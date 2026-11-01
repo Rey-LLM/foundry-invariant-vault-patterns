@@ -32,13 +32,13 @@ Each module pairs a minimal reference contract with a fuzz **handler** that driv
 | **02 · Uniswap V3-style TWAP Oracle Price Stability Framework**<br>`src/twap-validation/` | `PriceOracleModel.sol`: cumulative-price TWAP with hard price bounds and a 10% per-update deviation cap | `OracleHandler.sol`: bounded price moves and forward time warps | `OracleInvariant.t.sol` | Spot stays within bounds · cumulative matches ghost accounting · TWAP stays inside the observed price range · short-window drift is bounded · observations are strictly monotonic |
 | **03 · Multi-Token Staking & Flash-Loan Reward Validation Framework**<br>`src/flashloan-reward/` | `StakingPool.sol`: time-weighted reward-per-token staking pool | `RewardHandler.sol`: stake, unstake, claim, time warps, and same-block flash-sized stake/unstake cycles | `RewardInvariant.t.sol` | Distributed rewards never exceed the schedule · rewards match the schedule up to bounded rounding dust · zero reward from same-block cycles · `rewardPerToken` frozen within a block · `totalStaked` equals the sum of balances |
 
-> 📌 **Module status.** Modules 02 and 03 are on `main`. Module 01 is under review in [PR #1](https://github.com/Rey-LLM/foundry-invariant-vault-patterns/pull/1) (`pattern-01-erc4626-inflation-matrix`), which also adds the shared `foundry.toml`. Its handler lives in `src/`, and two of its invariant suites are **expected to fail**: they demonstrate the inflation and rounding defects, while `ProtectedInvariant` shows the fix.
+> 📌 **Module status.** All three modules are on `main`, together with the shared `foundry.toml`. Module 01 keeps its handler in `src/`, and two of its invariant suites are **expected to fail**: they demonstrate the inflation and rounding defects, while `ProtectedInvariant` shows the fix.
 
 ### 📂 Layout
 
 ```text
 src/
-├── erc4626-inflation/     Module 01 (PR #1)
+├── erc4626-inflation/     Module 01 · MockERC4626.sol · Handler.sol
 ├── twap-validation/       Module 02 · PriceOracleModel.sol
 └── flashloan-reward/      Module 03 · StakingPool.sol
 test/
@@ -74,7 +74,7 @@ forge install OpenZeppelin/openzeppelin-contracts --no-git
 forge build
 ```
 
-Dependencies are installed into `lib/` and are not committed. Until PR #1 lands, `main` has no `foundry.toml`, and Forge's defaults (`src/`, `test/`, `lib/`) are enough for Modules 02 and 03.
+Dependencies are installed into `lib/` and are not committed. The shared `foundry.toml` pins solc 0.8.24 and sets the `forge-std` and OpenZeppelin remappings.
 
 ### 3. Run a module
 
@@ -85,7 +85,7 @@ forge test --match-path "test/twap-validation/*" -vvv
 # Module 03: staking & flash-loan reward accounting
 forge test --match-path "test/flashloan-reward/*" -vvv
 
-# Module 01: ERC-4626 inflation matrix (after PR #1 is merged)
+# Module 01: ERC-4626 inflation matrix
 forge test --match-path "test/erc4626-inflation/*" -vvv
 
 # Everything
