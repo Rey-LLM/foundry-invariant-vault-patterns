@@ -1,0 +1,1 @@
+# foundry-invariant-vault-patterns
