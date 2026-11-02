@@ -140,6 +140,16 @@ def markdown_from_forge(forge_json: dict) -> str:
     if failed:
         out += ["| Contract | Test | Reason |", "| :-- | :-- | :-- |"]
         out += [f"| `{c}` | `{t}` | {r.replace('|', '/')} |" for _, c, t, r in failed]
+        out.append("")
+    out += ["<details><summary>All tests</summary>", ""]
+    for suite_id, suite in sorted(forge_json.items()):
+        if not isinstance(suite, dict):
+            continue
+        contract = suite_id.rpartition(":")[2]
+        for test, res in sorted((suite.get("test_results") or {}).items()):
+            status = res.get("status", "?") if isinstance(res, dict) else "?"
+            out.append(f"- `{contract}.{test}`: {status}")
+    out += ["", "</details>"]
     return "\n".join(out) + "\n"
 
 
