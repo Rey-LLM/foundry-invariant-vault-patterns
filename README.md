@@ -40,7 +40,8 @@ Each module pairs a minimal reference contract with a fuzz **handler** that driv
 src/
 ├── erc4626-inflation/     Module 01 · MockERC4626.sol · Handler.sol
 ├── twap-validation/       Module 02 · PriceOracleModel.sol
-└── flashloan-reward/      Module 03 · StakingPool.sol
+├── flashloan-reward/      Module 03 · StakingPool.sol
+└── cli/                   FoundryGuard · parser.py · injector.py
 test/
 ├── erc4626-inflation/     InflationInvariant.t.sol
 ├── twap-validation/       OracleHandler.sol · OracleInvariant.t.sol
@@ -119,6 +120,78 @@ FOUNDRY_PROFILE=ci forge test
 2. Point the handler at your contract and keep its input bounds realistic.
 3. Keep the ghost accounting independent of your contract's own math, because that independence is what makes the invariant meaningful.
 4. Run it in CI on every change to accounting or pricing code.
+
+---
+
+## 🤖 FoundryGuard: Automated Invariant Scaffolding CLI
+
+FoundryGuard turns any Foundry project into a fuzzing target in two commands. It scans your Solidity sources, finds the functions that move value, and writes a tailored `Handler.sol` and `Invariant.t.sol` for each contract, following the same handler + ghost-accounting pattern as the modules above.
+
+It needs only Python 3.9+ and the standard library.
+
+### Workflow
+
+```text
+src/**/*.sol ──▶ parser.py ──▶ foundryguard.json ──▶ injector.py ──▶ test/foundryguard/<Contract>/
+                 (scan + classify)   (blueprint)       (generate)      Handler.sol · Invariant.t.sol
+```
+
+```sh
+# 1. Scan src/ (or contracts/) and write the blueprint
+python3 src/cli/parser.py -o foundryguard.json
+
+# 2. Generate handler + invariant suites from the blueprint
+python3 src/cli/injector.py foundryguard.json --out test/foundryguard
+
+# 3. Review the setUp, then fuzz
+forge test --match-path "test/foundryguard/*" --show-metrics -vvv
+```
+
+### Step 1 · `parser.py`: scan and classify
+
+- Scans `src/` and `contracts/` by default (or the paths you pass), skipping `lib/`, `node_modules/`, `test/`, `script/` and build output.
+- Strips comments and masks string literals, then extracts every contract, abstract contract, interface and library, with each function's parameters, return values, visibility, mutability and modifiers.
+- Follows imports through `foundry.toml` / `remappings.txt` remappings, so functions inherited from libraries such as OpenZeppelin's `ERC4626` are known to the injector. Imported library contracts are recorded as `external` and never become test targets. Files that import `forge-std` are flagged as test helpers and skipped too.
+- Classifies public and external state-changing functions by name:
+
+| Category | Direction | Matches (prefix, case-insensitive) |
+| :-- | :-- | :-- |
+| `deposit` | in | `deposit`, `mint`, `supply`, `fund`, `addLiquidity`, `provide`, `topUp` |
+| `withdraw` | out | `withdraw`, `redeem`, `exit`, `removeLiquidity`, `burn`, `emergencyWithdraw` |
+| `stake_lock` | in | `stake`, `lock`, `bond`, `createLock`, `increaseLock`, `extendLock`, ... |
+| `stake_lock` | out | `unstake`, `unlock`, `unbond`, `withdrawStake`, `cooldown`, ... |
+| `stake_lock` | reward | `claim`, `getReward`, `harvest`, `collect`, `compound` |
+
+- Detects the amount parameter (`amount`, `assets`, `shares`, `value`, ... or the only `uint` argument) and its unit: `assets`, `shares`, or `native` for payable functions that take no amount.
+- Records accounting getters (`totalSupply`, `totalAssets`, `totalStaked`, `balanceOf`, ...), including public state variables.
+
+```sh
+python3 src/cli/parser.py src/flashloan-reward -o - | jq '.contracts[] | {name, categories}'
+```
+
+Key options: `--root <dir>` (project root), `-o -` (stdout), `--no-follow-imports`, `-v`.
+
+### Step 2 · `injector.py`: generate the suites
+
+For each deployable contract with at least one drivable value-flow function it writes `test/foundryguard/<Contract>/Handler.sol` and `Invariant.t.sol`:
+
+- **Handler.** One wrapper per value-flow function plus a `warp` action. A fixed actor set is pranked as the caller, amounts are bounded to `[1, MAX_AMOUNT]`, address parameters (receivers, owners) are routed back to actors, and payable functions get funded with `vm.deal`. Every call runs in `try/catch`: ghost totals (`ghost_in`, `ghost_out`, per unit) move only on success, and reverts are counted per action, so the suite stays usable with `fail_on_revert = true`.
+- **Invariant test.** Deploys the target, wires the handler with `targetContract` / `targetSelector`, and emits only the properties the blueprint supports:
+  - `invariant_withdrawalsBoundedByDeposits`: when all flows share one unit and both directions exist (skipped for mixed-unit surfaces like ERC-4626, where the totals are not comparable).
+  - `invariant_actorBalancesBoundedByTotal`: when the contract exposes a `balanceOf`-style getter and a `total*` getter.
+  - `afterInvariant`: fails a run in which no value-flow call ever succeeded, which means `setUp` still needs funding or approvals.
+
+Functions with non-elementary parameters (arrays, structs, `bytes`, `string`) are listed as skipped in the report and in the handler's NatSpec.
+
+Key options: `--contract <Name>` (repeatable), `--out <dir>`, `--actors <n>`, `--max-amount 1e24`, `--dry-run`, `--json`, `--force` (existing files are never overwritten without it).
+
+### After generating
+
+The output is a starting point, not a finished audit:
+
+1. Replace the placeholder constructor arguments marked `FOUNDRYGUARD` in `setUp` with real dependencies (tokens, oracles, owners).
+2. If the target pulls ERC-20 tokens, mint to and approve from each handler actor in `setUp`.
+3. Add the protocol-specific invariants that only you can state, using the generated ghost variables.
 
 ---
 
