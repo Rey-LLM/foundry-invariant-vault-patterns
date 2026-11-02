@@ -235,7 +235,20 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("deposit(uint256,uint256,uint256)", failed[0][3])
         sarif = reporting.sarif_from_forge(data, Path("."))
         self.assertEqual(sarif["runs"][0]["results"][0]["level"], "error")
-        self.assertIn("1 of 2 test(s) passed", reporting.markdown_from_forge(data))
+        self.assertIn("1 of 2 result(s) passed", reporting.markdown_from_forge(data))
+
+    def test_shared_campaign_failure_event_names_real_invariant(self):
+        target = "test/foundryguard/L/Invariant.t.sol:LGuardInvariantTest"
+        text = json.dumps({target: {"test_results": {"invariant_a()": {"status": "Failure", "reason": None}}}}) + "\n" + \
+            json.dumps({"event": "failure", "invariant": "invariant_tokenSolvency", "target": target,
+                        "reason": "token balance below totalDeposits"}) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "r.json"
+            path.write_text(text)
+            data = reporting.load_forge_json(path)
+        failed = reporting.failed_tests(data)
+        self.assertEqual([(f[2], f[3]) for f in failed], [("invariant_tokenSolvency()", "token balance below totalDeposits")])
+        self.assertEqual(reporting.test_count(data), 1)
         self.assertEqual(reporting.test_count({}), 0)
 
 

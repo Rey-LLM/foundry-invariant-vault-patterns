@@ -96,13 +96,26 @@ def _find_line(path: Path, func: str) -> int:
     return 1
 
 
+EVENTS_KEY = "__foundryguard_events__"
+
+
 def failed_tests(forge_json: dict) -> list[tuple[str, str, str, str]]:
     """Return (file, contract, test, reason) for every failed test in ``forge test --json`` output."""
     out = []
+    # Current forge runs every invariant of a contract in one shared campaign and files the campaign
+    # under the first invariant's name; the invariant that actually broke is in a separate
+    # {"event": "failure", "invariant": ...} line. Prefer those events when present.
+    events: dict[str, list[dict]] = {}
+    for ev in forge_json.get(EVENTS_KEY, []):
+        events.setdefault(ev.get("target", ""), []).append(ev)
     for suite_id, suite in forge_json.items():
-        if not isinstance(suite, dict):
+        if not isinstance(suite, dict) or suite_id == EVENTS_KEY:
             continue
         file, _, contract = suite_id.rpartition(":")
+        if suite_id in events:
+            for ev in events.pop(suite_id):
+                out.append((file, contract, f"{ev.get('invariant', '?')}()", ev.get("reason") or "failed"))
+            continue
         for test, res in (suite.get("test_results") or {}).items():
             if not isinstance(res, dict) or str(res.get("status", "")).lower() not in ("failure", "failed", "fail"):
                 continue
@@ -116,6 +129,9 @@ def failed_tests(forge_json: dict) -> list[tuple[str, str, str, str]]:
                 if calls:
                     reason += " | sequence: " + " -> ".join(str(c) for c in calls)
             out.append((file, contract, test, reason))
+    for target, evs in events.items():  # events whose suite had no result entry
+        file, _, contract = target.rpartition(":")
+        out += [(file, contract, f"{ev.get('invariant', '?')}()", ev.get("reason") or "failed") for ev in evs]
     return out
 
 
@@ -130,20 +146,22 @@ def sarif_from_forge(forge_json: dict, root: Path) -> dict:
 
 
 def test_count(forge_json: dict) -> int:
-    return sum(len((s or {}).get("test_results") or {}) for s in forge_json.values() if isinstance(s, dict))
+    return sum(len((s or {}).get("test_results") or {}) for k, s in forge_json.items()
+               if isinstance(s, dict) and k != EVENTS_KEY)
 
 
 def markdown_from_forge(forge_json: dict) -> str:
     failed = failed_tests(forge_json)
     total = test_count(forge_json)
-    out = ["# FoundryGuard test results", "", f"{total - len(failed)} of {total} test(s) passed.", ""]
+    out = ["# FoundryGuard test results", "", f"{total - len({(c, f) for f, c, _, _ in failed})} of {total} result(s) passed "
+           "(forge checks all invariants of a contract in one shared campaign).", ""]
     if failed:
         out += ["| Contract | Test | Reason |", "| :-- | :-- | :-- |"]
         out += [f"| `{c}` | `{t}` | {r.replace('|', '/')} |" for _, c, t, r in failed]
         out.append("")
     out += ["<details><summary>All tests</summary>", ""]
     for suite_id, suite in sorted(forge_json.items()):
-        if not isinstance(suite, dict):
+        if not isinstance(suite, dict) or suite_id == EVENTS_KEY:
             continue
         contract = suite_id.rpartition(":")[2]
         for test, res in sorted((suite.get("test_results") or {}).items()):
@@ -164,7 +182,11 @@ def load_forge_json(path: Path) -> dict:
             line = line.strip()
             if line.startswith("{"):
                 try:
-                    merged.update(json.loads(line))
+                    obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(obj, dict) and obj.get("event") == "failure" and "invariant" in obj:
+                    merged.setdefault(EVENTS_KEY, []).append(obj)
+                elif isinstance(obj, dict):
+                    merged.update(obj)
         return merged
