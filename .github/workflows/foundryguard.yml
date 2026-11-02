@@ -42,6 +42,8 @@ jobs:
         run: forge build
       - name: Run generated invariants
         run: |
+          forge test --match-path "test/foundryguard/*" --list
+          forge test --match-path "test/foundryguard/*" --show-metrics || true
           forge test --match-path "test/foundryguard/*" --json > forge-results.json || true
           python3 ../../../../src/cli/foundryguard.py report forge-results.json --md forge-results.md --sarif foundryguard.sarif --fail-on-failure
       - if: always()
