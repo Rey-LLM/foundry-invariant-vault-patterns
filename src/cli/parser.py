@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Iterable
 
 SCHEMA = "foundryguard.blueprint/v1"
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.2.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -124,6 +124,7 @@ class Contract:
     functions: list[Function] = field(default_factory=list)
     constructor: Function | None = None
     accounting_getters: list[str] = field(default_factory=list)
+    state_vars: list[dict] = field(default_factory=list)  # public state variables: {name, type}
     categories: dict[str, list[str]] = field(default_factory=dict)
     external: bool = False
     test_helper: bool = False
@@ -322,12 +323,46 @@ def parse_header(header: str, kind: str, in_interface: bool) -> dict:
                 virtual=virtual, override=override, modifiers=modifiers)
 
 
-def classify(fn: Function) -> None:
+def build_rules(config: dict | None) -> tuple[tuple[str, str, re.Pattern[str]], ...]:
+    """Prepend user rules from ``foundryguard.toml`` ``[classify]`` to the built-in ones.
+
+    Config shape (names are exact function names or regexes)::
+
+        [classify]
+        deposit = ["enter", "join"]           # category "deposit", direction "in"
+        withdraw = ["leave"]                   # category "withdraw", direction "out"
+        stake_in = ["boost"]
+        stake_out = ["unboost"]
+        reward = ["getPaid"]
+        ignore = ["mintFee"]                   # never treat these as value flows
+    """
+    cfg = (config or {}).get("classify", {})
+    mapping = {
+        "deposit": ("deposit", "in"), "withdraw": ("withdraw", "out"),
+        "stake_in": ("stake_lock", "in"), "stake_out": ("stake_lock", "out"), "reward": ("stake_lock", "reward"),
+        "ignore": ("__ignore__", ""),
+    }
+    rules: list[tuple[str, str, re.Pattern[str]]] = []
+    for key, names in cfg.items():
+        if key not in mapping:
+            log.warning("foundryguard.toml: unknown [classify] key %r (expected one of %s)", key, ", ".join(mapping))
+            continue
+        category, direction = mapping[key]
+        for n in names:
+            rules.append((category, direction, re.compile(n if any(ch in n for ch in "^$*+?[(|\\") else f"^{re.escape(n)}$")))
+    # Ignore rules must win over everything, user rules over built-ins.
+    rules.sort(key=lambda r: r[0] != "__ignore__")
+    return tuple(rules) + CLASSIFICATION_RULES
+
+
+def classify(fn: Function, rules: tuple[tuple[str, str, re.Pattern[str]], ...] = CLASSIFICATION_RULES) -> None:
     """Attach category/direction/amount metadata for value-flow functions."""
     if fn.kind != "function" or fn.visibility not in {"public", "external"} or fn.mutability in {"view", "pure"}:
         return
-    for category, direction, pattern in CLASSIFICATION_RULES:
+    for category, direction, pattern in rules:
         if pattern.match(fn.name):
+            if category == "__ignore__":
+                return
             fn.category, fn.direction = category, direction
             break
     else:
@@ -346,7 +381,7 @@ def classify(fn: Function) -> None:
         fn.amount_param, fn.unit = "msg.value", "native"
 
 
-def extract_contracts(source: str, rel_path: str) -> tuple[list[Contract], list[str]]:
+def extract_contracts(source: str, rel_path: str, rules=CLASSIFICATION_RULES) -> tuple[list[Contract], list[str]]:
     stripped = strip_comments(source)
     imports = IMPORT_RE.findall(stripped)
     text = mask_strings(stripped)
@@ -406,7 +441,7 @@ def extract_contracts(source: str, rel_path: str) -> tuple[list[Contract], list[
                 name=fname, kind=fkind, signature=signature, params=params,
                 line=line_of(text, body_offset + fm.start()), has_body=has_body, **header,
             )
-            classify(fn)
+            classify(fn, rules)
             if fkind == "constructor":
                 contract.constructor = fn
             else:
@@ -422,6 +457,7 @@ def extract_contracts(source: str, rel_path: str) -> tuple[list[Contract], list[
             r"^\s*(mapping\s*\(.+?\)|[A-Za-z_$][\w$.\[\]]*)\s+(?:(?:public|immutable|constant|override)\s+)*public\s+(?:(?:immutable|constant|override)\s+)*([A-Za-z_$][\w$]*)\s*[;=]",
             _strip_nested_blocks(body), re.M,
         ):
+            contract.state_vars.append({"name": vm_.group(2), "type": normalize_type(vm_.group(1))})
             if vm_.group(2) in ACCOUNTING_GETTERS:
                 contract.accounting_getters.append(vm_.group(2))
         for fn in contract.functions:
@@ -515,8 +551,29 @@ def rel(root: Path, p: Path) -> str:
         return p.as_posix()
 
 
-def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True) -> dict:
+def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True, backend: str = "auto",
+                    config: dict | None = None, build_dir: str = "out", run_build: bool = True) -> dict:
+    """Scan the project and return the blueprint dict.
+
+    ``backend``: ``regex`` (no compiler needed), ``ast`` (solc AST from forge build output, error if
+    missing) or ``auto`` (AST when available, regex otherwise).
+    """
     root = root.resolve()
+    rules = build_rules(config)
+    if backend in ("auto", "ast"):
+        try:
+            from_ast = _ast_backend()
+        except ImportError:  # pragma: no cover - module ships with the package
+            from_ast = None
+        if from_ast is not None:
+            result = from_ast.build_from_ast(root, paths, rules=rules, build_dir=build_dir,
+                                             run_build=run_build, required=(backend == "ast"))
+            if result is not None:
+                contracts, files_scanned, unresolved = result
+                return _finish_blueprint(root, paths, load_remappings(root), contracts, files_scanned,
+                                         unresolved, "ast")
+        if backend == "ast":
+            raise SystemExit("foundryguard: --backend ast requested but no solc AST was found (run `forge build --ast`)")
     remaps = load_remappings(root)
     queue = [(p, False) for p in discover_sources(root, paths)]
     seen: set[Path] = set()
@@ -535,7 +592,7 @@ def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True) -
             log.warning("cannot read %s: %s", path, exc)
             continue
         files_scanned += 1
-        found, imports = extract_contracts(source, rel(root, path))
+        found, imports = extract_contracts(source, rel(root, path), rules)
         for c in found:
             c.external = external
         contracts.extend(found)
@@ -548,6 +605,20 @@ def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True) -
                 elif resolved not in seen:
                     queue.append((resolved, external or not _is_under(resolved, root, paths)))
 
+    return _finish_blueprint(root, paths, remaps, contracts, files_scanned, unresolved, "regex")
+
+
+def _ast_backend():
+    if __package__:
+        from . import ast_backend  # type: ignore
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ast_backend  # type: ignore
+    return ast_backend
+
+
+def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Contract], files_scanned: int,
+                      unresolved: set[str], backend: str) -> dict:
     for c in contracts:
         cats: dict[str, list[str]] = {}
         for fn in c.functions:
@@ -569,6 +640,7 @@ def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True) -
     return {
         "schema": SCHEMA,
         "tool": {"name": "foundryguard", "version": TOOL_VERSION},
+        "backend": backend,
         "root": root.as_posix(),
         "source_paths": list(paths) or [d for d in DEFAULT_SOURCE_DIRS if (root / d).is_dir()],
         "remappings": [f"{k}={v}" for k, v in remaps],
@@ -594,8 +666,54 @@ def _contract_to_dict(c: Contract) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+CONFIG_FILE = "foundryguard.toml"
+
+
+def load_config(root: Path, path: str | None = None) -> dict:
+    """Load ``foundryguard.toml`` (or ``path``). Missing file -> empty config."""
+    cfg_path = Path(path) if path else root / CONFIG_FILE
+    if not cfg_path.is_file():
+        if path:
+            raise SystemExit(f"foundryguard: config not found: {cfg_path}")
+        return {}
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:  # pragma: no cover
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError:
+            raise SystemExit("foundryguard: reading foundryguard.toml needs Python 3.11+ or `pip install tomli`")
+    try:
+        return tomllib.loads(cfg_path.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"foundryguard: {cfg_path} is not valid TOML: {exc}")
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+
+
+def add_scan_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("paths", nargs="*", help="source dirs or .sol files, relative to --root (default: src/ or contracts/)")
+    ap.add_argument("--root", default=".", help="project root containing foundry.toml (default: .)")
+    ap.add_argument("--config", help=f"config file (default: <root>/{CONFIG_FILE} if present)")
+    ap.add_argument("--backend", choices=("auto", "ast", "regex"), default="auto",
+                    help="auto: solc AST from forge build output when available, else regex (default: auto)")
+    ap.add_argument("--build-dir", default="out", help="forge build output dir, relative to root (default: out)")
+    ap.add_argument("--no-build", action="store_true", help="never run `forge build --ast`; only read existing output")
+    ap.add_argument("--no-follow-imports", action="store_true", help="regex backend: do not parse imported files")
+
+
+def scan_from_args(args: argparse.Namespace) -> dict:
+    root = Path(args.root)
+    config = load_config(root.resolve(), args.config)
+    paths = args.paths or list(config.get("scan", {}).get("paths", []))
+    return build_blueprint(root, paths, follow_imports=not args.no_follow_imports, backend=args.backend,
+                           config=config, build_dir=args.build_dir, run_build=not args.no_build)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -603,15 +721,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="foundryguard-parse",
         description="Scan Solidity sources and map deposit / withdraw / staking-lock functions into a JSON blueprint.",
     )
-    ap.add_argument("paths", nargs="*", help="source dirs or .sol files, relative to --root (default: src/ or contracts/)")
-    ap.add_argument("--root", default=".", help="project root containing foundry.toml (default: .)")
+    add_scan_args(ap)
     ap.add_argument("-o", "--output", default="foundryguard.json", help="blueprint path, or '-' for stdout (default: foundryguard.json)")
-    ap.add_argument("--no-follow-imports", action="store_true", help="do not parse imported files for inherited functions")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING - 10 * min(args.verbose, 2), format="%(levelname)s %(name)s: %(message)s")
-    blueprint = build_blueprint(Path(args.root), args.paths, follow_imports=not args.no_follow_imports)
+    blueprint = scan_from_args(args)
     payload = json.dumps(blueprint, indent=2, sort_keys=False) + "\n"
 
     if args.output == "-":
@@ -622,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(payload)
         s = blueprint["summary"]
         print(
-            f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) -> {out} "
+            f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{blueprint['backend']}] -> {out} "
             f"[deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}]",
             file=sys.stderr,
         )
