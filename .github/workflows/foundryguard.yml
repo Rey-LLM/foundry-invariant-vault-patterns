@@ -43,8 +43,32 @@ jobs:
       - name: Run generated invariants
         run: |
           forge test --match-path "test/foundryguard/*" --list
-          forge test --match-path "test/foundryguard/*" --show-metrics || true
+          forge test --match-path "test/foundryguard/*" -vv || true
           forge test --match-path "test/foundryguard/*" --json > forge-results.json || true
           python3 ../../../../src/cli/foundryguard.py report forge-results.json --md forge-results.md --sarif foundryguard.sarif --fail-on-failure
       - if: always()
         run: cat forge-results.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  catches-bugs:
+    name: Generated suite catches a planted bug
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/broken
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --backend ast
+      - name: The planted bug must be reported
+        run: |
+          forge test --match-path "test/foundryguard/*" -vv || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json || true
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json --md forge-results.md
+          if python3 ../../../../src/cli/foundryguard.py report forge-results.json --fail-on-failure > /dev/null; then
+            echo "::error::FoundryGuard did not catch the LeakyVault bug"
+            exit 1
+          fi

@@ -114,7 +114,7 @@ def cmd_run(args, check: bool = False) -> int:
         print("foundryguard: --test needs `forge` on PATH (https://getfoundry.sh)", file=sys.stderr)
         return 1
     out = args.out or parser.load_config(root, args.config).get("generate", {}).get("out", "test/foundryguard")
-    cmd = [forge, "test", "--match-path", f"{out.rstrip('/')}/*", "--show-metrics"]
+    cmd = [forge, "test", "--match-path", f"{out.rstrip('/')}/*", "-vv"]
     print("foundryguard: " + " ".join(cmd), file=sys.stderr)
     return subprocess.call(cmd, cwd=root)
 

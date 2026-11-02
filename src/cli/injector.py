@@ -712,7 +712,7 @@ import {{ FoundryGuardMockERC20, IFoundryGuardERC20 }} from "{support_rel}";
 /// @title {c['name']}GuardHandler
 /// @notice Drives {c['name']} through its deposit / withdraw / staking-lock surface with a fixed actor
 ///         set and bounded inputs. Ghost totals advance only on successful calls; reverts are counted
-///         per selector so `forge test --show-metrics` and afterInvariant() expose a stuck setup.{skipped}
+///         per selector (ghost_reverts) so afterInvariant() and the logs expose a stuck setup.{skipped}
 contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     {c['name']} public immutable target;
 

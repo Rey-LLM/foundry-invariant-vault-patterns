@@ -139,7 +139,7 @@ foundryguard run --test          # scan + generate + forge test on the generated
 
 # Option B: run from a clone, no install
 python3 path/to/src/cli/foundryguard.py run
-forge test --match-path "test/foundryguard/*" --show-metrics -vvv
+forge test --match-path "test/foundryguard/*" -vvv
 ```
 
 | Command | What it does |
