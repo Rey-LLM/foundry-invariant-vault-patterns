@@ -129,9 +129,13 @@ def sarif_from_forge(forge_json: dict, root: Path) -> dict:
     return _sarif(results, {"foundryguard/invariant-broken": "A FoundryGuard invariant or test failed"})
 
 
+def test_count(forge_json: dict) -> int:
+    return sum(len((s or {}).get("test_results") or {}) for s in forge_json.values() if isinstance(s, dict))
+
+
 def markdown_from_forge(forge_json: dict) -> str:
     failed = failed_tests(forge_json)
-    total = sum(len((s or {}).get("test_results") or {}) for s in forge_json.values() if isinstance(s, dict))
+    total = test_count(forge_json)
     out = ["# FoundryGuard test results", "", f"{total - len(failed)} of {total} test(s) passed.", ""]
     if failed:
         out += ["| Contract | Test | Reason |", "| :-- | :-- | :-- |"]

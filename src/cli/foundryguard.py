@@ -129,6 +129,11 @@ def cmd_report(args) -> int:
         sys.stdout.write(md)
     if args.sarif:
         Path(args.sarif).write_text(json.dumps(reporting.sarif_from_forge(data, root), indent=2) + "\n")
+    if args.md:
+        sys.stdout.write(md)
+    if args.fail_on_failure and not reporting.test_count(data):
+        print("foundryguard: no test results found in forge output (did the suites run?)", file=sys.stderr)
+        return 1
     return 1 if (args.fail_on_failure and reporting.failed_tests(data)) else 0
 
 

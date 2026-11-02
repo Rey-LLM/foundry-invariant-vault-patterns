@@ -169,6 +169,14 @@ class InjectorTests(ProjectCase):
         self.assertIn("uint256 shares_max = target.maxRedeem(actor);", handler)
         self.assertIn("if (previewOk_ && !(result_ >= preview_)) ghost_previewViolations++;", handler)
 
+    def test_token_detected_even_without_parent_source(self):
+        bp = self.scan()
+        for c in bp["contracts"]:
+            if c["name"] == "Token":
+                c["inherits"] = ["ERC20"]
+                c["functions"] = [f for f in c["functions"] if f["name"] == "mint"]
+        self.assertNotIn("Token", {r["contract"] for r in self.gen(bp)})
+
     def test_admin_only_not_fuzzed(self):
         bp = self.scan()
         for c in bp["contracts"]:
@@ -228,6 +236,7 @@ class ReportingTests(unittest.TestCase):
         sarif = reporting.sarif_from_forge(data, Path("."))
         self.assertEqual(sarif["runs"][0]["results"][0]["level"], "error")
         self.assertIn("1 of 2 test(s) passed", reporting.markdown_from_forge(data))
+        self.assertEqual(reporting.test_count({}), 0)
 
 
 if __name__ == "__main__":

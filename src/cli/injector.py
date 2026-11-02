@@ -189,8 +189,13 @@ def is_admin_only(fn: dict) -> bool:
 
 def looks_like_plain_token(t: Target) -> bool:
     """A plain ERC-20 whose only 'flows' are mint/burn is a token, not a vault."""
+    if t.has("asset", 0):
+        return False
     has_erc20 = t.fn("transfer(address,uint256)") and t.fn("approve(address,uint256)")
-    if not has_erc20 or t.has("asset", 0):
+    # When the parent's source is missing (dependencies not installed) the name still tells us.
+    token_parent = any(re.match(r"^(ERC20|ERC20Burnable|ERC20Permit|ERC20Votes|ERC20Capped|ERC20Pausable|ERC20Upgradeable)$", p)
+                       for p in t.contract.get("inherits", []))
+    if not (has_erc20 or token_parent):
         return False
     return all(re.match(r"^_?(mint|burn)\w*$", f["name"], re.I) for f in t.flows)
 
