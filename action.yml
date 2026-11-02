@@ -1,0 +1,46 @@
+name: FoundryGuard
+description: Generate Foundry invariant suites for your DeFi contracts and run them in CI.
+branding:
+  icon: shield
+  color: yellow
+
+inputs:
+  root:
+    description: Foundry project root.
+    default: "."
+  out:
+    description: Where the generated suites go, relative to root.
+    default: test/foundryguard
+  args:
+    description: Extra arguments for `foundryguard run` (e.g. `--contract MyVault`).
+    default: ""
+  run-tests:
+    description: Run `forge test` on the generated suites (needs foundry-rs/foundry-toolchain first).
+    default: "true"
+  sarif:
+    description: Path for a SARIF file with broken invariants (upload it with github/codeql-action/upload-sarif).
+    default: foundryguard.sarif
+
+outputs:
+  sarif:
+    description: Path of the SARIF file.
+    value: ${{ inputs.root }}/${{ inputs.sarif }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+    - name: Generate invariant suites
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      run: python3 "$GITHUB_ACTION_PATH/src/cli/foundryguard.py" run --out "${{ inputs.out }}" --report-md "$GITHUB_STEP_SUMMARY" ${{ inputs.args }}
+    - name: Run invariant suites
+      if: inputs.run-tests == 'true'
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      run: |
+        forge test --match-path "${{ inputs.out }}/*" --json > foundryguard-results.json || true
+        python3 "$GITHUB_ACTION_PATH/src/cli/foundryguard.py" report foundryguard-results.json \
+          --md foundryguard-results.md --sarif "${{ inputs.sarif }}" --fail-on-failure

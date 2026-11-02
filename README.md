@@ -41,11 +41,12 @@ src/
 ├── erc4626-inflation/     Module 01 · MockERC4626.sol · Handler.sol
 ├── twap-validation/       Module 02 · PriceOracleModel.sol
 ├── flashloan-reward/      Module 03 · StakingPool.sol
-└── cli/                   FoundryGuard · parser.py · injector.py
+└── cli/                   FoundryGuard · foundryguard.py · parser.py · ast_backend.py · injector.py · reporting.py
 test/
 ├── erc4626-inflation/     InflationInvariant.t.sol
 ├── twap-validation/       OracleHandler.sol · OracleInvariant.t.sol
 └── flashloan-reward/      RewardHandler.sol · RewardInvariant.t.sol
+tests/foundryguard/        FoundryGuard unit tests + fixture project
 ```
 
 ### 🧩 How each module is built
@@ -125,34 +126,46 @@ FOUNDRY_PROFILE=ci forge test
 
 ## 🤖 FoundryGuard: Automated Invariant Scaffolding CLI
 
-FoundryGuard turns any Foundry project into a fuzzing target in two commands. It scans your Solidity sources, finds the functions that move value, and writes a tailored `Handler.sol` and `Invariant.t.sol` for each contract, following the same handler + ghost-accounting pattern as the modules above.
+FoundryGuard turns a Foundry project into a fuzzing target with one command. It reads your Solidity, finds the functions that move value, and writes a `Handler.sol` and an `Invariant.t.sol` for each contract. The output follows the handler and ghost-accounting pattern of the modules above. The generated `setUp` deploys and funds everything it needs, so the suite runs without hand edits in the common cases.
 
-It needs only Python 3.9+ and the standard library.
+It needs Python 3.9+ and nothing else (Python 3.9 and 3.10 also need `tomli` to read `foundryguard.toml`; `pip install .` installs it).
 
-### Workflow
-
-```text
-src/**/*.sol ──▶ parser.py ──▶ foundryguard.json ──▶ injector.py ──▶ test/foundryguard/<Contract>/
-                 (scan + classify)   (blueprint)       (generate)      Handler.sol · Invariant.t.sol
-```
+### Quick start
 
 ```sh
-# 1. Scan src/ (or contracts/) and write the blueprint
-python3 src/cli/parser.py -o foundryguard.json
+# Option A: install the command
+pipx install git+https://github.com/Rey-LLM/foundry-invariant-vault-patterns.git
+foundryguard run --test          # scan + generate + forge test on the generated suites
 
-# 2. Generate handler + invariant suites from the blueprint
-python3 src/cli/injector.py foundryguard.json --out test/foundryguard
-
-# 3. Review the setUp, then fuzz
+# Option B: run from a clone, no install
+python3 path/to/src/cli/foundryguard.py run
 forge test --match-path "test/foundryguard/*" --show-metrics -vvv
 ```
 
-### Step 1 · `parser.py`: scan and classify
+| Command | What it does |
+| :-- | :-- |
+| `foundryguard init` | Writes a commented `foundryguard.toml`. |
+| `foundryguard scan` | Turns Solidity into a `foundryguard.json` blueprint. |
+| `foundryguard gen` | Turns the blueprint into `test/foundryguard/<Contract>/` suites. |
+| `foundryguard run [--test]` | Runs `scan` and `gen`, plus `forge test` with `--test`. |
+| `foundryguard check` | For CI: exits 1 when generated suites are missing or stale. Writes nothing. |
+| `foundryguard report results.json` | Turns `forge test --json` output into Markdown and SARIF. |
 
-- Scans `src/` and `contracts/` by default (or the paths you pass), skipping `lib/`, `node_modules/`, `test/`, `script/` and build output.
-- Strips comments and masks string literals, then extracts every contract, abstract contract, interface and library, with each function's parameters, return values, visibility, mutability and modifiers.
-- Follows imports through `foundry.toml` / `remappings.txt` remappings, so functions inherited from libraries such as OpenZeppelin's `ERC4626` are known to the injector. Imported library contracts are recorded as `external` and never become test targets. Files that import `forge-std` are flagged as test helpers and skipped too.
-- Classifies public and external state-changing functions by name:
+The old entry points still work: `python3 src/cli/parser.py` and `python3 src/cli/injector.py foundryguard.json`.
+
+```text
+src/**/*.sol ──▶ scan ──▶ foundryguard.json ──▶ gen ──▶ test/foundryguard/
+                 (AST or regex)  (blueprint)              FoundryGuardSupport.sol
+                                                          <Contract>/Handler.sol · Invariant.t.sol
+```
+
+### Scanning: AST first, regex as fallback
+
+- `--backend auto` (the default) runs `forge build --ast` when `forge` is installed and reads the exact solc AST. It also reads existing Foundry artifacts, Foundry or Hardhat `build-info` files, and raw `solc --standard-json` output (`--build-dir <dir or file>`, `--no-build`).
+- Without a compiler it falls back to the built-in regex parser. That parser strips comments, follows imports through `foundry.toml` and `remappings.txt` remappings, and resolves inherited functions. `--backend ast` or `--backend regex` forces one backend.
+- Library contracts (`lib/`, `node_modules/`) are only used to resolve inheritance; they are never targets. Files that import `forge-std` are skipped as test helpers.
+- If a parent contract cannot be found (for example OpenZeppelin is not installed), FoundryGuard **warns** instead of silently dropping the inherited `deposit` and `withdraw`.
+- Public and external state-changing functions are classified by name:
 
 | Category | Direction | Matches (prefix, case-insensitive) |
 | :-- | :-- | :-- |
@@ -162,36 +175,78 @@ forge test --match-path "test/foundryguard/*" --show-metrics -vvv
 | `stake_lock` | out | `unstake`, `unlock`, `unbond`, `withdrawStake`, `cooldown`, ... |
 | `stake_lock` | reward | `claim`, `getReward`, `harvest`, `collect`, `compound` |
 
-- Detects the amount parameter (`amount`, `assets`, `shares`, `value`, ... or the only `uint` argument) and its unit: `assets`, `shares`, or `native` for payable functions that take no amount.
-- Records accounting getters (`totalSupply`, `totalAssets`, `totalStaked`, `balanceOf`, ...), including public state variables.
+Add your own names (`enter`, `join`, `leave`, ...) or ignore some in `[classify]` in `foundryguard.toml`.
 
-```sh
-python3 src/cli/parser.py src/flashloan-reward -o - | jq '.contracts[] | {name, categories}'
+### What `setUp` does for you
+
+| Situation | Generated behaviour |
+| :-- | :-- |
+| A constructor or initializer takes a token (`IERC20 asset_`, `address stakingToken`, ...) | Deploys a `FoundryGuardMockERC20` for it. Every actor gets a balance and approves the target. |
+| A reward token plus a `notifyRewardAmount`-style function | Funds the reward budget as the owner, whether the function pulls the tokens or expects them up front. |
+| `initialize(...)` with an `initializer` modifier | Deploys the implementation behind an ERC-1967 proxy and initializes it, like in production. |
+| `Ownable` / `onlyOwner` / `onlyRole` | The test contract deploys the target, so it is the owner. Admin-only functions are not fuzzed from actors. |
+| Owner/receiver parameters (`withdraw(assets, receiver, owner)`) | `owner`/`from`/`account` is the pranked actor; receivers are other actors, so value stays observable. |
+| Withdrawals and unstakes | Amounts are bounded by `maxWithdraw`, `maxRedeem`, `balanceOf` or `stakedOf` of the actor, so calls rarely revert. |
+| A plain ERC-20 with a faucet `mint` | Not treated as a vault. Add it to `[targets] include` to fuzz it anyway. |
+| A struct or other argument it cannot guess | The suite is not generated, and the report tells you which `[contracts.<Name>]` value to set. It never writes code that does not compile. |
+
+Every handler call runs in `try/catch`. Ghost totals move only on success, and reverts are counted per action, so suites work with `fail_on_revert = true`.
+
+### Invariant presets
+
+Each preset is emitted only when the scanned contract supports it:
+
+| Preset | Invariants |
+| :-- | :-- |
+| ERC-4626 | `previewsHonoured` (deposit/mint/withdraw/redeem never worse than `preview*`), `depositAlwaysMintsShares` (catches share inflation), `solvency`, `sharesBackedByAssets`, `assetsOutBoundedByIn`, `sharesOutBoundedByIn` |
+| Single-unit vault | `withdrawalsBoundedByDeposits` |
+| Staking / ERC-20 accounting | `actorBalancesBoundedByTotal`, `tokenSolvency` (token balance ≥ `totalStaked` / `totalDeposits`) |
+| Rewards | `rewardsBoundedByFunding_<token>`: actors never receive more rewards than were funded |
+| Always | `afterInvariant`: fails a run in which no value-flow call succeeded |
+
+### `foundryguard.toml`
+
+Run `foundryguard init` for a commented template. Settings live in the config, not in the generated files, so regenerating with `--force` keeps them:
+
+```toml
+[classify]
+deposit = ["enter", "join"]
+ignore = ["mintFee"]
+
+[contracts.MyVault]
+constructor_args = ["address(asset)", "\"Vault\"", "\"vTKN\""]   # mocks are named after the parameter
+setup = ["vm.warp(1 days);"]
 ```
 
-Key options: `--root <dir>` (project root), `-o -` (stdout), `--no-follow-imports`, `-v`.
+### CI
 
-### Step 2 · `injector.py`: generate the suites
+`foundryguard check` fails when the generated suites are out of date. `--report-md "$GITHUB_STEP_SUMMARY"` puts a summary on the workflow run, and `--sarif` lists setup warnings. To run the suites in your own repo with the bundled action:
 
-For each deployable contract with at least one drivable value-flow function it writes `test/foundryguard/<Contract>/Handler.sol` and `Invariant.t.sol`:
+```yaml
+- uses: foundry-rs/foundry-toolchain@v1
+- uses: Rey-LLM/foundry-invariant-vault-patterns@main
+  with:
+    args: --contract MyVault
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with:
+    sarif_file: foundryguard.sarif
+```
 
-- **Handler.** One wrapper per value-flow function plus a `warp` action. A fixed actor set is pranked as the caller, amounts are bounded to `[1, MAX_AMOUNT]`, address parameters (receivers, owners) are routed back to actors, and payable functions get funded with `vm.deal`. Every call runs in `try/catch`: ghost totals (`ghost_in`, `ghost_out`, per unit) move only on success, and reverts are counted per action, so the suite stays usable with `fail_on_revert = true`.
-- **Invariant test.** Deploys the target, wires the handler with `targetContract` / `targetSelector`, and emits only the properties the blueprint supports:
-  - `invariant_withdrawalsBoundedByDeposits`: when all flows share one unit and both directions exist (skipped for mixed-unit surfaces like ERC-4626, where the totals are not comparable).
-  - `invariant_actorBalancesBoundedByTotal`: when the contract exposes a `balanceOf`-style getter and a `total*` getter.
-  - `afterInvariant`: fails a run in which no value-flow call ever succeeded, which means `setUp` still needs funding or approvals.
+Broken invariants become code-scanning alerts that point at the failing `invariant_*` function, with the call sequence in the message.
 
-Functions with non-elementary parameters (arrays, structs, `bytes`, `string`) are listed as skipped in the report and in the handler's NatSpec.
+This repo tests FoundryGuard itself in `.github/workflows/foundryguard.yml`: Python unit tests on 3.9 and 3.13, then a fixture project in `tests/foundryguard/fixtures/project` (simple vault, reward staking, upgradeable vault, OpenZeppelin ERC-4626, plain token) is generated with the AST backend, built and fuzzed with Forge.
 
-Key options: `--contract <Name>` (repeatable), `--out <dir>`, `--actors <n>`, `--max-amount 1e24`, `--dry-run`, `--json`, `--force` (existing files are never overwritten without it).
+```sh
+python3 -m unittest discover -s tests/foundryguard -v
+```
 
-### After generating
+### Limitations
 
-The output is a starting point, not a finished audit:
-
-1. Replace the placeholder constructor arguments marked `FOUNDRYGUARD` in `setUp` with real dependencies (tokens, oracles, owners).
-2. If the target pulls ERC-20 tokens, mint to and approve from each handler actor in `setUp`.
-3. Add the protocol-specific invariants that only you can state, using the generated ghost variables.
+- The generated suites are a strong starting point, not an audit. Add the protocol-specific invariants only you can state, using the ghost variables.
+- Functions with array, struct, `bytes` or `string` parameters are listed as skipped, not fuzzed.
+- Contract-typed constructor arguments that are not tokens (oracles, routers) get `address(this)` with a `FOUNDRYGUARD` note. Pass real mocks via `constructor_args`.
+- Presets assume no external yield. Delete or relax `solvency` and the `*OutBoundedByIn` invariants for vaults that deploy into strategies or earn yield.
 
 ---
 

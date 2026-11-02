@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 out/
 cache/
+build/
+*.egg-info/
+lib/

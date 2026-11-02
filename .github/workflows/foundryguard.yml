@@ -1,0 +1,48 @@
+name: FoundryGuard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Python tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install .
+      - run: python -m unittest discover -s tests/foundryguard -v
+
+  forge:
+    name: Generated suites build and run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/project
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install Solidity dependencies
+        run: |
+          forge install foundry-rs/forge-std --no-git
+          forge install OpenZeppelin/openzeppelin-contracts@v5.0.2 --no-git
+      - name: Generate suites (AST backend)
+        run: python3 ../../../../src/cli/foundryguard.py run --backend ast --report-md "$GITHUB_STEP_SUMMARY"
+      - name: Compile generated suites
+        run: forge build
+      - name: Run generated invariants
+        run: |
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json || true
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json --md forge-results.md --sarif foundryguard.sarif --fail-on-failure
+      - if: always()
+        run: cat forge-results.md >> "$GITHUB_STEP_SUMMARY" || true
