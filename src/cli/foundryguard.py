@@ -61,6 +61,15 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 # initializer = "initialize"
 # initializer_args = ["address(asset)", "address(this)"]
 # setup = ["vm.warp(1 days);"]
+
+[ai]
+# Contracts no preset matches can be sent to a language model (same as `--ai`).
+# The key comes from ANTHROPIC_API_KEY or OPENAI_API_KEY, never from this file.
+# enabled = false
+# provider = "anthropic"      # or "openai" (any OpenAI-compatible endpoint)
+# model = "claude-sonnet-5-5"
+# base_url = "https://api.anthropic.com"
+# max_source_chars = 12000
 """
 
 

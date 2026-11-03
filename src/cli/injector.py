@@ -35,11 +35,17 @@ Invariant presets are emitted only when the blueprint proves they apply:
   that every slot is back to zero
 * ``afterInvariant``: fails a run in which every value-flow call reverted
 
+Contracts that match none of the presets but still have public state-changing functions (custom
+logic: auctions, curves, vesting ...) are skipped. With ``--ai`` (or ``[ai] enabled = true``) and
+``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` set, they are sent to ``ai_generator.py`` instead, which
+asks a language model for a Handler.sol / Invariant.t.sol pair and checks it before writing.
+
 Usage::
 
     python3 src/cli/injector.py foundryguard.json
     python3 src/cli/injector.py foundryguard.json --out test/foundryguard --contract StakingPool
     python3 src/cli/injector.py foundryguard.json --check        # CI: fail if suites are stale
+    python3 src/cli/injector.py foundryguard.json --ai           # LLM fallback for custom contracts
 """
 
 from __future__ import annotations
@@ -54,9 +60,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 if __package__:
+    from . import ai_generator
     from .blueprints import hook_reentrancy, transient_storage
 else:  # executed as a plain script directory (python3 src/cli/injector.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ai_generator  # type: ignore
     from blueprints import hook_reentrancy, transient_storage  # type: ignore
 
 SUPPORTED_SCHEMA = "foundryguard.blueprint/v2"
@@ -258,7 +266,19 @@ def looks_like_plain_token(t: Target) -> bool:
     return all(re.match(r"^_?(mint|burn)\w*$", f["name"], re.I) for f in t.flows)
 
 
-def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = None) -> list[Target]:
+def is_custom_candidate(t: Target) -> bool:
+    """No preset matched, but there is still something an actor can call that changes state."""
+    c = t.contract
+    if c.get("abstract") or c.get("deployable") is False or c.get("fully_implemented") is False:
+        return False
+    return any(f.get("visibility") in ("public", "external") and f.get("mutability") in ("nonpayable", "payable")
+               and not is_admin_only(f) and not any(INITIALIZER_MODIFIER.match(m) for m in f.get("modifiers", []))
+               for f in t.functions)
+
+
+def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = None,
+                  unmatched: list[Target] | None = None) -> list[Target]:
+    """Targets the presets can drive. Contracts no preset matches are appended to ``unmatched``."""
     config = config or {}
     tcfg = config.get("targets", {})
     include = set(tcfg.get("include", []))
@@ -307,8 +327,10 @@ def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = 
             log.info("skip %s: no drivable deposit/withdraw/stake_lock functions", c["name"])
             for w in t.warnings:
                 log.warning("%s: %s", c["name"], w)
+            if unmatched is not None and is_custom_candidate(t):
+                unmatched.append(t)
     if only:
-        missing_names = only - {t.name for t in targets}
+        missing_names = only - {t.name for t in targets} - {t.name for t in (unmatched or [])}
         for m in sorted(missing_names):
             log.warning("contract %s not found or has no drivable value-flow functions", m)
     return targets
@@ -1201,12 +1223,45 @@ def write_file(path: Path, content: str, force: bool, dry_run: bool) -> str:
     return "written"
 
 
+def inject_ai(t: Target, root: Path, out_dir: Path, force: bool, dry_run: bool,
+              ai: "ai_generator.AISettings", transport=None) -> dict:
+    """Layer 06: a model-written suite for a contract no preset matched."""
+    dest = (out_dir / t.name).resolve()
+    entry = {
+        "contract": t.name, "file": t.contract["file"], "line": t.contract["line"], "dir": dest.as_posix(),
+        "flows": [], "skipped": [], "warnings": list(t.warnings), "setup_notes": [], "tokens": [],
+        "upgradeable": False, "erc4626": False, "hooks": None, "transient": None, "support": None,
+        "ai": {"model": ai.describe()}, "invariants": [],
+    }
+    files = [dest / "Handler.sol", dest / "Invariant.t.sol"]
+    if dry_run:
+        entry.update(handler="not checked (AI suites are not regenerated in dry runs)", invariant="not checked")
+        return entry
+    if not force and any(f.exists() for f in files):
+        entry.update(handler="kept (exists, use --force to ask the model again)", invariant="kept")
+        return entry
+    try:
+        res = ai_generator.generate(t.contract, t.functions, t.lineage, root, import_path(dest, root, t.contract["file"]),
+                                    import_path(dest, out_dir.resolve(), SUPPORT_FILE), ai, transport)
+    except ai_generator.AIError as e:
+        log.warning("%s: AI generation failed: %s", t.name, e)
+        entry.update(handler="not generated", invariant="not generated", blocked=[f"AI generation failed: {e}"])
+        return entry
+    entry["handler"] = write_file(files[0], res.handler, True, False)
+    entry["invariant"] = write_file(files[1], res.invariant, True, False)
+    entry["invariants"] = res.invariants
+    entry["setup_notes"].append(f"suite written by {res.model}; review it before relying on it")
+    return entry
+
+
 def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, actors: int,
-           max_amount: str, force: bool, dry_run: bool, config: dict | None = None) -> list[dict]:
+           max_amount: str, force: bool, dry_run: bool, config: dict | None = None,
+           ai: "ai_generator.AISettings | None" = None, ai_transport=None) -> list[dict]:
     report = []
-    targets = build_targets(blueprint, only, config)
+    unmatched: list[Target] = []
+    targets = build_targets(blueprint, only, config, unmatched if ai else None)
     support_status = None
-    if targets:
+    if targets or unmatched:
         support_status = write_file(out_dir / SUPPORT_FILE, render_support(), force, dry_run)
     for t in targets:
         dest = (out_dir / t.name).resolve()
@@ -1241,11 +1296,17 @@ def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, ac
         entry["invariant"] = write_file(dest / "Invariant.t.sol", invariant_src, force, dry_run)
         entry["invariants"] = names
         report.append(entry)
+    for t in unmatched:
+        entry = inject_ai(t, root, out_dir, force, dry_run, ai, ai_transport)
+        entry["support"] = support_status
+        report.append(entry)
     return report
 
 
 def is_stale(report: list[dict]) -> bool:
     for r in report:
+        if r.get("ai"):  # model output is not reproducible, so it is never "stale"
+            continue
         for key in ("handler", "invariant", "support"):
             if r.get(key) not in (None, "unchanged"):
                 return True
@@ -1263,6 +1324,8 @@ def add_gen_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--json", action="store_true", help="print the generation report as JSON")
     ap.add_argument("--report-md", help="also write a Markdown summary (e.g. for $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--sarif", help="also write setup warnings and skipped functions as SARIF")
+    ap.add_argument("--ai", action="store_true",
+                    help="send contracts no preset matches to an LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
 
 def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root: Path) -> int:
@@ -1277,7 +1340,16 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
     out_dir = out_dir if out_dir.is_absolute() else root / out_dir
     only = set(args.contract) if args.contract else None
     dry = args.dry_run or args.check
-    report = inject(blueprint, root, out_dir, only, actors, max_amount, args.force or args.check, dry, config)
+    ai = None
+    if getattr(args, "ai", False) or config.get("ai", {}).get("enabled") is True:
+        try:
+            ai = ai_generator.settings_from(config)
+        except ai_generator.AIError as e:
+            raise SystemExit(f"foundryguard: {e}")
+        if ai is None:
+            print("foundryguard: AI fallback requested but neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set; "
+                  "custom contracts are skipped", file=sys.stderr)
+    report = inject(blueprint, root, out_dir, only, actors, max_amount, args.force or args.check, dry, config, ai)
 
     if args.report_md or args.sarif:
         rep = _reporting()
@@ -1292,7 +1364,8 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
         if not report:
             print("foundryguard: no contracts with drivable deposit/withdraw/stake_lock functions", file=sys.stderr)
         for r in report:
-            print(f"{r['contract']}: Handler.sol {r['handler']}, Invariant.t.sol {r['invariant']} -> {os.path.relpath(r['dir'])}")
+            via = f" [AI {r['ai']['model']}]" if r.get("ai") else ""
+            print(f"{r['contract']}{via}: Handler.sol {r['handler']}, Invariant.t.sol {r['invariant']} -> {os.path.relpath(r['dir'])}")
             for f in r["flows"]:
                 print(f"    + {f}")
             for s in r["skipped"]:

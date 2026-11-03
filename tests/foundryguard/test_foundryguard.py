@@ -11,11 +11,13 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src" / "cli"))
 
+import ai_generator  # noqa: E402
 import compiler  # noqa: E402
 import foundryguard  # noqa: E402
 import injector  # noqa: E402
@@ -825,6 +827,157 @@ class ReporterTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(reporter.main([str(FORGE_JSON), "--root", str(root), "-o", str(root / "j.md")]), 0)
         self.assertIn("forge JSON", (root / "j.md").read_text())
+
+
+AI_HANDLER = """```solidity
+// File: Handler.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test} from "forge-std/Test.sol";
+import {Ledger} from "../../../src/Token.sol";
+contract LedgerAIHandler is Test {
+    Ledger internal ledger;
+    uint256 public ghostMinted;
+    constructor(Ledger l) { ledger = l; }
+    function mint(uint256 seed, uint256 amount) external {
+        amount = bound(amount, 0, 1e24);
+        ledger.mint(address(uint160(bound(seed, 1, 4))), amount);
+        ghostMinted += amount;
+    }
+}
+```"""
+AI_TEST = """```solidity
+// File: Invariant.t.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test} from "forge-std/Test.sol";
+import {Ledger} from "../../../src/Token.sol";
+import {LedgerAIHandler} from "./Handler.sol";
+contract LedgerAIInvariantTest is Test {
+    Ledger internal ledger;
+    LedgerAIHandler internal handler;
+    function setUp() public {
+        ledger = new Ledger();
+        handler = new LedgerAIHandler(ledger);
+        targetContract(address(handler));
+    }
+    // catches supply drifting from what was minted
+    function invariant_supplyMatchesMinted() public view {
+        assertEq(ledger.totalSupply(), handler.ghostMinted());
+    }
+}
+```"""
+
+
+class AIGeneratorTests(ProjectCase):
+    """Layer 06: no network here, every call goes through a fake transport."""
+
+    def blueprint(self) -> dict:
+        bp = self.scan()
+        token = next(c for c in bp["contracts"] if c["name"] == "Token")
+        custom = json.loads(json.dumps(token))
+        custom["name"], custom["fqn"] = "Ledger", "src/Token.sol:Ledger"
+        custom["linearized_bases"] = ["src/Token.sol:Ledger"]
+        custom["categories"] = {}
+        for f in custom["functions"]:
+            f["category"] = None
+        bp["contracts"].append(custom)
+        return bp
+
+    def settings(self, provider="anthropic"):
+        key = "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"
+        return ai_generator.settings_from({}, {key: "test-key"})
+
+    def fake(self, answer: str, provider="anthropic"):
+        calls = []
+
+        def send(url, headers, body, timeout):
+            calls.append((url, headers, body))
+            if provider == "anthropic":
+                return {"content": [{"type": "text", "text": answer}]}
+            return {"choices": [{"message": {"content": answer}}]}
+        return send, calls
+
+    def run_ai(self, answer: str, provider="anthropic", **kw):
+        send, calls = self.fake(answer, provider)
+        out = self.root / "test" / "foundryguard"
+        report = injector.inject(self.blueprint(), self.root, out, kw.get("only"), 4, "1e24", kw.get("force", False),
+                                 kw.get("dry_run", False), {}, self.settings(provider), send)
+        return {r["contract"]: r for r in report}, calls
+
+    def test_settings_need_a_key(self):
+        self.assertIsNone(ai_generator.settings_from({}, {}))
+        s = ai_generator.settings_from({}, {"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"})
+        self.assertEqual((s.provider, s.model), ("anthropic", ai_generator.DEFAULT_MODELS["anthropic"]))
+        s = ai_generator.settings_from({"ai": {"provider": "openai", "model": "m"}},
+                                       {"OPENAI_API_KEY": "o", "OPENAI_BASE_URL": "http://localhost:8000/v1/"})
+        self.assertEqual((s.provider, s.model, s.base_url), ("openai", "m", "http://localhost:8000/v1"))
+        self.assertNotIn("api_key", repr(s))
+        with self.assertRaises(ai_generator.AIError):
+            ai_generator.settings_from({}, {"FOUNDRYGUARD_AI_PROVIDER": "x", "OPENAI_API_KEY": "o"})
+
+    def test_without_ai_custom_contracts_are_skipped(self):
+        report = self.gen(self.blueprint())
+        self.assertNotIn("Ledger", {r["contract"] for r in report})
+
+    def test_custom_contract_gets_ai_suite(self):
+        report, calls = self.run_ai(AI_HANDLER + "\n" + AI_TEST)
+        self.assertEqual(len(calls), 1)  # only Ledger: preset targets never reach the model
+        url, headers, body = calls[0]
+        self.assertTrue(url.endswith("/v1/messages"))
+        self.assertEqual(headers["x-api-key"], "test-key")
+        prompt = body["messages"][0]["content"]
+        self.assertIn("function mint(address to, uint256 amount) external", prompt)
+        self.assertIn("LedgerAIHandler", prompt)
+        self.assertNotIn("@notice", prompt)  # comments are stripped from the source
+        r = report["Ledger"]
+        self.assertEqual((r["handler"], r["invariant"]), ("written", "written"))
+        self.assertEqual(r["invariants"], ["invariant_supplyMatchesMinted"])
+        self.assertIn("SimpleVault", report)  # the preset suites are still generated
+        self.assertTrue(self.read("Ledger", "Handler.sol").startswith(ai_generator.GENERATED_MARKER))
+        self.assertNotIn("// File:", self.read("Ledger", "Invariant.t.sol"))
+        # existing files are kept and the model is not asked again; dry runs never call it
+        again, calls = self.run_ai(AI_HANDLER + AI_TEST)
+        self.assertEqual(calls, [])
+        self.assertTrue(again["Ledger"]["handler"].startswith("kept"))
+        dry, calls = self.run_ai(AI_HANDLER + AI_TEST, force=True, dry_run=True)
+        self.assertEqual(calls, [])
+        self.assertFalse(injector.is_stale([dry["Ledger"]]))
+
+    def test_openai_compatible_endpoint(self):
+        report, calls = self.run_ai(AI_HANDLER + AI_TEST, provider="openai", only={"Ledger"})
+        url, headers, body = calls[0]
+        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(headers["authorization"], "Bearer test-key")
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertEqual(report["Ledger"]["handler"], "written")
+
+    def test_dangerous_or_incomplete_answers_are_refused(self):
+        ffi = AI_TEST.replace("targetContract(address(handler));",
+                              "targetContract(address(handler)); vm.ffi(new string[](0));")
+        report, _ = self.run_ai(AI_HANDLER + ffi, only={"Ledger"})
+        self.assertEqual(report["Ledger"]["handler"], "not generated")
+        self.assertIn("vm.ffi", report["Ledger"]["blocked"][0])
+        self.assertFalse((self.root / "test" / "foundryguard" / "Ledger").exists())
+        report, _ = self.run_ai(AI_HANDLER, only={"Ledger"})
+        self.assertIn("did not contain", report["Ledger"]["blocked"][0])
+        renamed = AI_HANDLER.replace("contract LedgerAIHandler", "contract Other")
+        report, _ = self.run_ai(renamed + AI_TEST, only={"Ledger"})
+        self.assertIn("does not define contract LedgerAIHandler", report["Ledger"]["blocked"][0])
+
+    def test_strip_comments_keeps_strings(self):
+        src = 'string s = "a // b"; // gone\n/* gone\n too */ uint x;\n\n'
+        self.assertEqual(ai_generator.strip_comments(src), 'string s = "a // b";\nuint x;')
+
+    def test_cli_ai_flag_without_key_warns(self):
+        args = ["--root", str(self.root), "--ast", str(self.ast_fixture), "--ai"]
+        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                                                                  "FOUNDRYGUARD_AI_PROVIDER")}
+        err = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(foundryguard.main(["run", *args]), 0)
+        self.assertIn("neither ANTHROPIC_API_KEY nor OPENAI_API_KEY", err.getvalue())
 
 
 if __name__ == "__main__":
