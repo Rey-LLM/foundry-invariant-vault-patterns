@@ -47,7 +47,6 @@ EVENTS_KEY = reporting.EVENTS_KEY
 
 PASSED, FAILED, SKIPPED = "PASSED", "FAILED", "SKIPPED"
 BADGE_COLOR = {PASSED: "brightgreen", FAILED: "red", SKIPPED: "lightgrey"}
-ICON = {PASSED: "✅", FAILED: "❌", SKIPPED: "⏭️"}
 
 # --------------------------------------------------------------------------- #
 # Data model
@@ -576,7 +575,7 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
     suites = run.suites()
     passed, failed, skipped = run.count(PASSED), run.count(FAILED), run.count(SKIPPED)
     out = [
-        "# 🛡️ FoundryGuard Report",
+        "# FoundryGuard Report",
         "",
         " ".join([badge("FoundryGuard", run.status), badge("passed", PASSED, str(passed)),
                   badge("failed", FAILED if failed else PASSED, str(failed)),
@@ -586,12 +585,12 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
         "",
     ]
     if not run.tests:
-        out += ["⚠️ **No test results were found in the forge output.** Did the suites compile and run?", ""]
+        out += ["**No test results were found in the forge output.** Did the suites compile and run?", ""]
     elif failed:
-        out += [f"**{ICON[FAILED]} {failed} of {len(run.tests)} test(s) failed.** "
+        out += [f"**{failed} of {len(run.tests)} test(s) failed.** "
                 "The counter-examples below are the shrunk call sequences forge found.", ""]
     else:
-        out += [f"**{ICON[PASSED]} All {passed} test(s) passed** across {len(suites)} suite(s).", ""]
+        out += [f"**All {passed} test(s) passed** across {len(suites)} suite(s).", ""]
 
     out += ["## Summary", "", "| Suite | Status | Passed | Failed | Skipped |", "| :-- | :-: | --: | --: | --: |"]
     for sid, tests in suites.items():
@@ -604,7 +603,7 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
         out += ["## Broken invariants and failed tests", ""]
         cache: dict = {}
         for t in run.failures:
-            out += [f"### {ICON[FAILED]} `{t.contract}.{t.name}`", "", badge(t.kind, FAILED), ""]
+            out += [f"### `{t.contract}.{t.name}`", "", badge(t.kind, FAILED), ""]
             out.append(f"- **Suite:** `{t.suite}`")
             out.append(f"- **Reason:** `{_md(t.reason) or 'failed (no reason given)'}`")
             if t.kind == "invariant" and (t.runs is not None or t.calls is not None):
