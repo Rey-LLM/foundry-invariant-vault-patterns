@@ -6,6 +6,7 @@
     foundryguard gen                  blueprint -> test/foundryguard/<Contract>/ suites
     foundryguard run [--test]         scan + gen (+ forge test on the generated suites + FoundryGuard_Report.md)
     foundryguard check                CI: exit 1 when generated suites are missing or stale
+    foundryguard heal                 compile the generated suites and fix what the local compiler rejects
     foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, Markdown, SARIF
 
 Run it as ``foundryguard`` after ``pipx install .`` or as ``python3 src/cli/foundryguard.py``.
@@ -22,9 +23,10 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from . import injector, parser, reporter, reporting
+    from . import healer, injector, parser, reporter, reporting
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import healer  # type: ignore
     import injector  # type: ignore
     import parser  # type: ignore
     import reporter  # type: ignore
@@ -79,6 +81,14 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 # model = "claude-sonnet-5-5"
 # base_url = "https://api.anthropic.com"
 # max_source_chars = 12000
+
+[heal]
+# Layer 08: after writing the suites, compile them and fix what the local compiler rejects
+# (pragma, data location, visibility, override, mutability). On by default when forge is on PATH.
+# enabled = true
+# compiler = "auto"           # forge, solc or solcjs; auto = forge if on PATH
+# max_rounds = 5
+# warnings = true             # also fix mutability, unused parameter and SPDX warnings
 """
 
 
@@ -151,6 +161,23 @@ def cmd_run(args, check: bool = False) -> int:
     return rc
 
 
+def cmd_heal(args) -> int:
+    root = Path(args.root).resolve()
+    hcfg = parser.load_config(root, args.config).get("heal", {})
+    out = args.out or parser.load_config(root, args.config).get("generate", {}).get("out", "test/foundryguard")
+    out_dir = Path(out) if Path(out).is_absolute() else root / out
+    rounds = args.rounds if args.rounds is not None else int(hcfg.get("max_rounds", healer.DEFAULT_ROUNDS))
+    warnings = not args.no_warnings and bool(hcfg.get("warnings", True))
+    result = healer.heal(root, out_dir, args.compiler or hcfg.get("compiler", "auto"), args.solc or hcfg.get("solc"),
+                         max(rounds, 0), warnings)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    healer.summarize(result)
+    if result.status == "failed":
+        return 1
+    return 1 if (args.strict and result.status == "skipped") else 0
+
+
 def cmd_report(args) -> int:
     root = Path(args.root).resolve()
     text = sys.stdin.read() if args.results == "-" else Path(args.results).read_text(encoding="utf-8", errors="replace")
@@ -221,6 +248,18 @@ def build_cli() -> argparse.ArgumentParser:
             p.add_argument("--report", help=f"with --test: report path (default: <root>/{reporter.REPORT_FILE})")
             p.add_argument("--no-report", action="store_true", help=f"with --test: do not write {reporter.REPORT_FILE}")
         p.set_defaults(func=(lambda a, c=check: cmd_run(a, c)))
+
+    p = sub.add_parser("heal", help="compile the generated suites and fix what the local compiler rejects")
+    p.add_argument("--root", default=".")
+    p.add_argument("--config")
+    p.add_argument("--out", help="generated suites dir, relative to root (default: test/foundryguard)")
+    p.add_argument("--compiler", choices=healer.DRIVERS, help="forge, solc or solcjs (default: forge if on PATH)")
+    p.add_argument("--solc", help="solc or solcjs binary for the solc drivers")
+    p.add_argument("--rounds", type=int, help=f"maximum heal rounds (default: {healer.DEFAULT_ROUNDS})")
+    p.add_argument("--no-warnings", action="store_true", help="only fix errors, leave warnings alone")
+    p.add_argument("--strict", action="store_true", help="exit 1 when the suites could not be compiled at all")
+    p.add_argument("--json", action="store_true", help="print the heal result as JSON")
+    p.set_defaults(func=cmd_heal)
 
     p = sub.add_parser("report", help=f"turn forge test output into {reporter.REPORT_FILE} (+ CI Markdown / SARIF)")
     p.add_argument("results", help="file with `forge test --json` or `forge test -vvv` output, or '-' for stdin")

@@ -103,6 +103,34 @@ jobs:
           must "Counter-example call trace" report-from-stdout.md
           cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY"
 
+  self-heal:
+    name: Heal loop repairs a handler forge rejects
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/broken
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - name: Generate (the heal loop compiles the suites with forge build --json)
+        run: python3 ../../../../src/cli/foundryguard.py run
+      - name: Break the handler the way another solc version would reject it
+        run: |
+          H=test/foundryguard/LeakyVault/Handler.sol
+          cp "$H" /tmp/Handler.clean.sol
+          sed -i 's/address\[\] memory _tokens/address[] _tokens/; s/function actorCount() external view/function actorCount() view/' "$H"
+          if forge build > /dev/null 2>&1; then echo "::error::the broken handler still compiles"; exit 1; fi
+      - run: python3 ../../../../src/cli/foundryguard.py heal --compiler forge --strict
+      - name: The healed suite builds and the fixes are recorded
+        run: |
+          forge build
+          grep -q "address\[\] memory _tokens" test/foundryguard/LeakyVault/Handler.sol
+          grep -q '"data-location"' test/foundryguard/foundryguard.heal.json
+
   hook-reentrancy:
     name: Preset 04 catches hook read-reentrancy
     runs-on: ubuntu-latest

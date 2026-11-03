@@ -1157,3 +1157,154 @@ class EcosystemTests(ProjectCase):
         shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
         result = compiler.compile_with_solc(self.root, ["test/foundryguard/HubEcosystem/Invariant.t.sol"], "auto")
         self.assertIn("test/foundryguard/HubEcosystem/Handler.sol", result.units)
+
+
+import healer  # noqa: E402
+
+PRAGMA_MISMATCH = ("Source file requires different compiler version (current compiler is 0.8.19+commit.7dd6d404.Linux.g++) "
+                   "- note that nightly builds are considered to be strictly less than the released version")
+
+
+class HealerTests(ProjectCase):
+    """Layer 08: Generate -> Compile -> Heal -> Re-compile."""
+
+    def out(self) -> Path:
+        return self.root / "test" / "foundryguard"
+
+    def handler(self) -> Path:
+        return self.out() / "SimpleVault" / "Handler.sol"
+
+    def problem(self, needle: bytes, message: str, severity: str = "error", type_: str = "TypeError",
+                code: str = "", span: bool = False) -> healer.Problem:
+        data = self.handler().read_bytes()
+        start = data.index(needle)
+        return healer.Problem(severity, type_, code, message, "test/foundryguard/SimpleVault/Handler.sol", start,
+                              start + len(needle) if span else None)
+
+    def fake_compiler(self, *rounds: list):
+        """Each call returns the next list of problems (as a thunk, so offsets match the file at that point)."""
+        calls = list(rounds)
+
+        def run():
+            problems = calls.pop(0)() if calls else []
+            return healer.Build("fake", "0.8.19", problems)
+        return run
+
+    def test_rules_rewrite_the_reported_lines(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        h = self.handler()
+        src = h.read_text()
+        src = src.replace("address[] memory _tokens", "address[] _tokens")
+        src = src.replace("function actorCount() external view", "function actorCount() view")
+        src = src.replace("function warp(uint256 dtSeed) external {", "function warp(uint256 dtSeed) external override {")
+        h.write_text(src)
+        compile_fn = self.fake_compiler(lambda: [
+            self.problem(b"pragma solidity", PRAGMA_MISMATCH, type_="ParserError", code="5333"),
+            self.problem(b"address[] _tokens", 'Data location must be "memory" or "calldata" for parameter in function, '
+                                               'but none was given.', type_="TypeError", code="6651", span=True),
+            self.problem(b"function actorCount", 'No visibility specified. Did you intend to add "external"?',
+                         type_="SyntaxError", code="4937"),
+            self.problem(b"function warp", "Function has override specified but does not override anything.",
+                         code="7792"),
+        ], lambda: [])
+        result = healer.heal(self.root, self.out(), compile_fn=compile_fn)
+        self.assertEqual(result.status, "healed")
+        self.assertEqual(sorted(f["rule"] for f in result.fixes), ["data-location", "override", "pragma", "visibility"])
+        healed = h.read_text()
+        self.assertIn("pragma solidity ^0.8.19;", healed)
+        self.assertIn("address[] memory _tokens", healed)
+        self.assertIn("function actorCount() external view returns (uint256) {", healed)
+        self.assertIn("function warp(uint256 dtSeed) external {", healed)
+        log = json.loads((self.out() / healer.HEAL_FILE).read_text())
+        self.assertEqual(log["schema"], healer.HEAL_SCHEMA)
+        self.assertEqual(len(log["files"]["SimpleVault/Handler.sol"]), 4)
+
+    def test_heal_log_is_replayed_on_regenerate(self):
+        bp = self.scan()
+        self.gen(bp, only={"SimpleVault"})
+        compile_fn = self.fake_compiler(
+            lambda: [self.problem(b"pragma solidity", PRAGMA_MISMATCH, type_="ParserError", code="5333")], lambda: [])
+        self.assertEqual(healer.heal(self.root, self.out(), compile_fn=compile_fn).status, "healed")
+        # A forced regenerate renders the template again and keeps the fix; check does not call it stale.
+        self.gen(bp, only={"SimpleVault"}, force=True)
+        self.assertIn("pragma solidity ^0.8.19;", self.handler().read_text())
+        self.assertFalse(injector.is_stale(self.gen(bp, only={"SimpleVault"}, dry_run=True)))
+
+    def test_warning_rules_and_opt_out(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        h = self.handler()
+        h.write_text(h.read_text().replace("function unitCount() external view", "function unitCount() external"))
+        warn = lambda: [self.problem(b"function unitCount", "Function state mutability can be restricted to view",  # noqa: E731
+                                     severity="warning", type_="Warning", code="2018")]
+        off = healer.heal(self.root, self.out(), warnings=False, compile_fn=self.fake_compiler(warn))
+        self.assertEqual((off.status, off.fixes, off.warnings), ("passed", [], 1))
+        on = healer.heal(self.root, self.out(), compile_fn=self.fake_compiler(warn, lambda: []))
+        self.assertEqual(on.status, "healed")
+        self.assertIn("function unitCount() external view returns (uint256) {", h.read_text())
+
+    def test_errors_outside_generated_files_are_not_touched(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        before = (self.root / "src" / "SimpleVault.sol").read_bytes()
+        bad = lambda: [healer.Problem("error", "TypeError", "6651", 'Data location must be "memory" or "calldata" '  # noqa: E731
+                                      "for parameter in function, but none was given.", "src/SimpleVault.sol", 10, 20)]
+        result = healer.heal(self.root, self.out(), compile_fn=self.fake_compiler(bad, bad))
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.fixes, [])
+        self.assertIn("src/SimpleVault.sol", result.remaining[0])
+        self.assertEqual((self.root / "src" / "SimpleVault.sol").read_bytes(), before)
+
+    def test_unresolved_imports_skip_instead_of_fail(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        missing = lambda: [healer.Problem("error", "ParserError", "6275", 'Source "forge-std/Test.sol" not found: '  # noqa: E731
+                                          "File not found.", "test/foundryguard/SimpleVault/Invariant.t.sol", 0, 10)]
+        result = healer.heal(self.root, self.out(), compile_fn=self.fake_compiler(missing))
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("imports did not resolve", result.note)
+
+    def test_forge_text_diagnostics_fallback(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        text = ("Compiler run failed:\n\x1b[31mError (6651)\x1b[0m: Data location must be \"memory\" or \"calldata\" for "
+                "parameter in function, but none was given.\n  --> test/foundryguard/SimpleVault/Handler.sol:41:31:\n")
+        (p,) = healer.problems_from_text(text, self.root)
+        self.assertEqual((p.severity, p.code, p.file), ("error", "6651", "test/foundryguard/SimpleVault/Handler.sol"))
+        self.assertEqual(self.handler().read_bytes()[:p.start].count(b"\n") + 1, 41)
+        doc = healer._json_document('Compiling 3 files\n{"errors": [{"severity": "warning", "type": "Warning", '
+                                    '"message": "x", "sourceLocation": {"file": "a.sol", "start": 1, "end": 2}}]}')
+        self.assertEqual(healer.problems_from_json(doc)[0].file, "a.sol")
+
+    def test_gen_heals_only_when_asked_or_forge_present(self):
+        bp_path = self.tmp / "bp.json"
+        bp_path.write_text(json.dumps(self.scan()))
+        with unittest.mock.patch.object(injector.shutil, "which", return_value=None), \
+                unittest.mock.patch.object(healer, "heal") as heal, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(foundryguard.main(["gen", str(bp_path), "--root", str(self.root)]), 0)
+            heal.assert_not_called()
+            heal.return_value = healer.HealResult("failed", "fake", 2, remaining=["x.sol: TypeError: nope"])
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(foundryguard.main(["gen", str(bp_path), "--root", str(self.root), "--heal"]), 1)
+            self.assertIn("still do not compile", err.getvalue())
+            heal.reset_mock()
+            foundryguard.main(["check", "--root", str(self.root), "--ast", str(self.ast_fixture), "--heal"])
+            heal.assert_not_called()  # check never writes, so it never heals
+
+    @needs_solc
+    def test_live_heal_with_solc(self):
+        self.gen(self.scan(), only={"SimpleVault"})
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        h = self.handler()
+        clean = h.read_text()
+        broken = (clean.replace("address[] memory _tokens", "address[] _tokens")
+                  .replace("function actorCount() external view", "function actorCount() view")
+                  .replace("function warp(uint256 dtSeed) external {", "function warp(uint256 dtSeed) external view override {")
+                  .replace("function unitCount() external view returns", "function unitCount() external pure returns"))
+        h.write_text(broken)
+        result = healer.heal(self.root, self.out(), "auto")
+        self.assertEqual(result.status, "healed", result.remaining)
+        rules = {f["rule"] for f in result.fixes}
+        self.assertTrue({"data-location", "visibility", "override", "mutability"} <= rules, rules)
+        healed = h.read_text()
+        self.assertIn("address[] memory _tokens", healed)
+        self.assertIn("function warp(uint256 dtSeed) external {", healed)
+        self.assertIn("function unitCount() external view returns", healed)
+        files = healer.generated_files(self.root, self.out())
+        self.assertEqual(healer.compile_solc(self.root, files).errors, [])

@@ -63,16 +63,18 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 if __package__:
-    from . import ai_generator
+    from . import ai_generator, healer
     from .blueprints import hook_reentrancy, transient_storage
 else:  # executed as a plain script directory (python3 src/cli/injector.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import ai_generator  # type: ignore
+    import healer  # type: ignore
     from blueprints import hook_reentrancy, transient_storage  # type: ignore
 
 SUPPORTED_SCHEMA = "foundryguard.blueprint/v2"
@@ -1861,7 +1863,14 @@ def inject_ecosystem(eco: EcosystemPlan, root: Path, out_dir: Path, force: bool,
 # --------------------------------------------------------------------------- #
 
 
+# Layer 08: line fixes the healer made for the local compiler, replayed on every render so a
+# healed suite stays healed and `check` does not call it stale. Set by `inject`.
+_HEALS: "healer.HealLog | None" = None
+
+
 def write_file(path: Path, content: str, force: bool, dry_run: bool) -> str:
+    if _HEALS is not None and path.suffix == ".sol":
+        content = _HEALS.apply(path, content)
     if path.exists():
         existing = path.read_text()
         if existing == content:
@@ -1909,6 +1918,17 @@ def inject_ai(t: Target, root: Path, out_dir: Path, force: bool, dry_run: bool,
 def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, actors: int,
            max_amount: str, force: bool, dry_run: bool, config: dict | None = None,
            ai: "ai_generator.AISettings | None" = None, ai_transport=None) -> list[dict]:
+    global _HEALS
+    _HEALS = healer.HealLog.load(out_dir)
+    try:
+        return _inject(blueprint, root, out_dir, only, actors, max_amount, force, dry_run, config, ai, ai_transport)
+    finally:
+        _HEALS = None
+
+
+def _inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, actors: int,
+            max_amount: str, force: bool, dry_run: bool, config: dict | None,
+            ai: "ai_generator.AISettings | None", ai_transport) -> list[dict]:
     report = []
     unmatched: list[Target] = []
     targets = build_targets(blueprint, only, config, unmatched if ai else None)
@@ -1988,6 +2008,14 @@ def add_gen_args(ap: argparse.ArgumentParser) -> None:
                     help="do not generate cross-contract ecosystem suites (Layer 07)")
     ap.add_argument("--ai", action="store_true",
                     help="send contracts no preset matches to an LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+    heal = ap.add_mutually_exclusive_group()
+    heal.add_argument("--heal", dest="heal", action="store_true", default=None,
+                      help="compile the generated suites and fix what the local compiler rejects "
+                           "(default: on when forge is on PATH)")
+    heal.add_argument("--no-heal", dest="heal", action="store_false", help="do not compile or heal the generated suites")
+    ap.add_argument("--heal-compiler", choices=healer.DRIVERS,
+                    help="compiler for the heal loop (default: forge if on PATH, else solc / solcjs)")
+    ap.add_argument("--heal-rounds", type=int, help=f"maximum heal rounds (default: {healer.DEFAULT_ROUNDS})")
 
 
 def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root: Path) -> int:
@@ -2022,6 +2050,17 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
         if args.sarif:
             Path(args.sarif).write_text(json.dumps(rep.sarif_from_generation(report, root), indent=2) + "\n")
 
+    healed = None
+    hcfg = config.get("heal", {})
+    want = args.heal if getattr(args, "heal", None) is not None else hcfg.get("enabled")
+    if want is None:
+        want = bool(shutil.which("forge"))
+    if want and report and not dry:
+        rounds = args.heal_rounds if getattr(args, "heal_rounds", None) is not None else int(hcfg.get("max_rounds", healer.DEFAULT_ROUNDS))
+        healed = healer.heal(root, out_dir, getattr(args, "heal_compiler", None) or hcfg.get("compiler", "auto"),
+                             getattr(args, "solc", None) or hcfg.get("solc"), max(rounds, 0),
+                             bool(hcfg.get("warnings", True)))
+
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -2042,6 +2081,10 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
                 print(f"    * {inv}")
             for w in r.get("warnings", []) + r.get("setup_notes", []) + r.get("blocked", []):
                 print(f"    ! {w}")
+    if healed is not None:
+        healer.summarize(healed)
+        if healed.status == "failed":
+            return 1
     if args.check and is_stale(report):
         print("foundryguard: generated suites are missing or out of date (run `foundryguard gen --force`)", file=sys.stderr)
         return 1
