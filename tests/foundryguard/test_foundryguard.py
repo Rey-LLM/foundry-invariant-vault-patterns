@@ -18,12 +18,19 @@ sys.path.insert(0, str(REPO / "src" / "cli"))
 import foundryguard  # noqa: E402
 import injector  # noqa: E402
 import parser as fg_parser  # noqa: E402
+import reporter  # noqa: E402
 import reporting  # noqa: E402
+from blueprints import hook_reentrancy  # noqa: E402
 
 logging.disable(logging.CRITICAL)
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "project"
-AST_OUTPUT = Path(__file__).resolve().parent / "fixtures" / "ast" / "solc-output.json"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+FIXTURE = FIXTURES / "project"
+HOOKS_FIXTURE = FIXTURES / "hooks"
+AST_OUTPUT = FIXTURES / "ast" / "solc-output.json"
+HOOKS_AST_OUTPUT = FIXTURES / "ast" / "hooks-solc-output.json"
+FORGE_STDOUT = FIXTURES / "forge" / "leaky-stdout.txt"
+FORGE_JSON = FIXTURES / "forge" / "leaky-results.json"
 
 
 def contracts(blueprint: dict) -> dict[str, dict]:
@@ -31,10 +38,12 @@ def contracts(blueprint: dict) -> dict[str, dict]:
 
 
 class ProjectCase(unittest.TestCase):
+    fixture = FIXTURE
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="foundryguard-"))
         self.root = self.tmp / "project"
-        shutil.copytree(FIXTURE, self.root)
+        shutil.copytree(self.fixture, self.root)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -250,6 +259,144 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual([(f[2], f[3]) for f in failed], [("invariant_tokenSolvency()", "token balance below totalDeposits")])
         self.assertEqual(reporting.test_count(data), 1)
         self.assertEqual(reporting.test_count({}), 0)
+
+
+class HookPresetTests(ProjectCase):
+    fixture = HOOKS_FIXTURE
+
+    def test_detects_hook_callbacks(self):
+        cs = contracts(self.scan())
+        self.assertEqual(cs["HookedVault"]["hooks"]["callbacks"], ["afterWithdraw", "beforeDeposit"])
+        self.assertEqual(cs["UnlockPool"]["hooks"]["callbacks"], ["unlockCallback"])
+        self.assertFalse(cs["IVaultHooks"]["hooks"])
+        # Callback entry points are not value flows.
+        self.assertEqual(cs["IUnlockCallback"]["categories"], {})
+
+    def test_callback_detection_patterns(self):
+        body = """
+            key.hooks.beforeSwap(msg.sender, key, params, hookData);
+            bytes memory r = IUnlockCallback(msg.sender).unlockCallback(data);
+            IVaultHooks(hookAddr).afterDeposit{gas: 50000}(msg.sender, amount);
+            token.transferFrom(msg.sender, address(this), amount);
+            oracle.beforeUpdate();
+            ICallee(msg.sender).uniswapV3SwapCallback(a0, a1, data);
+        """
+        found = {(c["name"], c["receiver"]) for c in hook_reentrancy.detect_callbacks(body)}
+        self.assertEqual(found, {("beforeSwap", "key.hooks"), ("unlockCallback", "msg.sender"),
+                                 ("afterDeposit", "hookAddr"), ("uniswapV3SwapCallback", "msg.sender")})
+
+    def test_ast_backend_detects_the_same_hooks(self):
+        shutil.copy(HOOKS_AST_OUTPUT, self.root / "ast.json")
+        ast = contracts(fg_parser.build_blueprint(self.root, [], backend="ast", build_dir="ast.json", run_build=False))
+        rgx = contracts(self.scan())
+        self.assertEqual({k: v["hooks"] for k, v in ast.items()}, {k: v["hooks"] for k, v in rgx.items()})
+
+    def test_buggy_vault_gets_read_consistency_check(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        r = report["HookedVault"]
+        self.assertIn("invariant_hook_readConsistency", r["invariants"])
+        self.assertNotIn("invariant_hook_lockEngagedDuringCallback", r["invariants"])  # no lock getter
+        self.assertEqual(r["hooks"]["views"], ["pricePerShare", "totalAssets", "totalSupply"])
+        inv = self.read("HookedVault", "Invariant.t.sol")
+        self.assertIn("hookProbes[0] /* IVaultHooks hooks_: Preset 04 hook probe */", inv)
+        self.assertIn("new HookedVaultGuardHandler(target, tokens, rewardTokens, hookProbes)", inv)
+        handler = self.read("HookedVault", "Handler.sol")
+        self.assertIn("contract HookedVaultHookProbe {", handler)
+        self.assertIn('_hookBegin("");', handler)
+        self.assertIn("_hookEnd(false);", handler)
+
+    def test_guarded_vault_gets_lock_and_reentry_checks(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        r = report["GuardedHookVault"]
+        self.assertEqual(r["hooks"]["lock_getter"], "locked")
+        self.assertEqual(r["hooks"]["nonreentrant_flows"], ["deposit(uint256)", "withdraw(uint256)"])
+        self.assertIn("invariant_hook_lockEngagedDuringCallback", r["invariants"])
+        self.assertIn("invariant_hook_guardedFlowsNotReentered", r["invariants"])
+        inv = self.read("GuardedHookVault", "Invariant.t.sol")
+        self.assertIn('abi.encodeWithSignature("setHooks(address)", hookProbes[0])', inv)
+        handler = self.read("GuardedHookVault", "Handler.sol")
+        self.assertIn('_hookBegin(abi.encodeWithSignature("withdraw(uint256)", shares_));', handler)
+
+    def test_msg_sender_callback_with_bytes_return(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        self.assertEqual(report["UnlockPool"]["hooks"]["receivers"], ["msg.sender"])
+        self.assertEqual(report["UnlockPool"]["setup_notes"], [])
+        handler = self.read("UnlockPool", "Handler.sol")
+        self.assertIn('import { IUnlockCallback } from "../../../src/UnlockPool.sol";', handler)
+        self.assertIn('if (msg.sig == IUnlockCallback.unlockCallback.selector) return abi.encode(bytes(""));', handler)
+
+    def test_projects_without_hooks_are_unchanged(self):
+        root = self.tmp / "plain"
+        shutil.copytree(FIXTURE, root)
+        bp = fg_parser.build_blueprint(root, [], backend="regex", run_build=False)
+        injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
+        self.assertNotIn("HookProbe", (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text())
+
+
+class ReporterTests(unittest.TestCase):
+    def test_parses_forge_stdout(self):
+        run = reporter.parse_text(FORGE_STDOUT.read_text(), "forge.log")
+        self.assertEqual(run.fmt, "forge stdout")
+        self.assertEqual((run.count(reporter.PASSED), run.count(reporter.FAILED)), (4, 2))  # recap not double-counted
+        inv = next(t for t in run.failures if t.name == "invariant_tokenSolvency()")
+        self.assertEqual(inv.kind, "invariant")
+        self.assertEqual(inv.shrunk_from, 7)
+        self.assertEqual([c.signature for c in inv.sequence], ["deposit(uint256,uint256)", "withdraw(uint256,uint256)"])
+        self.assertEqual(inv.sequence[0].args, ["3", "1000000000000000000000"])  # [1e21] annotation dropped
+        self.assertEqual(inv.sequence[0].target, "LeakyVaultGuardHandler")
+        self.assertTrue(inv.traces)
+        fuzz = next(t for t in run.failures if t.name == "testFuzz_roundTrip(uint256)")
+        self.assertEqual((fuzz.kind, fuzz.reason, fuzz.sequence[0].args), ("fuzz", "assertion failed: 1 != 2", ["42"]))
+        self.assertEqual(fuzz.logs, ["amount 42"])
+
+    def test_parses_forge_json(self):
+        run = reporter.parse_text(FORGE_JSON.read_text(), "results.json")
+        self.assertEqual(run.fmt, "forge JSON")
+        inv = run.failures[0]
+        self.assertEqual((inv.name, inv.calls, len(inv.sequence)), ("invariant_tokenSolvency()", 2, 2))
+        self.assertEqual(inv.sequence[1].args, ["3", "1000"])
+
+    def test_shared_campaign_event_names_real_invariant(self):
+        target = "test/foundryguard/L/Invariant.t.sol:LGuardInvariantTest"
+        text = json.dumps({target: {"test_results": {
+            "invariant_a()": {"status": "Failure", "counterexample": {"Sequence": [{"signature": "deposit(uint256)"}]}},
+            "invariant_tokenSolvency()": {"status": "Success"}}}}) + "\n" + json.dumps(
+            {"event": "failure", "invariant": "invariant_tokenSolvency", "target": target, "reason": "below"}) + "\n"
+        run = reporter.parse_text(text)
+        broken = next(t for t in run.tests if t.name == "invariant_tokenSolvency()")
+        self.assertEqual((broken.status, broken.reason, len(broken.sequence)), (reporter.FAILED, "below", 1))
+        self.assertIn("invariant_tokenSolvency", next(t for t in run.tests if t.name == "invariant_a()").note)
+
+    def test_report_markdown(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        handler = root / "test" / "foundryguard" / "LeakyVault" / "Handler.sol"
+        handler.parent.mkdir(parents=True)
+        handler.write_text("function deposit(uint256 actorSeed, uint256 amountSeed) external {}\n"
+                           "function withdraw(uint256 actorSeed, uint256 amountSeed) external {}\n")
+        md = reporter.render(reporter.parse_text(FORGE_STDOUT.read_text(), "forge.log"), root, generated="now")
+        self.assertIn("https://img.shields.io/badge/FoundryGuard-FAILED-red", md)
+        self.assertIn("https://img.shields.io/badge/PASSED-brightgreen", md)
+        self.assertIn("#### Counter-example call trace", md)
+        self.assertIn("`deposit(actorSeed: 3, amountSeed: 1000000000000000000000)`", md)
+        self.assertIn("    handler.withdraw(3, 1000);\n    invariant_tokenSolvency();", md)
+        self.assertIn("--match-test 'invariant_tokenSolvency' -vvvv", md)
+        clean = reporter.render(reporter.Run(source="x", fmt="forge JSON"), root)
+        self.assertIn("No test results were found", clean)
+
+    def test_cli_report_writes_root_report_from_stdout(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = foundryguard.main(["report", str(FORGE_STDOUT), "--root", str(root), "--fail-on-failure",
+                                    "--sarif", str(root / "r.sarif")])
+        self.assertEqual(rc, 1)
+        self.assertIn("invariant_tokenSolvency", (root / reporter.REPORT_FILE).read_text())
+        results = json.loads((root / "r.sarif").read_text())["runs"][0]["results"]
+        self.assertEqual(len(results), 2)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(reporter.main([str(FORGE_JSON), "--root", str(root), "-o", str(root / "j.md")]), 0)
+        self.assertIn("forge JSON", (root / "j.md").read_text())
 
 
 if __name__ == "__main__":

@@ -41,7 +41,8 @@ src/
 ├── erc4626-inflation/     Module 01 · MockERC4626.sol · Handler.sol
 ├── twap-validation/       Module 02 · PriceOracleModel.sol
 ├── flashloan-reward/      Module 03 · StakingPool.sol
-└── cli/                   FoundryGuard · foundryguard.py · parser.py · ast_backend.py · injector.py · reporting.py
+└── cli/                   FoundryGuard · foundryguard.py · parser.py · ast_backend.py · injector.py · reporter.py · reporting.py
+    └── blueprints/        invariant preset library · hook_reentrancy.py (Preset 04)
 test/
 ├── erc4626-inflation/     InflationInvariant.t.sol
 ├── twap-validation/       OracleHandler.sol · OracleInvariant.t.sol
@@ -147,9 +148,9 @@ forge test --match-path "test/foundryguard/*" -vvv
 | `foundryguard init` | Writes a commented `foundryguard.toml`. |
 | `foundryguard scan` | Turns Solidity into a `foundryguard.json` blueprint. |
 | `foundryguard gen` | Turns the blueprint into `test/foundryguard/<Contract>/` suites. |
-| `foundryguard run [--test]` | Runs `scan` and `gen`, plus `forge test` with `--test`. |
+| `foundryguard run [--test]` | Runs `scan` and `gen`, plus `forge test` and `FoundryGuard_Report.md` with `--test`. |
 | `foundryguard check` | For CI: exits 1 when generated suites are missing or stale. Writes nothing. |
-| `foundryguard report results.json` | Turns `forge test --json` output into Markdown and SARIF. |
+| `foundryguard report results` | Turns `forge test --json` or `forge test -vvv` output (a file, or `-` for stdin) into `FoundryGuard_Report.md`, plus CI Markdown and SARIF. |
 
 The old entry points still work: `python3 src/cli/parser.py` and `python3 src/cli/injector.py foundryguard.json`.
 
@@ -202,7 +203,36 @@ Each preset is emitted only when the scanned contract supports it:
 | Single-unit vault | `withdrawalsBoundedByDeposits` |
 | Staking / ERC-20 accounting | `actorBalancesBoundedByTotal`, `tokenSolvency` (token balance ≥ `totalStaked` / `totalDeposits`) |
 | Rewards | `rewardsBoundedByFunding_<token>`: actors never receive more rewards than were funded |
+| 04 · Hook read-reentrancy | `hook_readConsistency`, `hook_lockEngagedDuringCallback`, `hook_guardedFlowsNotReentered` (see below) |
 | Always | `afterInvariant`: fails a run in which no value-flow call succeeded |
+
+### Preset 04: hook-based read-reentrancy (Uniswap v4 style)
+
+The scanner reads function bodies and flags a contract that calls out to an external hook mid-flow: the v4 `IHooks` surface (`beforeSwap`, `afterAddLiquidity`, ...), `before*`/`after*` calls on a hook-typed receiver, `unlockCallback` / `lockAcquired` / `*Callback` on `msg.sender`, and `onFlashLoan`. For such a contract the generated suite:
+
+- deploys `<Contract>HookProbe` contracts and uses them as **every fuzz actor**; `hookProbes[0]` is also the registered hook, through a hook-typed constructor or initializer parameter (`IHooks hooks_`) or a `setHook(s)`-style setter;
+- while a handler flow runs, each callback that reaches a probe snapshots the target's price and accounting views (`totalAssets`, `totalSupply`, `*Price*`, `*Rate`, reserves, `convertToAssets(1e18)`, ...), reads the lock getter (`locked`, `reentrancyGuardEntered`, ...), and re-enters the running flow when it carries `nonReentrant` / `lock`;
+- answers every hook with its own selector followed by zero words (so `bytes4` and v4 `(bytes4, delta, fee)` returns decode), and `bytes`-returning callbacks such as `unlockCallback` with empty bytes.
+
+| Invariant | Fails when |
+| :-- | :-- |
+| `invariant_hook_readConsistency` | a view read inside a callback equals neither the state before nor the state after the flow (assets sent but shares not yet burned, and so on). Views that revert mid-callback count as a read guard, not a failure. |
+| `invariant_hook_lockEngagedDuringCallback` | the lock getter reads `false` while the contract is calling out |
+| `invariant_hook_guardedFlowsNotReentered` | a `nonReentrant` flow was re-entered successfully from the callback |
+
+`tests/foundryguard/fixtures/hooks` holds a broken `HookedVault` (hook runs before the shares are burned), its fixed `GuardedHookVault`, and a v4-style `UnlockPool`; CI requires the first to fail and the other two to pass.
+
+### `FoundryGuard_Report.md`
+
+`foundryguard report` and `foundryguard run --test` write a Markdown report to the project root (`--report PATH` to move it, `--no-report` to skip it). It reads `forge test --json` (one document or one object per line) and plain `forge test -vv` / `-vvv` / `-vvvv` stdout:
+
+- PASSED / FAILED badges for the run, every suite and every test, with runs, calls, reverts and gas;
+- for each broken invariant or failed fuzz test: the reason, the shrunk counter-example call sequence (sender, target, function, arguments named from the handler source), a Solidity replay test, the exact `forge test --match-test ... -vvvv` command, and the logs and traces forge printed;
+- the invariant that really broke when forge files a shared campaign under another name.
+
+```sh
+forge test -vvv | foundryguard report -        # or: python3 src/cli/reporter.py forge.log
+```
 
 ### `foundryguard.toml`
 
@@ -244,7 +274,7 @@ python3 -m unittest discover -s tests/foundryguard -v
 ### Limitations
 
 - The generated suites are a strong starting point, not an audit. Add the protocol-specific invariants only you can state, using the ghost variables.
-- Functions with array, struct, `bytes` or `string` parameters are listed as skipped, not fuzzed.
+- Functions with array, struct, `bytes` or `string` parameters are listed as skipped, not fuzzed. That includes a real v4 `PoolManager` (`PoolKey` structs), so Preset 04 targets contracts with elementary-typed flows that call hooks, not the PoolManager itself. Hook addresses are not mined for v4 permission bits.
 - Contract-typed constructor arguments that are not tokens (oracles, routers) get `address(this)` with a `FOUNDRYGUARD` note. Pass real mocks via `constructor_args`.
 - Presets assume no external yield. Delete or relax `solvency` and the `*OutBoundedByIn` invariants for vaults that deploy into strategies or earn yield.
 

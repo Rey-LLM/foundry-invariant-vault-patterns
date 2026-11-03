@@ -11,6 +11,11 @@ against the value-flow categories FoundryGuard generates invariants for:
 * ``withdraw``  - value leaving the system (withdraw, redeem, exit, ...)
 * ``stake_lock`` - staking and time-lock flows (stake, unstake, lock, claim, ...)
 
+Function bodies are also scanned for external hook callbacks (Uniswap v4 ``beforeSwap`` /
+``afterSwap`` style hooks, ``unlockCallback`` on ``msg.sender``, ``*Callback``, ``onFlashLoan``); a
+contract that makes them is flagged with ``hooks`` so the injector adds the Preset 04
+read-reentrancy checks (``blueprints/hook_reentrancy.py``).
+
 Imports are followed (using ``foundry.toml`` / ``remappings.txt`` remappings) so
 that functions inherited from parent contracts in libraries such as
 OpenZeppelin can be resolved by the injector, without making those library
@@ -38,8 +43,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+if __package__:
+    from .blueprints import hook_reentrancy
+else:  # executed as a plain script directory (python3 src/cli/parser.py)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blueprints import hook_reentrancy  # type: ignore
+
 SCHEMA = "foundryguard.blueprint/v1"
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -111,6 +122,7 @@ class Function:
     direction: str | None = None
     amount_param: str | None = None
     unit: str | None = None
+    callbacks: list[dict] = field(default_factory=list)  # external hook calls made in the body
 
 
 @dataclass
@@ -128,6 +140,7 @@ class Contract:
     categories: dict[str, list[str]] = field(default_factory=dict)
     external: bool = False
     test_helper: bool = False
+    hooks: dict = field(default_factory=dict)  # {"callbacks": [...], "call_sites": [...]} when it calls hooks
 
     @property
     def is_deployable(self) -> bool:
@@ -359,6 +372,8 @@ def classify(fn: Function, rules: tuple[tuple[str, str, re.Pattern[str]], ...] =
     """Attach category/direction/amount metadata for value-flow functions."""
     if fn.kind != "function" or fn.visibility not in {"public", "external"} or fn.mutability in {"view", "pure"}:
         return
+    if hook_reentrancy.is_callback_name(fn.name):
+        return  # unlockCallback / beforeSwap ... are entry points for the caller, not value flows
     for category, direction, pattern in rules:
         if pattern.match(fn.name):
             if category == "__ignore__":
@@ -447,10 +462,13 @@ def extract_contracts(source: str, rel_path: str, rules=CLASSIFICATION_RULES) ->
             else:
                 contract.functions.append(fn)
             try:
-                pos = (match_bracket(body, j, "{", "}") + 1) if has_body else j + 1
+                body_end = match_bracket(body, j, "{", "}") if has_body else j
             except ValueError:
                 log.warning("%s: unbalanced body in %s.%s", rel_path, contract.name, fname)
                 break
+            if has_body:
+                fn.callbacks = hook_reentrancy.detect_callbacks(body[j + 1 : body_end])
+            pos = body_end + 1
 
         # Public state variables expose implicit getters (e.g. `uint256 public totalStaked`).
         for vm_ in re.finditer(
@@ -625,6 +643,10 @@ def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Cont
             if fn.category:
                 cats.setdefault(fn.category, []).append(fn.signature)
         c.categories = cats
+        fns = c.functions + ([c.constructor] if c.constructor else [])
+        sites = [fn.name for fn in fns if fn.callbacks]
+        if sites:
+            c.hooks = {"callbacks": sorted({cb["name"] for fn in fns for cb in fn.callbacks}), "call_sites": sites}
 
     contracts.sort(key=lambda c: (c.external, c.file, c.line))
     targets = [c for c in contracts if not c.external and not c.test_helper]
@@ -636,6 +658,7 @@ def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Cont
         "deposit_functions": sum(len(c.categories.get("deposit", [])) for c in targets),
         "withdraw_functions": sum(len(c.categories.get("withdraw", [])) for c in targets),
         "stake_lock_functions": sum(len(c.categories.get("stake_lock", [])) for c in targets),
+        "hook_contracts": sum(1 for c in targets if c.hooks),
     }
     return {
         "schema": SCHEMA,

@@ -4,9 +4,9 @@
     foundryguard init                 write a commented foundryguard.toml
     foundryguard scan                 Solidity -> foundryguard.json blueprint
     foundryguard gen                  blueprint -> test/foundryguard/<Contract>/ suites
-    foundryguard run [--test]         scan + gen (+ forge test on the generated suites)
+    foundryguard run [--test]         scan + gen (+ forge test on the generated suites + FoundryGuard_Report.md)
     foundryguard check                CI: exit 1 when generated suites are missing or stale
-    foundryguard report results.json  forge test --json -> Markdown / SARIF
+    foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, Markdown, SARIF
 
 Run it as ``foundryguard`` after ``pipx install .`` or as ``python3 src/cli/foundryguard.py``.
 """
@@ -22,11 +22,12 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from . import injector, parser, reporting
+    from . import injector, parser, reporter, reporting
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import injector  # type: ignore
     import parser  # type: ignore
+    import reporter  # type: ignore
     import reporting  # type: ignore
 
 CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
@@ -114,14 +115,35 @@ def cmd_run(args, check: bool = False) -> int:
         print("foundryguard: --test needs `forge` on PATH (https://getfoundry.sh)", file=sys.stderr)
         return 1
     out = args.out or parser.load_config(root, args.config).get("generate", {}).get("out", "test/foundryguard")
-    cmd = [forge, "test", "--match-path", f"{out.rstrip('/')}/*", "-vv"]
+    cmd = [forge, "test", "--match-path", f"{out.rstrip('/')}/*", "-vvv"]
     print("foundryguard: " + " ".join(cmd), file=sys.stderr)
-    return subprocess.call(cmd, cwd=root)
+    # Stream forge's output as usual and keep a copy for the report.
+    proc = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    captured = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        captured.append(line)
+    rc = proc.wait()
+    if not getattr(args, "no_report", False):
+        run = reporter.parse_text("".join(captured), "forge test " + " ".join(cmd[2:]))
+        path = reporter.write_report(run, root, getattr(args, "report", None))
+        print(f"foundryguard: wrote {path} [{run.status}]", file=sys.stderr)
+    return rc
 
 
 def cmd_report(args) -> int:
-    data = reporting.load_forge_json(Path(args.results))
     root = Path(args.root).resolve()
+    text = sys.stdin.read() if args.results == "-" else Path(args.results).read_text(encoding="utf-8", errors="replace")
+    run = reporter.parse_text(text, "stdin" if args.results == "-" else args.results)
+    if not args.no_report:
+        path = reporter.write_report(run, root, args.report)
+        print(f"foundryguard: wrote {path} [{run.status}] {run.count(reporter.PASSED)} passed, "
+              f"{run.count(reporter.FAILED)} failed", file=sys.stderr)
+    data = reporter.try_json(text) or {}
+    if not reporting.test_count(data) and run.tests:
+        # stdout input: feed the CI Markdown / SARIF outputs from the parsed results.
+        data = _as_forge_json(run)
     md = reporting.markdown_from_forge(data)
     if args.md:
         Path(args.md).write_text(md)
@@ -135,6 +157,17 @@ def cmd_report(args) -> int:
         print("foundryguard: no test results found in forge output (did the suites run?)", file=sys.stderr)
         return 1
     return 1 if (args.fail_on_failure and reporting.failed_tests(data)) else 0
+
+
+def _as_forge_json(run) -> dict:
+    """The subset of ``forge test --json`` the CI Markdown / SARIF writers read, built from parsed stdout."""
+    data: dict = {}
+    for t in run.tests:
+        res = {"status": {"PASSED": "Success", "FAILED": "Failure", "SKIPPED": "Skipped"}[t.status], "reason": t.reason}
+        if t.sequence:
+            res["counterexample"] = {"Sequence": [{"signature": c.signature or c.function} for c in t.sequence]}
+        data.setdefault(t.suite, {"test_results": {}})["test_results"][t.name] = res
+    return data
 
 
 def build_cli() -> argparse.ArgumentParser:
@@ -166,12 +199,16 @@ def build_cli() -> argparse.ArgumentParser:
         p.add_argument("-o", "--output", help="also save the blueprint here")
         if not check:
             p.add_argument("--test", action="store_true", help="run forge test on the generated suites afterwards")
+            p.add_argument("--report", help=f"with --test: report path (default: <root>/{reporter.REPORT_FILE})")
+            p.add_argument("--no-report", action="store_true", help=f"with --test: do not write {reporter.REPORT_FILE}")
         p.set_defaults(func=(lambda a, c=check: cmd_run(a, c)))
 
-    p = sub.add_parser("report", help="turn `forge test --json` output into Markdown / SARIF")
-    p.add_argument("results", help="file with `forge test --json` output")
-    p.add_argument("--root", default=".")
-    p.add_argument("--md", help="write Markdown here (default: stdout)")
+    p = sub.add_parser("report", help=f"turn forge test output into {reporter.REPORT_FILE} (+ CI Markdown / SARIF)")
+    p.add_argument("results", help="file with `forge test --json` or `forge test -vvv` output, or '-' for stdin")
+    p.add_argument("--root", default=".", help="project root; the report is written here")
+    p.add_argument("--report", help=f"report path (default: <root>/{reporter.REPORT_FILE})")
+    p.add_argument("--no-report", action="store_true", help=f"do not write {reporter.REPORT_FILE}")
+    p.add_argument("--md", help="write the short CI Markdown summary here (default: stdout)")
     p.add_argument("--sarif", help="write SARIF here")
     p.add_argument("--fail-on-failure", action="store_true", help="exit 1 if any test failed")
     p.set_defaults(func=cmd_report)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foundryguard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Generate Foundry invariant test suites (handlers, ghost accounting, DeFi invariant presets) from Solidity sources."
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,4 +25,4 @@ foundryguard = "foundryguard.foundryguard:main"
 
 [tool.setuptools]
 package-dir = { "foundryguard" = "src/cli" }
-packages = ["foundryguard"]
+packages = ["foundryguard", "foundryguard.blueprints"]

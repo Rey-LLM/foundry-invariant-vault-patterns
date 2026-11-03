@@ -35,6 +35,8 @@ def markdown_report(report: list[dict], blueprint: dict | None = None) -> str:
         toks = ", ".join(f"{t['var']} ({t['role']})" for t in r.get("tokens", [])) or "-"
         status = "blocked" if r.get("blocked") else f"handler {r.get('handler')}, test {r.get('invariant')}"
         kind = " (ERC-4626)" if r.get("erc4626") else (" (upgradeable)" if r.get("upgradeable") else "")
+        if r.get("hooks"):
+            kind += " (hooks)"
         out.append(f"| `{r['contract']}`{kind} | {len(r.get('flows', []))} | {invs} | {toks} | {status} |")
     notes = [(r["contract"], n) for r in report
              for n in r.get("blocked", []) + r.get("warnings", []) + r.get("setup_notes", []) + r.get("skipped", [])]

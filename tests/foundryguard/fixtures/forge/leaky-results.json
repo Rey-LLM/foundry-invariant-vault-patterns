@@ -1,0 +1,89 @@
+{
+  "test/foundryguard/LeakyVault/Invariant.t.sol:LeakyVaultGuardInvariantTest": {
+    "duration": "412ms",
+    "test_results": {
+      "afterInvariant()": {
+        "status": "Success",
+        "reason": null,
+        "counterexample": null,
+        "decoded_logs": [],
+        "kind": {
+          "Invariant": {
+            "runs": 32,
+            "calls": 1024,
+            "reverts": 0,
+            "metrics": {},
+            "failed_corpus_replays": 0
+          }
+        }
+      },
+      "invariant_actorBalancesBoundedByTotal()": {
+        "status": "Success",
+        "reason": null,
+        "counterexample": null,
+        "decoded_logs": [],
+        "kind": {
+          "Invariant": {
+            "runs": 32,
+            "calls": 1024,
+            "reverts": 0,
+            "metrics": {},
+            "failed_corpus_replays": 0
+          }
+        }
+      },
+      "invariant_tokenSolvency()": {
+        "status": "Failure",
+        "reason": "token balance below totalDeposits: 999999999999999999990 < 1000000000000000000000",
+        "counterexample": {
+          "Sequence": [
+            {
+              "sender": "0x0000000000000000000000000000000000000Ca4",
+              "addr": "0x2e234DAe75C793f67A35089C9d99245E1C58470b",
+              "calldata": "0xe2bbb1580000000000000000000000000000000000000000000000000000000000000003",
+              "contract_name": "test/foundryguard/LeakyVault/Handler.sol:LeakyVaultGuardHandler",
+              "signature": "deposit(uint256,uint256)",
+              "args": "3, 1000000000000000000000 [1e21]",
+              "raw_args": "3, 1000000000000000000000"
+            },
+            {
+              "sender": "0x00000000000000000000000000000000000016Ac",
+              "addr": "0x2e234DAe75C793f67A35089C9d99245E1C58470b",
+              "calldata": "0x441a3e70",
+              "contract_name": "test/foundryguard/LeakyVault/Handler.sol:LeakyVaultGuardHandler",
+              "signature": "withdraw(uint256,uint256)",
+              "args": "3, 1000",
+              "raw_args": "3, 1000"
+            }
+          ]
+        },
+        "decoded_logs": [],
+        "kind": {
+          "Invariant": {
+            "runs": 1,
+            "calls": 2,
+            "reverts": 0,
+            "metrics": {},
+            "failed_corpus_replays": 0
+          }
+        }
+      },
+      "invariant_withdrawalsBoundedByDeposits()": {
+        "status": "Success",
+        "reason": null,
+        "counterexample": null,
+        "decoded_logs": [],
+        "kind": {
+          "Invariant": {
+            "runs": 32,
+            "calls": 1024,
+            "reverts": 0,
+            "metrics": {},
+            "failed_corpus_replays": 0
+          }
+        }
+      }
+    },
+    "warnings": []
+  }
+}

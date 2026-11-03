@@ -26,9 +26,11 @@ import subprocess
 from pathlib import Path
 
 if __package__:
+    from .blueprints import hook_reentrancy
     from .parser import (DEFAULT_SOURCE_DIRS, EXCLUDED_DIRS, ACCOUNTING_GETTERS, CLASSIFICATION_RULES,
                          Contract, Function, Param, classify, normalize_type)
 else:  # executed as a plain script directory (python3 src/cli/foundryguard.py)
+    from blueprints import hook_reentrancy  # type: ignore
     from parser import (DEFAULT_SOURCE_DIRS, EXCLUDED_DIRS, ACCOUNTING_GETTERS, CLASSIFICATION_RULES,  # type: ignore
                         Contract, Function, Param, classify, normalize_type)
 
@@ -123,6 +125,7 @@ def _function(node: dict, source: bytes | None, in_interface: bool, rules) -> Fu
         mutability=node.get("stateMutability", "nonpayable"), modifiers=[m for m in mods if m],
         virtual=bool(node.get("virtual")), override=node.get("overrides") is not None,
         has_body=bool(node.get("implemented")), line=_line(source, node.get("src", "")),
+        callbacks=hook_reentrancy.detect_callbacks_ast(node.get("body")),
     )
     classify(fn, rules)
     return fn

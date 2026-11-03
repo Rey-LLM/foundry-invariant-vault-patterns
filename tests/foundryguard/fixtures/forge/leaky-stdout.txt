@@ -1,0 +1,39 @@
+Compiling 6 files with Solc 0.8.24
+Solc 0.8.24 finished in 1.21s
+Compiler run successful!
+
+Ran 4 tests for test/foundryguard/LeakyVault/Invariant.t.sol:LeakyVaultGuardInvariantTest
+[32m[PASS][0m afterInvariant() (runs: 32, calls: 1024, reverts: 0)
+[32m[PASS][0m invariant_actorBalancesBoundedByTotal() (runs: 32, calls: 1024, reverts: 0)
+[31m[FAIL: token balance below totalDeposits: 999999999999999999990 < 1000000000000000000000][0m
+	[Sequence] (original: 7, shrunk: 2)
+		sender=0x0000000000000000000000000000000000000Ca4 addr=[test/foundryguard/LeakyVault/Handler.sol:LeakyVaultGuardHandler]0x2e234DAe75C793f67A35089C9d99245E1C58470b calldata=deposit(uint256,uint256) args=[3, 1000000000000000000000 [1e21]]
+		sender=0x00000000000000000000000000000000000016Ac addr=[test/foundryguard/LeakyVault/Handler.sol:LeakyVaultGuardHandler]0x2e234DAe75C793f67A35089C9d99245E1C58470b calldata=withdraw(uint256,uint256) args=[3, 1000]
+ invariant_tokenSolvency() (runs: 1, calls: 2, reverts: 0)
+Traces:
+  [11234] LeakyVaultGuardInvariantTest::invariant_tokenSolvency()
+    ├─ [2559] FoundryGuardMockERC20::balanceOf(LeakyVault: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   └─ ← [Return] 999999999999999999990 [9.999e20]
+    └─ ← [Revert] token balance below totalDeposits: 999999999999999999990 < 1000000000000000000000
+
+[32m[PASS][0m invariant_withdrawalsBoundedByDeposits() (runs: 32, calls: 1024, reverts: 0)
+Suite result: [31mFAILED[0m. 3 passed; 1 failed; 0 skipped; finished in 412.10ms (1.20s CPU time)
+
+Ran 2 tests for test/Unit.t.sol:UnitTest
+[PASS] test_deposit() (gas: 51234)
+[FAIL: assertion failed: 1 != 2; counterexample: calldata=0x2fbebd38000000000000000000000000000000000000000000000000000000000000002a args=[42]] testFuzz_roundTrip(uint256) (runs: 3, μ: 20311, ~: 20311)
+Logs:
+  amount 42
+
+Suite result: FAILED. 1 passed; 1 failed; 0 skipped; finished in 10.00ms (5.00ms CPU time)
+
+Ran 2 test suites in 430.00ms (1.21s CPU time): 4 passed, 2 failed, 0 skipped (6 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/foundryguard/LeakyVault/Invariant.t.sol:LeakyVaultGuardInvariantTest
+[FAIL: token balance below totalDeposits: 999999999999999999990 < 1000000000000000000000]
+	[Sequence] (original: 7, shrunk: 2)
+		sender=0x0000000000000000000000000000000000000Ca4 addr=[test/foundryguard/LeakyVault/Handler.sol:LeakyVaultGuardHandler]0x2e234DAe75C793f67A35089C9d99245E1C58470b calldata=deposit(uint256,uint256) args=[3, 1000000000000000000000 [1e21]]
+ invariant_tokenSolvency() (runs: 1, calls: 2, reverts: 0)
+
+Encountered a total of 2 failing tests, 4 tests succeeded
