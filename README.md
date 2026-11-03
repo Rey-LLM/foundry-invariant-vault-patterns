@@ -65,7 +65,7 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | `foundryguard run [--test]` | `scan` and `gen`; with `--test` also `forge test` and the report |
 | `foundryguard check` | exits 1 when generated suites are missing or stale |
 | `foundryguard heal` | compiles the generated suites and fixes what the local compiler rejects |
-| `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md`, plus CI Markdown and SARIF |
+| `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md` and `foundryguard-report.html`, plus CI Markdown and SARIF |
 
 ### Scanning
 
@@ -242,6 +242,10 @@ The rules are deliberately narrow. Anything else (a wrong type, a missing functi
 ### Report
 
 `foundryguard report` and `foundryguard run --test` write `FoundryGuard_Report.md` to the project root (`--report PATH` to move it, `--no-report` to skip it). It reads forge JSON or stdout and shows PASSED/FAILED per test and, for each broken invariant, the shrunk call sequence, a Solidity replay test and the command to rerun it. Forge 1.x does not print the sequence for invariant campaigns, so the report reads it from `cache/invariant/failures/`.
+
+The same results also go to `foundryguard-report.html` next to the Markdown file (`--html PATH` to move it, `--no-html` to skip it). It is one static page with no scripts or external files: run metrics, a table per suite, and each failed execution path as a collapsible tree of calls with sender, target, named parameters and, when the trace has them (`-vvvvv`), the storage slots each call changed. The last node is the invariant check with both sides of the failed assertion and their difference.
+
+The metrics count each invariant campaign once. Forge 1.x runs all invariants of a test contract in one campaign and prints its stats on every one of them, so adding them up per test would multiply the calls. Fuzz inputs are invariant handler calls plus fuzz runs. Execution time is forge's own wall clock from stdout; JSON output has no wall clock, so the report shows the sum of suite durations and says so.
 
 ```sh
 forge test -vvv | foundryguard report -

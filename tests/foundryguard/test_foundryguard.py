@@ -828,6 +828,81 @@ class ReporterTests(unittest.TestCase):
             self.assertEqual(reporter.main([str(FORGE_JSON), "--root", str(root), "-o", str(root / "j.md")]), 0)
         self.assertIn("forge JSON", (root / "j.md").read_text())
 
+    def test_metrics_count_each_campaign_once(self):
+        m = reporter.metrics(reporter.parse_text(FORGE_STDOUT.read_text(), "forge.log"))
+        # afterInvariant is a hook, not a property; three separate pre-1.x campaigns; one fuzz test with 3 runs
+        self.assertEqual((m.invariants, m.invariants_broken, m.campaigns), (3, 1, 3))
+        self.assertEqual((m.invariant_calls, m.fuzz_runs, m.fuzz_inputs), (2050, 3, 2053))
+        self.assertAlmostEqual(m.wall_time, 0.43)
+        self.assertAlmostEqual(m.suite_time, 0.4221)
+        # forge 1.x prints one shared campaign's stats on every invariant of the contract
+        m1 = reporter.metrics(reporter.parse_text(FORGE1_STDOUT.read_text(), "forge.log"))
+        self.assertEqual((m1.campaigns, m1.invariant_runs, m1.invariant_calls), (2, 64, 2048))
+        self.assertAlmostEqual(m1.time, 1.23)
+        mj = reporter.metrics(reporter.parse_text(FORGE_JSON.read_text(), "results.json"))
+        self.assertEqual((mj.wall_time, round(mj.suite_time, 3), mj.invariant_calls), (None, 0.412, 2050))
+
+    def test_attributed_campaign_counted_once(self):
+        target = "test/X.t.sol:XTest"
+        text = json.dumps({target: {"test_results": {
+            "invariant_a()": {"status": "Failure", "kind": {"Invariant": {"runs": 8, "calls": 400, "reverts": 0}},
+                              "counterexample": {"Sequence": [{"signature": "deposit(uint256)", "args": "1"}]}},
+            "invariant_b()": {"status": "Success"}}}}) + "\n" + json.dumps(
+            {"event": "failure", "invariant": "invariant_b", "target": target, "reason": "b"}) + "\n"
+        m = reporter.metrics(reporter.parse_text(text))
+        self.assertEqual((m.invariants, m.campaigns, m.invariant_calls), (2, 1, 400))
+
+    def test_parse_duration(self):
+        self.assertAlmostEqual(reporter.parse_duration("412.10ms"), 0.4121)
+        self.assertAlmostEqual(reporter.parse_duration("1m 2s"), 62.0)
+        self.assertAlmostEqual(reporter.parse_duration("12µs"), 12e-6)
+        self.assertAlmostEqual(reporter.parse_duration({"secs": 1, "nanos": 500000000}), 1.5)
+        self.assertIsNone(reporter.parse_duration("soon"))
+
+    def test_trace_frames_storage_changes(self):
+        frames = reporter.trace_frames([
+            "  [52000] H::deposit(3, 10)", "    ├─  storage changes:", "    │   @ 2: 0 → 10",
+            "    ├─ [500] Token::transfer(1) ", "    └─ ← [Stop]", "  [3000] T::invariant_x()"])
+        self.assertEqual([(f.contract, f.func) for f in frames], [("H", "deposit"), ("T", "invariant_x")])
+        self.assertEqual(frames[0].storage, [("2", "0", "10")])
+
+    def test_report_html(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        run = reporter.parse_text(FORGE_STDOUT.read_text(), "forge.log")
+        run.failures[0].traces[:0] = ["  [1] LeakyVaultGuardHandler::withdraw(3, 1000)", "    │   @ 2: 1000 → 990"]
+        page = reporter.render_html(run, root, generated="now")
+        self.assertTrue(page.startswith("<!doctype html>"))
+        for banned in ("<script", "gradient", "animation", "transition", "http://", "https://"):
+            self.assertNotIn(banned, page)
+        self.assertIn("#2e7d32", page)
+        self.assertIn("#c62828", page)
+        self.assertIn('<span class="badge FAILED">FAILED</span>', page)
+        self.assertIn('<details class="failure" open>', page)
+        self.assertIn('<span class="fn">withdraw</span>(3, 1000)', page)
+        self.assertIn('<td class="n"><span class="down">-10</span></td>', page)  # storage drift on slot 2
+        self.assertIn("drift (left - right)</th><td>-10</td>", page)
+        self.assertIn("<td>Invariants checked</td><td class=\"n\">3</td>", page)
+        self.assertIn("<td>Fuzz inputs</td><td class=\"n\">2,053</td>", page)
+        self.assertIn("<td>Execution time</td><td class=\"n\">430.00 ms</td>", page)
+        empty = reporter.render_html(reporter.Run(source="<x>", fmt="forge JSON"), root)
+        self.assertIn("No test results were found", empty)
+        self.assertIn("&lt;x&gt;", empty)
+
+    def test_write_report_writes_html_beside_markdown(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        run = reporter.parse_text(FORGE_JSON.read_text(), "results.json")
+        reporter.write_report(run, root)
+        self.assertIn("invariant_tokenSolvency()", (root / reporter.HTML_FILE).read_text())
+        self.assertIn("| Invariants checked | Fuzz inputs | Execution time |", (root / reporter.REPORT_FILE).read_text())
+        (root / reporter.HTML_FILE).unlink()
+        reporter.write_report(run, root, html=False)
+        self.assertFalse((root / reporter.HTML_FILE).exists())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            foundryguard.main(["report", str(FORGE_JSON), "--root", str(root), "--html", str(root / "out" / "r.html")])
+        self.assertTrue((root / "out" / "r.html").is_file())
+
 
 AI_HANDLER = """```solidity
 // File: Handler.sol

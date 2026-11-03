@@ -23,13 +23,17 @@ Usage::
     foundryguard report results.json    # same, plus the CI Markdown / SARIF outputs
     foundryguard run --test             # scan + gen + forge test + report
 
-The report is written to ``<root>/FoundryGuard_Report.md`` unless ``-o`` says otherwise.
+The report is written to ``<root>/FoundryGuard_Report.md`` unless ``-o`` says otherwise, and the same
+results go to ``foundryguard-report.html`` next to it: one static page (no scripts, no external files)
+with run metrics, a collapsible call tree per failed execution path, and every test (``--html PATH`` to
+move it, ``--no-html`` to skip it).
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import html as _html
 import json
 import re
 import sys
@@ -81,6 +85,7 @@ class TestResult:
     logs: list[str] = field(default_factory=list)
     traces: list[str] = field(default_factory=list)
     note: str | None = None
+    campaign: str | None = None     # set when forge ran this invariant in a campaign shared with others
 
     @property
     def file(self) -> str:
@@ -100,6 +105,8 @@ class Run:
     source: str
     fmt: str                  # "forge JSON" | "forge stdout"
     tests: list[TestResult] = field(default_factory=list)
+    suite_time: dict[str, float] = field(default_factory=dict)  # seconds, from forge's per-suite duration
+    wall_time: float | None = None    # seconds, forge's "Ran N test suites in X" (stdout only)
 
     def suites(self) -> dict[str, list[TestResult]]:
         out: dict[str, list[TestResult]] = {}
@@ -172,6 +179,24 @@ def _split_args(text: str | None) -> list[str]:
     return [re.sub(r"\s+\[[-+0-9.eE]+\]$", "", p) for p in parts]
 
 
+DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ns|µs|μs|us|ms|s|m|h)(?![a-z])")
+DURATION_UNIT = {"ns": 1e-9, "µs": 1e-6, "μs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_duration(value) -> float | None:
+    """Seconds from a forge duration: ``"412.10ms"``, ``"1m 2s"`` or serde's ``{"secs": 1, "nanos": 5}``."""
+    if isinstance(value, dict) and ("secs" in value or "nanos" in value):
+        return float(value.get("secs") or 0) + float(value.get("nanos") or 0) / 1e9
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    parts = DURATION_RE.findall(value)
+    if not parts:
+        return None
+    return sum(float(n) * DURATION_UNIT[u] for n, u in parts)
+
+
 def _call_from_json(step: dict) -> Call:
     contract, path = _split_contract(step.get("contract_name"))
     sig = step.get("signature")
@@ -202,6 +227,9 @@ def parse_json(data: dict, source: str = "forge JSON") -> Run:
         if suite_id == EVENTS_KEY or not isinstance(suite, dict):
             continue
         results = suite.get("test_results") or {}
+        secs = parse_duration(suite.get("duration"))
+        if secs is not None:
+            run.suite_time[suite_id] = secs
         for name, res in sorted(results.items()):
             if not isinstance(res, dict):
                 continue
@@ -249,6 +277,10 @@ def attribute(run: Run, suite_id: str, invariant: str, reason: str | None, how: 
             if getattr(hit, k) is None:
                 setattr(hit, k, getattr(campaign, k))
         hit.traces = hit.traces or campaign.traces
+        if hit.calls == campaign.calls and hit.runs == campaign.runs:
+            # one campaign, now listed under two names: count its calls once
+            key = campaign.campaign or f"{campaign.suite}::{campaign.name}"
+            campaign.campaign = hit.campaign = key
         campaign.status = PASSED
         campaign.note = (f"forge filed the shared invariant campaign under this name; the invariant that broke is `{name}`"
                          + (" (matched by its assertion message)" if how == "source" else ""))
@@ -280,6 +312,8 @@ def resolve_from_source(run: Run, root: Path) -> None:
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RAN_RE = re.compile(r"^Ran \d+ tests? for (\S+)")
+RAN_ALL_RE = re.compile(r"^Ran \d+ test suites? in (.+?)(?:\s*\(.*CPU time\))?:")
+SUITE_TIME_RE = re.compile(r"finished in ([^()]+?)\s*(?:\(|$)")
 # The reason itself can contain brackets (`args=[1, 2]`), so it runs to the last `]` before the test name.
 # Forge 1.x prints invariant names without parentheses (`[PASS] invariant_tokenSolvency`).
 RESULT_RE = re.compile(r"^\[(PASS|FAIL|SKIP)(?:[:.]\s*(?:Reason:\s*)?(?P<reason>.*))?\]\s*(?P<rest>(?:[A-Za-z_$][\w$]*(?:\(.*)?)?)$")
@@ -362,6 +396,14 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
         if m:
             suite, pending, last, block, section = m.group(1), None, None, None, None
             continue
+        if s.startswith("Suite result:") and suite not in run.suite_time:
+            tm2 = SUITE_TIME_RE.search(s)
+            secs = parse_duration(tm2.group(1)) if tm2 else None
+            if secs is not None:
+                run.suite_time[suite] = secs
+        m = RAN_ALL_RE.match(s)
+        if m:
+            run.wall_time = parse_duration(m.group(1))
         if s.startswith(("Suite result:", "Ran ", "Failing tests:", "Encountered ")):
             m2 = re.match(r"^Encountered \d+ failing tests? in (\S+)", s)
             if m2:
@@ -378,6 +420,8 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
         if m and block is not None:
             for t in block:
                 _stats(m.group(2), t)
+                if len(block) > 1:
+                    t.campaign = f"{suite}::invariants"
             last = next((t for t in block if t.status == FAILED), None)
             block, section = None, None
             continue
@@ -598,6 +642,9 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
         out.append(f"| `{sid.rpartition(':')[2]}` | {badge('', st)} | {sum(t.status == PASSED for t in tests)} | "
                    f"{sum(t.status == FAILED for t in tests)} | {sum(t.status == SKIPPED for t in tests)} |")
     out += [f"| **Total** | {badge('', run.status)} | **{passed}** | **{failed}** | **{skipped}** |", ""]
+    m = metrics(run)
+    out += ["| Invariants checked | Fuzz inputs | Execution time |", "| --: | --: | --: |",
+            f"| {m.invariants:,} | {m.fuzz_inputs:,} | {format_seconds(m.time)} |", ""]
 
     if run.failures:
         out += ["## Broken invariants and failed tests", ""]
@@ -670,6 +717,344 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- #
+# Metrics
+# --------------------------------------------------------------------------- #
+
+
+def is_invariant(t: TestResult) -> bool:
+    """An invariant property. ``afterInvariant`` is a hook forge calls after a campaign, not a property."""
+    return t.kind == "invariant" and not t.func.startswith("afterInvariant")
+
+
+@dataclass
+class Metrics:
+    tests: int
+    passed: int
+    failed: int
+    skipped: int
+    suites: int
+    invariants: int            # invariant properties checked
+    invariants_broken: int
+    campaigns: int             # distinct invariant campaigns (forge 1.x runs a contract's invariants in one)
+    invariant_runs: int
+    invariant_calls: int
+    fuzz_tests: int
+    fuzz_runs: int
+    wall_time: float | None    # forge's own wall clock for the whole run
+    suite_time: float | None   # sum of per-suite durations (suites run in parallel, so this can exceed wall time)
+
+    @property
+    def fuzz_inputs(self) -> int:
+        """Inputs the fuzzer generated: one per handler call in invariant campaigns, one per fuzz run."""
+        return self.invariant_calls + self.fuzz_runs
+
+    @property
+    def time(self) -> float | None:
+        return self.wall_time if self.wall_time is not None else self.suite_time
+
+
+def metrics(run: Run) -> Metrics:
+    """Totals for the report header.
+
+    Each invariant campaign is counted once. Forge 1.x runs all invariants of a test contract in one
+    campaign and prints its stats on every one of them, and ``attribute`` copies the campaign stats to
+    the invariant that broke, so summing per test would count the same calls several times.
+    """
+    invariants = [t for t in run.tests if is_invariant(t)]
+    seen: dict[str, tuple[int, int]] = {}
+    for t in invariants:
+        if t.runs is None and t.calls is None:
+            continue
+        key = t.campaign or f"{t.suite}::{t.name}"
+        if key not in seen:
+            seen[key] = (t.runs or 0, t.calls or 0)
+    fuzz = [t for t in run.tests if t.kind == "fuzz"]
+    return Metrics(
+        tests=len(run.tests), passed=run.count(PASSED), failed=run.count(FAILED), skipped=run.count(SKIPPED),
+        suites=len(run.suites()), invariants=len(invariants),
+        invariants_broken=sum(t.status == FAILED for t in invariants), campaigns=len(seen),
+        invariant_runs=sum(r for r, _ in seen.values()), invariant_calls=sum(c for _, c in seen.values()),
+        fuzz_tests=len(fuzz), fuzz_runs=sum(t.runs or 0 for t in fuzz),
+        wall_time=run.wall_time, suite_time=sum(run.suite_time.values()) if run.suite_time else None,
+    )
+
+
+def format_seconds(secs: float | None) -> str:
+    if secs is None:
+        return "-"
+    if secs < 1e-3:
+        return f"{secs * 1e6:.0f} µs"
+    if secs < 1:
+        return f"{secs * 1e3:.2f} ms"
+    if secs < 60:
+        return f"{secs:.2f} s"
+    return f"{int(secs // 60)} min {secs % 60:.1f} s"
+
+
+# --------------------------------------------------------------------------- #
+# HTML
+# --------------------------------------------------------------------------- #
+
+HTML_FILE = "foundryguard-report.html"
+
+HTML_CSS = """
+:root { --ink: #222; --muted: #666; --line: #d0d0d0; --soft: #f4f4f4; --pass: #2e7d32; --fail: #c62828; --skip: #757575; }
+* { box-sizing: border-box; }
+html { background: #fafafa; }
+body { margin: 0; padding: 32px 16px 48px; background: #fafafa; color: var(--ink);
+       font: 13px/1.5 SFMono-Regular, Menlo, Consolas, "Liberation Mono", "Courier New", monospace; }
+main { max-width: 1120px; margin: 0 auto; background: #fff; border: 1px solid var(--line); padding: 28px 32px; }
+h1 { font-size: 18px; font-weight: 700; margin: 0 0 4px; letter-spacing: 0; }
+h2 { font-size: 14px; font-weight: 700; margin: 32px 0 10px; padding-bottom: 4px; border-bottom: 1px solid var(--ink); text-transform: uppercase; }
+h3 { font-size: 13px; font-weight: 700; margin: 20px 0 8px; }
+p { margin: 6px 0; }
+.sub { color: var(--muted); margin: 0 0 20px; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 12px; }
+th, td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+th { background: var(--soft); font-weight: 700; }
+td.n, th.n { text-align: right; white-space: nowrap; }
+table.kv th { width: 200px; }
+.badge { display: inline-block; padding: 0 6px; font-size: 11px; font-weight: 700; color: #fff; line-height: 18px; }
+.PASSED { background: var(--pass); } .FAILED { background: var(--fail); } .SKIPPED { background: var(--skip); }
+code, pre { font-family: inherit; }
+pre { background: var(--soft); border: 1px solid var(--line); padding: 8px 10px; overflow-x: auto; margin: 6px 0 10px; white-space: pre; }
+details { margin: 4px 0; }
+summary { cursor: pointer; padding: 2px 0; }
+details.failure { border: 1px solid var(--line); border-left: 3px solid var(--fail); padding: 6px 12px; margin: 12px 0; }
+details.failure > summary { font-weight: 700; }
+ol.tree { list-style: none; margin: 6px 0 10px; padding: 0 0 0 4px; border-left: 1px solid var(--line); }
+ol.tree > li { margin: 0; padding: 2px 0 2px 12px; }
+ol.tree table { width: auto; min-width: 60%; }
+.idx { color: var(--muted); }
+.fn { font-weight: 700; }
+.muted { color: var(--muted); }
+.up { color: var(--pass); } .down { color: var(--fail); }
+.scroll { overflow-x: auto; }
+footer { margin-top: 32px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+@media (max-width: 640px) { main { padding: 16px; } table.kv th { width: auto; } }
+@media print { html, body { background: #fff; } main { border: 0; } details { display: block; } }
+"""
+
+FRAME_RE = re.compile(r"^(?P<indent>[\s│├└─]*)\[\d+\]\s+(?P<contract>[\w$]+)::(?P<func>[\w$]+)\(")
+STORAGE_RE = re.compile(r"@\s*(?P<slot>0x[0-9a-fA-F]+|\d+)\s*:\s*(?P<old>\S+)\s*(?:→|->)\s*(?P<new>\S+)")
+CHECK_RE = re.compile(r"(?P<left>-?(?:0x[0-9a-fA-F]+|\d+))\s*(?P<op>!=|==|<=|>=|<|>)\s*(?P<right>-?(?:0x[0-9a-fA-F]+|\d+))\s*$")
+
+
+@dataclass
+class Frame:
+    contract: str
+    func: str
+    storage: list[tuple[str, str, str]] = field(default_factory=list)  # (slot, old, new)
+
+
+def trace_frames(lines: list[str]) -> list[Frame]:
+    """Top-level call frames of a forge trace and the storage changes printed under each (-vvvvv)."""
+    parsed = []
+    for line in lines:
+        m = FRAME_RE.match(line)
+        if m:
+            parsed.append((len(m.group("indent")), Frame(m.group("contract"), m.group("func"))))
+        else:
+            sm = STORAGE_RE.search(line)
+            if sm:
+                parsed.append((None, (sm.group("slot"), sm.group("old"), sm.group("new"))))
+    depths = [d for d, _ in parsed if d is not None]
+    if not depths:
+        return []
+    top = min(depths)
+    frames: list[Frame] = []
+    for depth, item in parsed:
+        if depth is None:
+            if frames:
+                frames[-1].storage.append(item)
+        elif depth == top:
+            frames.append(item)
+    return frames
+
+
+def _int(v: str) -> int | None:
+    try:
+        return int(v, 0)
+    except ValueError:
+        return None
+
+
+def _h(v) -> str:
+    return _html.escape("" if v is None else str(v), quote=True)
+
+
+def _badge_html(status: str) -> str:
+    return f'<span class="badge {_h(status)}">{_h(status)}</span>'
+
+
+def _num(v) -> str:
+    return "-" if v is None else f"{v:,}"
+
+
+def _kv(rows: list[tuple[str, str]]) -> str:
+    """Two-column table; values are already HTML."""
+    return '<table class="kv">' + "".join(f"<tr><th>{_h(k)}</th><td>{v}</td></tr>" for k, v in rows) + "</table>"
+
+
+def _storage_rows(storage: list[tuple[str, str, str]]) -> str:
+    out = ['<table><tr><th>slot</th><th>before</th><th>after</th><th class="n">delta</th></tr>']
+    for slot, old, new in storage:
+        a, b = _int(old), _int(new)
+        delta = "-" if a is None or b is None else (f'<span class="up">+{b - a:,}</span>' if b >= a
+                                                   else f'<span class="down">{b - a:,}</span>')
+        out.append(f"<tr><td>{_h(slot)}</td><td>{_h(old)}</td><td>{_h(new)}</td><td class=\"n\">{delta}</td></tr>")
+    return "".join(out) + "</table>"
+
+
+def _call_node(i: int, c: Call, names: list[str], frame: Frame | None) -> str:
+    target = f"{c.target}." if c.target else ""
+    head = (f'<span class="idx">{i:02d}</span>  {_h(target)}<span class="fn">{_h(c.function)}</span>'
+            f"({_h(_call_text(c, names)[len(c.function) + 1:-1])})")
+    rows = [("sender", _h(c.sender or "-")), ("target", _h(f"{c.target or '-'}" + (f" @ {c.address}" if c.address else ""))),
+            ("signature", _h(c.signature or "-"))]
+    types = c.signature[c.signature.index("(") + 1:-1].split(",") if c.signature and "(" in c.signature else []
+    for k, a in enumerate(c.args):
+        name = names[k] if k < len(names) and names[k] else f"arg{k}"
+        ty = types[k] if k < len(types) and types[k] else ""
+        rows.append((f"param {name}" + (f" ({ty})" if ty else ""), _h(a)))
+    if c.calldata and c.calldata != "0x":
+        rows.append(("calldata", f'<div class="scroll">{_h(c.calldata)}</div>'))
+    body = _kv(rows)
+    if frame and frame.storage:
+        body += "<p>storage changes</p>" + _storage_rows(frame.storage)
+    return f"<li><details><summary>{head}</summary>{body}</details></li>"
+
+
+def _check_node(t: TestResult, n: int, frame: Frame | None) -> str:
+    rows = [("result", _badge_html(FAILED)), ("reason", _h(t.reason or "failed (no reason given)"))]
+    m = CHECK_RE.search(t.reason or "")
+    if m:
+        a, b = _int(m.group("left")), _int(m.group("right"))
+        rows += [("left", _h(m.group("left"))), ("right", _h(m.group("right"))), ("expected", _h(f"left {m.group('op')} right is false"))]
+        if a is not None and b is not None:
+            rows.append(("drift (left - right)", _h(f"{a - b:+,}")))
+    body = _kv(rows)
+    if frame and frame.storage:
+        body += "<p>storage changes</p>" + _storage_rows(frame.storage)
+    return (f'<li><details open><summary><span class="idx">{n:02d}</span>  check '
+            f'<span class="fn">{_h(t.func)}</span>()  {_badge_html(FAILED)}</summary>{body}</details></li>')
+
+
+def _failure_html(t: TestResult, root: Path, cache: dict) -> str:
+    reason = t.reason or "failed (no reason given)"
+    out = [f'<details class="failure" open><summary>{_badge_html(FAILED)}  {_h(t.contract)}.{_h(t.name)}  '
+           f'<span class="muted">{_h(t.kind)}</span></summary>']
+    rows = [("suite", _h(t.suite)), ("reason", _h(reason))]
+    if t.runs is not None or t.calls is not None:
+        rows.append(("campaign", _h(f"{_num(t.runs)} runs, {_num(t.calls)} calls, {_num(t.reverts)} reverts")))
+    if t.sequence:
+        shrunk = f" (shrunk from {t.shrunk_from})" if t.shrunk_from and t.shrunk_from != len(t.sequence) else ""
+        rows.append(("counter-example", _h(f"{len(t.sequence)} call(s){shrunk}")))
+    if t.note:
+        rows.append(("note", _h(t.note)))
+    out.append(_kv(rows))
+
+    frames = trace_frames(t.traces)
+    used: set[int] = set()
+
+    def take(func: str, contract: str | None) -> Frame | None:
+        for k, f in enumerate(frames):
+            if k not in used and f.func == func and (not contract or f.contract == contract):
+                used.add(k)
+                return f
+        return None
+
+    if t.sequence:
+        out.append("<h3>Call sequence</h3><ol class=\"tree\">")
+        for i, c in enumerate(t.sequence, 1):
+            out.append(_call_node(i, c, _param_names(root, c, cache), take(c.function, c.target)))
+        if t.kind == "invariant":
+            out.append(_check_node(t, len(t.sequence) + 1, take(t.func, t.contract)))
+        out.append("</ol>")
+    else:
+        out.append('<p class="muted">forge did not print a call sequence for this failure.</p>')
+    loose = [s for k, f in enumerate(frames) if k not in used for s in f.storage]
+    if loose:
+        out.append("<details><summary>Storage changes in other trace frames</summary>" + _storage_rows(loose) + "</details>")
+    snippet = replay_snippet(t)
+    if snippet:
+        out.append(f"<details><summary>Replay as a Foundry regression test</summary><p>Paste into {_h(t.contract)} "
+                   f"({_h(t.file)}) and run it with -vvvv.</p><pre>{_h(snippet)}</pre></details>")
+    out.append("<details><summary>Rerun this test</summary><pre>"
+               + _h(f"forge test --match-path '{t.file}' --match-contract '{t.contract}' --match-test '{t.func}' -vvvv")
+               + "</pre></details>")
+    if t.logs:
+        out.append(f"<details><summary>Logs ({len(t.logs)} lines)</summary><pre>{_h(chr(10).join(t.logs))}</pre></details>")
+    if t.traces:
+        out.append(f"<details><summary>Traces ({len(t.traces)} lines)</summary><pre>{_h(chr(10).join(t.traces))}</pre></details>")
+    out.append("</details>")
+    return "".join(out)
+
+
+def render_html(run: Run, root: Path | None = None, generated: str | None = None) -> str:
+    """The same results as ``render``, as one standalone HTML page with no scripts or external files."""
+    root = root or Path(".")
+    generated = generated or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    m = metrics(run)
+    suites = run.suites()
+    time_label = ("wall clock, forge" if m.wall_time is not None
+                  else "sum of suite durations" if m.suite_time is not None else "not reported by forge")
+    out = ["<!doctype html>", '<html lang="en"><head><meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width, initial-scale=1">',
+           f"<title>FoundryGuard Report</title><style>{HTML_CSS}</style></head><body><main>",
+           f"<h1>FoundryGuard Report  {_badge_html(run.status)}</h1>",
+           f'<p class="sub">Generated {_h(generated)} from {_h(run.source)} ({_h(run.fmt)})</p>']
+    if not run.tests:
+        out.append("<p><b>No test results were found in the forge output.</b> Did the suites compile and run?</p>")
+    elif m.failed:
+        out.append(f"<p><b>{m.failed} of {m.tests} test(s) failed.</b> Each call sequence below is the shrunk "
+                   "counter-example forge found.</p>")
+    else:
+        out.append(f"<p><b>All {m.passed} test(s) passed</b> across {m.suites} suite(s).</p>")
+
+    out.append("<h2>Metrics</h2><table>")
+    out.append('<tr><th>Metric</th><th class="n">Value</th><th>Detail</th></tr>')
+    rows = [
+        ("Invariants checked", _num(m.invariants), f"{m.invariants_broken} broken, {m.campaigns} campaign(s)"),
+        ("Fuzz inputs", _num(m.fuzz_inputs), f"{_num(m.invariant_calls)} invariant calls + {_num(m.fuzz_runs)} fuzz runs"),
+        ("Invariant runs", _num(m.invariant_runs), "call sequences generated"),
+        ("Execution time", format_seconds(m.time), time_label),
+        ("Tests", _num(m.tests), f"{m.passed} passed, {m.failed} failed, {m.skipped} skipped"),
+        ("Suites", _num(m.suites), ""),
+    ]
+    out += [f'<tr><td>{_h(a)}</td><td class="n">{_h(b)}</td><td>{_h(c)}</td></tr>' for a, b, c in rows]
+    out.append("</table>")
+
+    out.append('<h2>Suites</h2><table><tr><th>Suite</th><th>Status</th><th class="n">Passed</th><th class="n">Failed</th>'
+               '<th class="n">Skipped</th><th class="n">Time</th></tr>')
+    for sid, tests in suites.items():
+        st = FAILED if any(t.status == FAILED for t in tests) else PASSED
+        out.append(f"<tr><td>{_h(sid.rpartition(':')[2])}</td><td>{_badge_html(st)}</td>"
+                   f'<td class="n">{sum(t.status == PASSED for t in tests)}</td><td class="n">{sum(t.status == FAILED for t in tests)}</td>'
+                   f'<td class="n">{sum(t.status == SKIPPED for t in tests)}</td><td class="n">{format_seconds(run.suite_time.get(sid))}</td></tr>')
+    out.append("</table>")
+
+    if run.failures:
+        out.append("<h2>Failed execution paths</h2>")
+        cache: dict = {}
+        out += [_failure_html(t, root, cache) for t in run.failures]
+
+    out.append("<h2>All tests</h2>")
+    for sid, tests in suites.items():
+        out.append(f"<h3>{_h(sid)}</h3><table><tr><th>Status</th><th>Test</th><th>Kind</th><th class=\"n\">Runs</th>"
+                   '<th class="n">Calls</th><th class="n">Reverts</th><th class="n">Gas</th></tr>')
+        for t in tests:
+            note = f'<br><span class="muted">{_h(t.note)}</span>' if t.note else ""
+            out.append(f"<tr><td>{_badge_html(t.status)}</td><td>{_h(t.name)}{note}</td><td>{_h(t.kind)}</td>"
+                       f'<td class="n">{_num(t.runs)}</td><td class="n">{_num(t.calls)}</td>'
+                       f'<td class="n">{_num(t.reverts)}</td><td class="n">{_num(t.gas)}</td></tr>')
+        out.append("</table>")
+    out.append("<footer>Generated by FoundryGuard. A passing invariant held for every call sequence forge tried; "
+               "it is evidence, not a proof.</footer></main></body></html>")
+    return "\n".join(out) + "\n"
+
+
 def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> None:
     """Fill missing counter-examples from forge's persisted failures.
 
@@ -706,14 +1091,32 @@ def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> 
                 t.note = (t.note + "; " if t.note else "") + f"counter-example read from `{path.relative_to(root).as_posix()}`"
 
 
-def write_report(run: Run, root: Path, output: str | None = None) -> Path:
+def html_path(root: Path, output: str | None = None, html: str | None = None) -> Path:
+    """Where the HTML report goes: ``html`` if given, else next to the Markdown report."""
+    if html:
+        p = Path(html)
+        return p if p.is_absolute() else Path.cwd() / p
+    md = Path(output) if output else root / REPORT_FILE
+    if not md.is_absolute() and output:
+        md = Path.cwd() / md
+    return md.parent / HTML_FILE
+
+
+def write_report(run: Run, root: Path, output: str | None = None, html: str | None | bool = None) -> Path:
+    """Write the Markdown report and, unless ``html`` is False, ``foundryguard-report.html`` beside it
+    (or at the path ``html`` names). Returns the Markdown path."""
     resolve_from_source(run, root)
     load_persisted_sequences(run, root)
     path = Path(output) if output else root / REPORT_FILE
     if not path.is_absolute() and output:
         path = Path.cwd() / path
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render(run, root))
+    generated = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    path.write_text(render(run, root, generated))
+    if html is not False:
+        hp = html_path(root, output, html if isinstance(html, str) else None)
+        hp.parent.mkdir(parents=True, exist_ok=True)
+        hp.write_text(render_html(run, root, generated), encoding="utf-8")
     return path
 
 
@@ -728,10 +1131,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("results", help="file with `forge test --json` or `forge test -vvv` output, or '-' for stdin")
     ap.add_argument("--root", default=".", help="project root: the report goes here and handler sources are read from here")
     ap.add_argument("-o", "--output", help=f"report path (default: <root>/{REPORT_FILE})")
+    ap.add_argument("--html", help=f"HTML report path (default: {HTML_FILE} next to the Markdown report)")
+    ap.add_argument("--no-html", action="store_true", help=f"do not write {HTML_FILE}")
     ap.add_argument("--fail-on-failure", action="store_true", help="exit 1 if a test failed or no results were found")
     args = ap.parse_args(argv)
     run = load(args.results)
-    path = write_report(run, Path(args.root), args.output)
+    path = write_report(run, Path(args.root), args.output, False if args.no_html else args.html)
     print(f"foundryguard: {path} [{run.status}] {run.count(PASSED)} passed, {run.count(FAILED)} failed, "
           f"{run.count(SKIPPED)} skipped", file=sys.stderr)
     if args.fail_on_failure and (run.status != PASSED):

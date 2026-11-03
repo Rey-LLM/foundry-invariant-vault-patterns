@@ -98,6 +98,8 @@ jobs:
           must "Counter-example call trace" FoundryGuard_Report.md
           # The leak breaks both accounting invariants; the fuzzer reports whichever it hits first.
           must "invariant_(tokenSolvency|actorBalancesBoundedByTotal)" FoundryGuard_Report.md
+          must 'class="badge FAILED"' foundryguard-report.html
+          must 'Fuzz inputs' foundryguard-report.html
           forge test --match-path "test/foundryguard/*" -vvv > forge-output.txt || true
           python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
           must "Counter-example call trace" report-from-stdout.md

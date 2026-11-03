@@ -7,7 +7,7 @@
     foundryguard run [--test]         scan + gen (+ forge test on the generated suites + FoundryGuard_Report.md)
     foundryguard check                CI: exit 1 when generated suites are missing or stale
     foundryguard heal                 compile the generated suites and fix what the local compiler rejects
-    foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, Markdown, SARIF
+    foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, foundryguard-report.html, Markdown, SARIF
 
 Run it as ``foundryguard`` after ``pipx install .`` or as ``python3 src/cli/foundryguard.py``.
 """
@@ -156,7 +156,8 @@ def cmd_run(args, check: bool = False) -> int:
     rc = proc.wait()
     if not getattr(args, "no_report", False):
         run = reporter.parse_text("".join(captured), "forge test " + " ".join(cmd[2:]))
-        path = reporter.write_report(run, root, getattr(args, "report", None))
+        html = False if getattr(args, "no_html", False) else getattr(args, "html", None)
+        path = reporter.write_report(run, root, getattr(args, "report", None), html)
         print(f"foundryguard: wrote {path} [{run.status}]", file=sys.stderr)
     return rc
 
@@ -183,7 +184,7 @@ def cmd_report(args) -> int:
     text = sys.stdin.read() if args.results == "-" else Path(args.results).read_text(encoding="utf-8", errors="replace")
     run = reporter.parse_text(text, "stdin" if args.results == "-" else args.results)
     if not args.no_report:
-        path = reporter.write_report(run, root, args.report)
+        path = reporter.write_report(run, root, args.report, False if args.no_html else args.html)
         print(f"foundryguard: wrote {path} [{run.status}] {run.count(reporter.PASSED)} passed, "
               f"{run.count(reporter.FAILED)} failed", file=sys.stderr)
     data = reporter.try_json(text) or {}
@@ -247,6 +248,8 @@ def build_cli() -> argparse.ArgumentParser:
             p.add_argument("--test", action="store_true", help="run forge test on the generated suites afterwards")
             p.add_argument("--report", help=f"with --test: report path (default: <root>/{reporter.REPORT_FILE})")
             p.add_argument("--no-report", action="store_true", help=f"with --test: do not write {reporter.REPORT_FILE}")
+            p.add_argument("--html", help=f"with --test: HTML report path (default: {reporter.HTML_FILE} next to the report)")
+            p.add_argument("--no-html", action="store_true", help=f"with --test: do not write {reporter.HTML_FILE}")
         p.set_defaults(func=(lambda a, c=check: cmd_run(a, c)))
 
     p = sub.add_parser("heal", help="compile the generated suites and fix what the local compiler rejects")
@@ -266,6 +269,8 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--root", default=".", help="project root; the report is written here")
     p.add_argument("--report", help=f"report path (default: <root>/{reporter.REPORT_FILE})")
     p.add_argument("--no-report", action="store_true", help=f"do not write {reporter.REPORT_FILE}")
+    p.add_argument("--html", help=f"HTML report path (default: {reporter.HTML_FILE} next to the report)")
+    p.add_argument("--no-html", action="store_true", help=f"do not write {reporter.HTML_FILE}")
     p.add_argument("--md", help="write the short CI Markdown summary here (default: stdout)")
     p.add_argument("--sarif", help="write SARIF here")
     p.add_argument("--fail-on-failure", action="store_true", help="exit 1 if any test failed")
