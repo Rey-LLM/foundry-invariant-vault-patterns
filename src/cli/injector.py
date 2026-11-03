@@ -70,12 +70,14 @@ from pathlib import Path
 
 if __package__:
     from . import ai_generator, healer
-    from .blueprints import hook_reentrancy, transient_storage
+    from .blueprints import (flashloan_price, governance_flashmint, hook_reentrancy,
+                             read_reentrancy_view, transient_storage)
 else:  # executed as a plain script directory (python3 src/cli/injector.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import ai_generator  # type: ignore
     import healer  # type: ignore
-    from blueprints import hook_reentrancy, transient_storage  # type: ignore
+    from blueprints import (flashloan_price, governance_flashmint, hook_reentrancy,  # type: ignore
+                            read_reentrancy_view, transient_storage)
 
 SUPPORTED_SCHEMA = "foundryguard.blueprint/v2"
 # v1 blueprints (0.3, name-based inheritance) are still read; v2 adds AST node identities.
@@ -133,6 +135,9 @@ class Target:
     settings: dict = field(default_factory=dict)  # [contracts.<Name>] config block
     hooks: "hook_reentrancy.HookPlan | None" = None  # Preset 04 plan when the target calls out to hooks
     transient: "transient_storage.TransientPlan | None" = None  # Preset 05 plan when the target uses tstore
+    pricing: "flashloan_price.FlashLoanPlan | None" = None  # Preset 06 plan when the price source is manipulable
+    governance: "governance_flashmint.GovernancePlan | None" = None  # Preset 07 plan for a governance contract
+    read_reentrancy: "read_reentrancy_view.ReadReentrancyPlan | None" = None  # Preset 08 payout-before-settle plan
 
     @property
     def name(self) -> str:
@@ -337,6 +342,15 @@ def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = 
             t.hooks = hook_reentrancy.analyze(c["name"], functions, t.flows, lineage, blueprint["contracts"])
             if t.settings.get("transient", True) is not False:
                 t.transient = transient_storage.analyze(c["name"], lineage, t.settings)
+            t.pricing = flashloan_price.analyze(c["name"], functions, t.flows, lineage, c.get("links", []), t.settings)
+            t.governance = governance_flashmint.analyze(c["name"], functions, t.flows, lineage, t.settings)
+            # Preset 08 reuses the hook probe to watch a native payout, so it only applies when Preset 04 has
+            # not already claimed the actor slot for a declared hook.
+            if t.hooks is None:
+                rr = read_reentrancy_view.analyze(c["name"], functions, t.flows, lineage, t.settings)
+                t.read_reentrancy = rr
+                if rr and rr.native:
+                    t.hooks = read_reentrancy_view.to_hook_plan(rr)
             for w in t.warnings:
                 log.warning("%s: %s", c["name"], w)
             targets.append(t)
@@ -563,6 +577,12 @@ def plan_setup(t: Target) -> SetupPlan:
         plan.notes.extend(t.transient.notes)
         if t.transient.slots:
             plan.harness = plan_harness(t)
+    if t.pricing:
+        plan.notes.extend(t.pricing.notes)
+    if t.governance:
+        plan.notes.extend(t.governance.notes)
+    if t.read_reentrancy:
+        plan.notes.extend(t.read_reentrancy.notes)
     return plan
 
 
@@ -865,6 +885,22 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
         transient_helpers = (transient_storage.render_sequence(seq_wrappers) + "\n"
                              + transient_storage.render_handler_helpers(c["name"], t.transient))
         harness_src = transient_storage.render_harness(c["name"], harness["params"], harness["args"], harness["payable"])
+
+    # Preset 06: sample the priced views before and after a bare donation to the target.
+    pricing = t.pricing
+    pricing_state = pricing_helpers = ""
+    if pricing and pricing.quotes:
+        selectors.append("donationSqueeze")
+        pricing_state = flashloan_price.render_handler_state(c["name"], pricing)
+        pricing_helpers = flashloan_price.render_handler_helpers(c["name"], pricing)
+
+    # Preset 07: the flash-vote probe needs a mint-like function to flash-acquire the governance token.
+    gov = t.governance
+    governance_state = governance_helpers = ""
+    if gov and gov.grant:
+        selectors.append("flashVote")
+        governance_state = governance_flashmint.render_handler_state(c["name"], gov)
+        governance_helpers = governance_flashmint.render_handler_helpers(c["name"], gov)
     if hooks:
         ctor_sig = f"{c['name']} _target, address[] memory _tokens, address[] memory _rewardTokens, address[] memory _probes"
         actor_loop = "_probes.length"
@@ -919,7 +955,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     uint256 public ghost_successfulFlows;
     /// Actions skipped because the actor had nothing to take out.
     uint256 public ghost_skipped;
-{erc_ghosts}{probes_decl}{transient_state}
+{erc_ghosts}{probes_decl}{transient_state}{pricing_state}{governance_state}
     /// @param _tokens every mock token the target uses: each actor gets INITIAL_BALANCE and approves the target.
     /// @param _rewardTokens the subset paid out as rewards (balance deltas feed ghost_rewardsPaid).{actor_doc}
     constructor({ctor_sig}) {{
@@ -948,6 +984,8 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
 
 {chr(10).join(chr(10).join([w, '']) for w in wrappers).rstrip()}
 {transient_helpers.rstrip(chr(10)) + chr(10) if harness else ''}
+{pricing_helpers.rstrip(chr(10)) + chr(10) if pricing_helpers else ''}
+{governance_helpers.rstrip(chr(10)) + chr(10) if governance_helpers else ''}
     /// @notice Advances time so time-weighted rewards and lock expiries are exercised.
     function warp(uint256 dtSeed) external {{
         vm.warp(block.timestamp + bound(dtSeed, 1, 7 days));
@@ -1133,6 +1171,18 @@ def render_invariant(t: Target, plan: SetupPlan, import_rel: str, support_rel: s
 
     if plan.harness:
         for fname, doc, body in transient_storage.invariants(name, t.transient):
+            add(fname, doc, body)
+
+    if t.pricing and t.pricing.quotes:
+        for fname, doc, body in flashloan_price.invariants(name, t.pricing):
+            add(fname, doc, body)
+
+    if t.governance and t.governance.grant:
+        for fname, doc, body in governance_flashmint.invariants(name, t.governance):
+            add(fname, doc, body)
+
+    if t.read_reentrancy:
+        for fname, doc, body in read_reentrancy_view.invariants(name, t.read_reentrancy):
             add(fname, doc, body)
 
     for tk in rewards:
@@ -1891,7 +1941,8 @@ def inject_ai(t: Target, root: Path, out_dir: Path, force: bool, dry_run: bool,
     entry = {
         "contract": t.name, "file": t.contract["file"], "line": t.contract["line"], "dir": dest.as_posix(),
         "flows": [], "skipped": [], "warnings": list(t.warnings), "setup_notes": [], "tokens": [],
-        "upgradeable": False, "erc4626": False, "hooks": None, "transient": None, "support": None,
+        "upgradeable": False, "erc4626": False, "hooks": None, "transient": None,
+        "pricing": None, "governance": None, "read_reentrancy": None, "support": None,
         "ai": {"model": ai.describe()}, "invariants": [],
     }
     files = [dest / "Handler.sol", dest / "Invariant.t.sol"]
@@ -1958,6 +2009,9 @@ def _inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, a
             "erc4626": t.is_erc4626,
             "hooks": t.hooks.summary() if t.hooks else None,
             "transient": t.transient.summary() if t.transient else None,
+            "pricing": t.pricing.summary() if t.pricing else None,
+            "governance": t.governance.summary() if t.governance else None,
+            "read_reentrancy": t.read_reentrancy.summary() if t.read_reentrancy else None,
             "support": support_status,
         }
         if plan.blockers:

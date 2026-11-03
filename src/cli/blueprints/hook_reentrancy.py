@@ -148,6 +148,7 @@ class HookPlan:
     returns: list[dict] = field(default_factory=list)            # dynamic-return dispatch entries
     imports: list[tuple[str, str]] = field(default_factory=list)  # (symbol, file) for selectors
     notes: list[str] = field(default_factory=list)
+    read_reentrancy: bool = False  # Preset 08 reuses this probe to watch a native payout (no declared hook)
 
     @property
     def msg_sender(self) -> bool:
@@ -281,8 +282,8 @@ def analyze(target_name: str, functions: list[dict], flows: list[dict], lineage:
 
 def wiring_notes(hp: HookPlan, hook_params_used: int, flows: list[dict]) -> list[str]:
     """Explain receivers the generated setUp could not point at the probe."""
-    if hp.msg_sender or hook_params_used or hp.setter:
-        return []
+    if hp.read_reentrancy or hp.msg_sender or hook_params_used or hp.setter:
+        return []  # Preset 08: the actor is the payee, so no hook wiring is needed
     if any(p["type"] == "address" and HOOK_PARAM_NAME.search(p["name"]) for f in flows for p in f["params"]):
         return []
     return [f"hook receiver(s) {', '.join(hp.receivers)} could not be pointed at the probe; pass "
@@ -431,6 +432,8 @@ def render_handler_helpers(target_name: str) -> str:
 
 def invariants(target_name: str, hp: HookPlan) -> list[tuple[str, str, str]]:
     out = []
+    if hp.read_reentrancy:
+        return out  # Preset 08 owns the invariant (invariant_readReentrancy_viewsConsistentOnPayout)
     if hp.views:
         out.append((
             "invariant_hook_readConsistency",

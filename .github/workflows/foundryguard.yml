@@ -211,6 +211,123 @@ jobs:
       - if: always()
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
 
+  flashloan-price:
+    name: Preset 06 catches a price squeezable by a donation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/flashloan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
+      - run: forge build
+      - name: SpotPricedVault must fail the donation check, AccountedVault must pass
+        run: |
+          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
+          grep -q "invariant_flashloan_priceNotMovableByDonation" report-from-stdout.md
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          run = reporter.load("forge-results.json")
+          failed = {t.contract for t in run.failures}
+          print("failed suites:", sorted(failed))
+          names = {t.name for t in run.failures if t.contract == "SpotPricedVaultGuardInvariantTest"}
+          assert "SpotPricedVaultGuardInvariantTest" in failed, "Preset 06 did not catch the donation-squeezable price"
+          assert "invariant_flashloan_priceNotMovableByDonation()" in names, f"wrong invariant reported: {names}"
+          assert not failed - {"SpotPricedVaultGuardInvariantTest"}, f"false positive on the fixed vault: {failed}"
+          print("SpotPricedVault failures:", sorted(names))
+          PY
+      - if: always()
+        run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  governance:
+    name: Preset 07 catches a flash-mintable vote weight
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/governance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
+      - run: forge build
+      - name: FlashVoteGovernor must fail, SnapshotGovernor must pass
+        run: |
+          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
+          grep -q "invariant_governance_powerNotFlashInflatable" report-from-stdout.md
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          run = reporter.load("forge-results.json")
+          failed = {t.contract for t in run.failures}
+          print("failed suites:", sorted(failed))
+          names = {t.name for t in run.failures if t.contract == "FlashVoteGovernorGuardInvariantTest"}
+          assert "FlashVoteGovernorGuardInvariantTest" in failed, "Preset 07 did not catch the flash-mintable vote weight"
+          assert "invariant_governance_powerNotFlashInflatable()" in names, f"wrong invariant reported: {names}"
+          assert not failed - {"FlashVoteGovernorGuardInvariantTest"}, f"false positive on the checkpointed governor: {failed}"
+          print("FlashVoteGovernor failures:", sorted(names))
+          PY
+      - if: always()
+        run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  read-reentrancy:
+    name: Preset 08 catches a view read mid-payout
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/read-reentrancy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
+      - run: forge build
+      - name: NativeYieldVault must fail the read-reentrancy check, SafeNativeYieldVault must pass
+        run: |
+          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
+          grep -q "invariant_readReentrancy_viewsConsistentOnPayout" report-from-stdout.md
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          run = reporter.load("forge-results.json")
+          failed = {t.contract for t in run.failures}
+          print("failed suites:", sorted(failed))
+          names = {t.name for t in run.failures if t.contract == "NativeYieldVaultGuardInvariantTest"}
+          assert "NativeYieldVaultGuardInvariantTest" in failed, "Preset 08 did not catch the mid-payout view inconsistency"
+          assert "invariant_readReentrancy_viewsConsistentOnPayout()" in names, f"wrong invariant reported: {names}"
+          assert not failed - {"NativeYieldVaultGuardInvariantTest"}, f"false positive on the checks-effects-interactions vault: {failed}"
+          print("NativeYieldVault failures:", sorted(names))
+          PY
+      - if: always()
+        run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
   ecosystem:
     name: Layer 07 catches a vault that breaks when its oracle moves
     runs-on: ubuntu-latest

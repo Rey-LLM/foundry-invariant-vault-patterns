@@ -24,7 +24,8 @@ import injector  # noqa: E402
 import parser as fg_parser  # noqa: E402
 import reporter  # noqa: E402
 import reporting  # noqa: E402
-from blueprints import hook_reentrancy, transient_storage  # noqa: E402
+from blueprints import (flashloan_price, governance_flashmint, hook_reentrancy,  # noqa: E402
+                        read_reentrancy_view, transient_storage)
 
 logging.disable(logging.CRITICAL)
 
@@ -32,10 +33,16 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FIXTURE = FIXTURES / "project"
 HOOKS_FIXTURE = FIXTURES / "hooks"
 TRANSIENT_FIXTURE = FIXTURES / "transient"
+FLASHLOAN_FIXTURE = FIXTURES / "flashloan"
+GOVERNANCE_FIXTURE = FIXTURES / "governance"
+READ_REENTRANCY_FIXTURE = FIXTURES / "read-reentrancy"
 LIBS_FIXTURE = FIXTURES / "libs"
 AST_OUTPUT = FIXTURES / "ast" / "solc-output.json"
 HOOKS_AST_OUTPUT = FIXTURES / "ast" / "hooks-solc-output.json"
 TRANSIENT_AST_OUTPUT = FIXTURES / "ast" / "transient-solc-output.json"
+FLASHLOAN_AST_OUTPUT = FIXTURES / "ast" / "flashloan-solc-output.json"
+GOVERNANCE_AST_OUTPUT = FIXTURES / "ast" / "governance-solc-output.json"
+READ_REENTRANCY_AST_OUTPUT = FIXTURES / "ast" / "read-reentrancy-solc-output.json"
 FORGE_STDOUT = FIXTURES / "forge" / "leaky-stdout.txt"
 FORGE_JSON = FIXTURES / "forge" / "leaky-results.json"
 FORGE1_STDOUT = FIXTURES / "forge" / "hooks-stdout-forge1.txt"
@@ -721,6 +728,219 @@ class TransientPresetTests(ProjectCase):
         self.assertTrue(all(r["transient"] is None for r in report))
         handler = (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text()
         self.assertNotIn("transient", handler.lower())
+
+
+class FlashLoanPresetTests(ProjectCase):
+    fixture = FLASHLOAN_FIXTURE
+    ast_fixture = FLASHLOAN_AST_OUTPUT
+
+    def test_detects_self_balance_pricing(self):
+        bp = self.scan()
+        cs = contracts(bp)
+        # The spot read is in the internal _backing() helper that convertToAssets / deposit call.
+        backing = next(f for f in cs["SpotPricedVault"]["functions"] if f["name"] == "_backing")
+        self.assertTrue(backing["reads_self_balance"])
+        # The fixed vault prices off internal accounting; only skimmable() reads the live balance.
+        fixed = {f["name"]: f for f in cs["AccountedVault"]["functions"]}
+        self.assertFalse(fixed["convertToAssets"]["reads_self_balance"])
+        self.assertTrue(fixed["skimmable"]["reads_self_balance"])
+        self.assertEqual(bp["summary"]["flashloan_price_contracts"], 2)
+
+    def test_both_vaults_get_the_donation_squeeze_check(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        for name in ("SpotPricedVault", "AccountedVault"):
+            r = report[name]
+            self.assertIn("invariant_flashloan_priceNotMovableByDonation", r["invariants"])
+            self.assertEqual(r["pricing"]["quotes"], ["convertToAssets(1e18)"])
+            self.assertEqual(r["setup_notes"], [])
+        self.assertIn("SpotPricedVault._backing", report["SpotPricedVault"]["pricing"]["sources"][0])
+        self.assertIn("AccountedVault.skimmable", report["AccountedVault"]["pricing"]["sources"][0])
+        handler = self.read("SpotPricedVault", "Handler.sol")
+        self.assertIn("function donationSqueeze(uint256 tokenSeed, uint256 amountSeed) external {", handler)
+        self.assertIn('abi.encodeWithSignature("convertToAssets(uint256)", uint256(1e18))', handler)
+        self.assertIn("ghost_priceMovedByDonation++;", handler)
+        inv = self.read("SpotPricedVault", "Invariant.t.sol")
+        self.assertIn("SpotPricedVaultGuardHandler.donationSqueeze.selector", inv)
+        self.assertIn("assertEq(handler.ghost_priceMovedByDonation(), 0,", inv)
+
+    def test_price_source_without_a_priced_view_is_reported_not_generated(self):
+        (self.root / "src" / "Bare.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.24;
+            interface IERC20 { function balanceOf(address) external view returns (uint256);
+                function transferFrom(address,address,uint256) external returns (bool); }
+            contract Bare {
+                IERC20 public token;
+                mapping(address => uint256) public stakedOf;
+                uint256 public totalStaked;
+                constructor(IERC20 t) { token = t; }
+                function stake(uint256 a) external { token.transferFrom(msg.sender, address(this), a);
+                    stakedOf[msg.sender] += a; totalStaked += a; }
+                function surplus() external view returns (uint256) { return token.balanceOf(address(this)) - totalStaked; }
+            }
+        """)
+        report = {r["contract"]: r for r in self.gen(self.compile(paths=["src/Bare.sol"]), only={"Bare"})}
+        r = report["Bare"]
+        self.assertNotIn("invariant_flashloan_priceNotMovableByDonation", r["invariants"])
+        self.assertTrue(any("no per-unit price view" in n for n in r["setup_notes"]))
+
+    def test_contract_without_price_source_is_not_flagged(self):
+        root = self.tmp / "plain"
+        shutil.copytree(FIXTURE, root)
+        bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
+        report = injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
+        self.assertTrue(all(r.get("pricing") is None for r in report))
+        self.assertNotIn("donationSqueeze", (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text())
+
+    @needs_solc
+    def test_generated_flashloan_suite_compiles(self):
+        self.gen(self.scan())
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        files = sorted(p.relative_to(self.root).as_posix() for p in (self.root / "test").rglob("*.sol"))
+        result = compiler.compile_with_solc(self.root, files, "auto")
+        self.assertEqual([d.as_dict() for d in result.diagnostics if d.severity == "error"], [])
+        self.assertIn("test/foundryguard/SpotPricedVault/Invariant.t.sol", result.units)
+
+
+class GovernancePresetTests(ProjectCase):
+    fixture = GOVERNANCE_FIXTURE
+    ast_fixture = GOVERNANCE_AST_OUTPUT
+
+    def test_detects_governance_and_grant(self):
+        bp = self.scan()
+        self.assertEqual(bp["summary"]["governance_contracts"], 2)
+        report = {r["contract"]: r for r in self.gen(bp)}
+        for name in ("FlashVoteGovernor", "SnapshotGovernor"):
+            g = report[name]["governance"]
+            self.assertEqual(g["vote_fns"], ["castVote(uint256,bool)"])
+            self.assertEqual(g["power_getter"], "votingPower")
+            self.assertEqual(g["grant"], "mint(address,uint256)")
+            self.assertIn("invariant_governance_powerNotFlashInflatable", report[name]["invariants"])
+
+    def test_flash_vote_handler_shape(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        handler = self.read("FlashVoteGovernor", "Handler.sol")
+        self.assertIn("function flashVote(uint256 actorSeed, uint256 amountSeed) external {", handler)
+        self.assertIn('abi.encodeWithSignature("votingPower(address)", account)', handler)
+        self.assertIn('abi.encodeWithSignature("mint(address,uint256)", actor, flash)', handler)
+        self.assertIn("ghost_flashPowerGain++;", handler)
+        inv = self.read("FlashVoteGovernor", "Invariant.t.sol")
+        self.assertIn("FlashVoteGovernorGuardHandler.flashVote.selector", inv)
+        self.assertIn("assertEq(handler.ghost_flashPowerGain(), 0,", inv)
+
+    def test_power_getter_without_grant_is_reported_not_generated(self):
+        (self.root / "src" / "NoMint.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.24;
+            contract NoMint {
+                mapping(address => uint256) public balanceOf;
+                uint256 public totalSupply;
+                mapping(uint256 => uint256) public forVotes;
+                function stake(uint256 a) external { balanceOf[msg.sender] += a; totalSupply += a; }
+                function castVote(uint256 id, bool s) external { if (s) forVotes[id] += votingPower(msg.sender); }
+                function votingPower(address a) public view returns (uint256) { return balanceOf[a]; }
+            }
+        """)
+        report = {r["contract"]: r for r in self.gen(self.compile(paths=["src/NoMint.sol"]), only={"NoMint"})}
+        r = report["NoMint"]
+        self.assertNotIn("invariant_governance_powerNotFlashInflatable", r["invariants"])
+        self.assertTrue(any("no public mint/issue" in n for n in r["setup_notes"]))
+
+    def test_non_governance_contract_is_not_flagged(self):
+        root = self.tmp / "plain"
+        shutil.copytree(FIXTURE, root)
+        bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
+        report = injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
+        self.assertTrue(all(r.get("governance") is None for r in report))
+
+    @needs_solc
+    def test_generated_governance_suite_compiles(self):
+        self.gen(self.scan())
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        files = sorted(p.relative_to(self.root).as_posix() for p in (self.root / "test").rglob("*.sol"))
+        result = compiler.compile_with_solc(self.root, files, "auto")
+        self.assertEqual([d.as_dict() for d in result.diagnostics if d.severity == "error"], [])
+        self.assertIn("test/foundryguard/SnapshotGovernor/Invariant.t.sol", result.units)
+
+
+class ReadReentrancyPresetTests(ProjectCase):
+    fixture = READ_REENTRANCY_FIXTURE
+    ast_fixture = READ_REENTRANCY_AST_OUTPUT
+
+    def test_detects_payout_before_settle(self):
+        bp = self.scan()
+        cs = contracts(bp)
+        vuln = {f["name"]: f for f in cs["NativeYieldVault"]["functions"]}
+        self.assertTrue(vuln["withdraw"]["payout_settle"]["native"])
+        # The fixed vault settles before paying, so the native payment comes after the last state write.
+        safe = {f["name"]: f for f in cs["SafeNativeYieldVault"]["functions"]}
+        self.assertFalse(safe["withdraw"]["payout_settle"].get("native"))
+        self.assertEqual(bp["summary"]["read_reentrancy_contracts"], 1)
+
+    def test_vulnerable_gets_probe_and_invariant(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        r = report["NativeYieldVault"]
+        self.assertIn("invariant_readReentrancy_viewsConsistentOnPayout", r["invariants"])
+        self.assertEqual(r["read_reentrancy"]["sites"], ["NativeYieldVault.withdraw"])
+        self.assertEqual(r["read_reentrancy"]["views"], ["pricePerShare", "totalAssets", "totalShares"])
+        self.assertTrue(r["read_reentrancy"]["native"])
+        # Preset 08 does not emit the Preset 04 read-consistency invariant on a synthesized plan.
+        self.assertNotIn("invariant_hook_readConsistency", r["invariants"])
+        handler = self.read("NativeYieldVault", "Handler.sol")
+        self.assertIn("contract NativeYieldVaultHookProbe {", handler)
+        self.assertIn("function hookInconsistentReads() external view returns (uint256 total) {", handler)
+        inv = self.read("NativeYieldVault", "Invariant.t.sol")
+        self.assertIn("assertEq(handler.hookInconsistentReads(), 0,", inv)
+        self.assertNotIn("could not be pointed at the probe", inv)
+
+    def test_fixed_vault_is_not_flagged(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        r = report["SafeNativeYieldVault"]
+        self.assertIsNone(r["read_reentrancy"])
+        self.assertNotIn("invariant_readReentrancy_viewsConsistentOnPayout", r["invariants"])
+        self.assertNotIn("HookProbe", self.read("SafeNativeYieldVault", "Handler.sol"))
+
+    def test_token_payout_before_settle_is_reported_not_fuzzed(self):
+        (self.root / "src" / "TokenPayout.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.24;
+            interface IERC20 { function transfer(address,uint256) external returns (bool);
+                function transferFrom(address,address,uint256) external returns (bool); }
+            contract TokenPayout {
+                IERC20 public token;
+                uint256 public totalAssets;
+                uint256 public totalShares;
+                mapping(address => uint256) public sharesOf;
+                constructor(IERC20 t) { token = t; }
+                function deposit(uint256 a) external { token.transferFrom(msg.sender, address(this), a);
+                    sharesOf[msg.sender] += a; totalShares += a; totalAssets += a; }
+                function withdraw(uint256 s) external {
+                    require(sharesOf[msg.sender] >= s);
+                    uint256 assets = totalShares == 0 ? 0 : s * totalAssets / totalShares;
+                    totalShares -= s; sharesOf[msg.sender] -= s;
+                    token.transfer(msg.sender, assets);
+                    totalAssets -= assets;
+                }
+                function pricePerShare() external view returns (uint256) {
+                    return totalShares == 0 ? 1e18 : totalAssets * 1e18 / totalShares;
+                }
+            }
+        """)
+        report = {r["contract"]: r for r in self.gen(self.compile(paths=["src/TokenPayout.sol"]), only={"TokenPayout"})}
+        r = report["TokenPayout"]
+        self.assertTrue(r["read_reentrancy"]["token"])
+        self.assertFalse(r["read_reentrancy"]["native"])
+        self.assertNotIn("invariant_readReentrancy_viewsConsistentOnPayout", r["invariants"])
+        self.assertTrue(any("ERC-1820" in n for n in r["setup_notes"]))
+
+    @needs_solc
+    def test_generated_read_reentrancy_suite_compiles(self):
+        self.gen(self.scan())
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        files = sorted(p.relative_to(self.root).as_posix() for p in (self.root / "test").rglob("*.sol"))
+        result = compiler.compile_with_solc(self.root, files, "auto")
+        self.assertEqual([d.as_dict() for d in result.diagnostics if d.severity == "error"], [])
+        self.assertIn("test/foundryguard/NativeYieldVault/Invariant.t.sol", result.units)
 
 
 class ReporterTests(unittest.TestCase):

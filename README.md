@@ -117,6 +117,9 @@ Every handler call runs in `try/catch` and ghost totals change only on success, 
 | Rewards | `rewardsBoundedByFunding_<token>` |
 | 04 Hook read-reentrancy | `hook_readConsistency`, `hook_lockEngagedDuringCallback`, `hook_guardedFlowsNotReentered` |
 | 05 Transient storage | `transient_slotsClearedBetweenCalls` |
+| 06 Flash-loan price squeezing | `flashloan_priceNotMovableByDonation` |
+| 07 Governance flash-mint | `governance_powerNotFlashInflatable` |
+| 08 Economic read-reentrancy | `readReentrancy_viewsConsistentOnPayout` |
 | All | `afterInvariant` fails a run in which no value-flow call succeeded |
 
 ### Preset 04: hook read-reentrancy
@@ -143,6 +146,30 @@ A contract cannot read another contract's transient storage, so the suite deploy
 `invariant_transient_slotsClearedBetweenCalls` fails when a slot is still set after a call has returned. If a slot is meant to live for the whole transaction, list it under `transient_ignore`. Slots the parser cannot resolve go under `transient_slots`. `transient = false` turns the preset off for a contract.
 
 `tests/foundryguard/fixtures/transient` has `TransientStaking` and `LeakyTransientStaking`. CI requires the leaky one to fail this invariant and the fixed one to pass everything.
+
+### Preset 06: flash-loan price squeezing
+
+Applies to contracts that read a price, value or amount from a source an attacker can move inside one transaction: their own token or ETH balance (`token.balanceOf(address(this))`, `address(this).balance`), or a spot read on a contract they hold (`getReserves`, `slot0`, `getAmountOut`, `latestAnswer`, ...) used in a value flow. The parser finds the self-balance reads in the AST and the spot reads from the link map.
+
+The handler has a `donationSqueeze` action: it samples a priced view (`convertToAssets`, `previewRedeem`, `pricePerShare`, `exchangeRate`, ...), sends the target a bare donation (a direct transfer, no deposit, no shares), and samples the view again. `invariant_flashloan_priceNotMovableByDonation` fails if the view moved. A price read off a balance the donation changed moves; a price read off internal accounting that ignores unsolicited transfers does not. A view that moves is what a flash loan squeezes: borrow, donate to push the price, transact against it, withdraw the donation, repay. Price off a TWAP or internal accounting instead. A contract with a manipulable source but no priced view is reported, not generated.
+
+`tests/foundryguard/fixtures/flashloan` has a spot-priced `SpotPricedVault` and an internally accounted `AccountedVault`. CI requires the first to fail and the second to pass.
+
+### Preset 07: governance flash-mint vote hijacking
+
+Applies to contracts with a vote entry point (`castVote`, `vote`, ...) and a per-account voting-power getter (`getVotes`, `votingPower`, or plain `balanceOf`). A vote is safe only when its weight is fixed to a snapshot taken at proposal time or a past checkpoint; when the weight is read live, an attacker flash-mints or flash-borrows the governance token, votes, and returns it in one transaction.
+
+When the contract exposes a public mint/issue the test can flash-acquire with, the handler has a `flashVote` action: it reads an actor's voting power, grants that actor a large amount of the governance token in the same transaction, and reads the power again. `invariant_governance_powerNotFlashInflatable` fails if the power rose, because that rise is weight a flash loan would vote with and hand straight back. A checkpointed design (`getPastVotes`, an `ERC20Snapshot`, a balance recorded at proposal time) returns the same power no matter what is acquired in the current block. A governance contract with no mint the test can drive is reported, not generated.
+
+`tests/foundryguard/fixtures/governance` has a live-weight `FlashVoteGovernor` and a checkpointed `SnapshotGovernor`. CI requires the first to fail and the second to pass.
+
+### Preset 08: economic read-reentrancy via view functions
+
+Applies to a value flow that pays the caller before it finishes updating accounting, so the payment hands control back (a native `receive` / `fallback`) while an economic view (`totalAssets`, `pricePerShare`, `getReserves`, `convertToAssets`, ...) reads a half-settled state a reader would act on. The parser walks the function body in source order and flags a native payment (`call{value:}`, `transfer`, `send`) that comes before a write to an accounting state variable.
+
+The suite reuses the Preset 04 probe: every actor is a probe that snapshots the economic views when the target pays it mid-flow. `invariant_readReentrancy_viewsConsistentOnPayout` fails when a view read during the payment matches neither the pre-flow nor the post-flow state. The fix is checks-effects-interactions (settle before paying) or a read lock the views honour. A token payment before settlement (an ERC-777 `tokensReceived` risk) is reported rather than fuzzed, since reproducing it needs the ERC-1820 registry. Contracts that already call an external hook are left to Preset 04.
+
+`tests/foundryguard/fixtures/read-reentrancy` has a pay-before-settle `NativeYieldVault` and a checks-effects-interactions `SafeNativeYieldVault`. CI requires the first to fail and the second to pass.
 
 ### Cross-contract ecosystems
 

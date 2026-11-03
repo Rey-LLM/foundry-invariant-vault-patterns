@@ -66,12 +66,14 @@ from typing import Iterable
 
 if __package__:
     from . import compiler
-    from .blueprints import hook_reentrancy, transient_storage
+    from .blueprints import (flashloan_price, governance_flashmint, hook_reentrancy,
+                             read_reentrancy_view, transient_storage)
     from .compiler import Diagnostic, SolidityError
 else:  # executed as a plain script directory (python3 src/cli/parser.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import compiler  # type: ignore
-    from blueprints import hook_reentrancy, transient_storage  # type: ignore
+    from blueprints import (flashloan_price, governance_flashmint, hook_reentrancy,  # type: ignore
+                            read_reentrancy_view, transient_storage)
     from compiler import Diagnostic, SolidityError  # type: ignore
 
 SCHEMA = "foundryguard.blueprint/v2"
@@ -159,6 +161,9 @@ class Function:
     amount_param: str | None = None
     unit: str | None = None
     callbacks: list[dict] = field(default_factory=list)  # external hook calls made in the body
+    reads_self_balance: bool = False  # Preset 06: reads balanceOf(this) / this.balance (a spot price source)
+    vote_weighting: dict = field(default_factory=dict)   # Preset 07: {reads_live, reads_past}
+    payout_settle: dict = field(default_factory=dict)    # Preset 08: {native, token} payment before settlement
 
 
 @dataclass
@@ -419,6 +424,9 @@ def _function(node: dict, source: bytes | None, rules) -> Function:
         selector=node.get("functionSelector"),
         overrides=[_ref_name(o) for o in (overrides or {}).get("overrides", [])],
         callbacks=hook_reentrancy.detect_callbacks_ast(node.get("body")),
+        reads_self_balance=flashloan_price.detect_self_balance_pricing_ast(node.get("body")),
+        vote_weighting=governance_flashmint.detect_vote_weighting_ast(node.get("body")),
+        payout_settle=read_reentrancy_view.detect_payout_before_settle_ast(node.get("body")),
     )
     classify(fn, rules)
     return fn
@@ -1031,6 +1039,11 @@ def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts
         "stake_lock_functions": sum(len(c.categories.get("stake_lock", [])) for c in targets),
         "hook_contracts": sum(1 for c in targets if c.hooks),
         "transient_contracts": sum(1 for c in targets if c.transient),
+        "flashloan_price_contracts": sum(1 for c in targets if any(f.reads_self_balance for f in c.functions)),
+        "governance_contracts": sum(1 for c in targets
+                                    if any(governance_flashmint.VOTE_FN.match(f.name) for f in c.functions)),
+        "read_reentrancy_contracts": sum(1 for c in targets if any(
+            (f.payout_settle or {}).get("native") or (f.payout_settle or {}).get("token") for f in c.functions)),
         "linked_contracts": sum(1 for c in targets if c.links),
         "ecosystems": len(ecosystem["clusters"]),
     }
