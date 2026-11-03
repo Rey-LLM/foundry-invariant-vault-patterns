@@ -677,12 +677,19 @@ def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> 
     sequence of every broken invariant in ``cache/invariant/failures/<TestContract>/invariants/<invariant>``
     (older forge: ``cache/invariant/failures/<TestContract>/<invariant>``).
     """
+    failures_dir = root / cache_dir / "invariant" / "failures"
     for t in run.failures:
         if t.sequence or t.kind != "invariant":
             continue
-        base = root / cache_dir / "invariant" / "failures" / t.contract
+        base = failures_dir / t.contract
+        candidates = [base / "invariants" / t.func, base / t.func]
+        # Other forge versions nest the file differently; any file named after the invariant under a
+        # directory of this test contract is the same record.
+        if failures_dir.is_dir():
+            found = sorted(failures_dir.rglob(f"{t.func}*"), key=lambda q: (t.contract not in q.parts, len(q.parts)))
+            candidates += [q for q in found if q.is_file() and q.name.split(".")[0] == t.func]
         data = path = None
-        for path in (base / "invariants" / t.func, base / t.func):
+        for path in candidates:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 break
@@ -690,7 +697,9 @@ def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> 
                 data = None
         if data is None:
             continue
-        seq = data.get("call_sequence") if isinstance(data, dict) else data
+        seq = data
+        if isinstance(data, dict):
+            seq = next((data[k] for k in ("call_sequence", "sequence", "calls") if isinstance(data.get(k), list)), None)
         if isinstance(seq, list):
             t.sequence = [_call_from_json(step) for step in seq if isinstance(step, dict)]
             if t.sequence:

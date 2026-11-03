@@ -60,8 +60,8 @@ contract TransientInvariantTest is Test {
     }
 }
 
-/// @notice Shows the planted bug in LeakyTransientStaking. A test function runs as one transaction, so
-///         transient storage carries over from one call to the next, exactly as in a multicall.
+/// @notice Shows the planted bug in LeakyTransientStaking. Forge resets transient storage between the
+///         test's own top-level calls, so every step, including the slot read, runs inside one multicall.
 contract LeakyTransientStakingTest is Test {
     uint256 internal constant AMOUNT = 1_000e18;
     uint256 internal constant BONUS = AMOUNT / 100;
@@ -82,31 +82,29 @@ contract LeakyTransientStakingTest is Test {
         vm.stopPrank();
     }
 
-    function _stakeThenClaimTwice() internal pure returns (bytes[] memory calls) {
-        calls = new bytes[](3);
+    /// @dev The last step reads the entry slot from inside the same multicall, so the read happens in the
+    ///      transaction that ran the stake, which is where the leftover value lives.
+    function _stakeClaimClaimRead(bytes32 entrySlot) internal pure returns (bytes[] memory calls) {
+        calls = new bytes[](4);
         calls[0] = abi.encodeCall(TransientStaking.stake, (AMOUNT));
         calls[1] = abi.encodeCall(TransientStaking.claimPoints, ());
         calls[2] = abi.encodeCall(TransientStaking.claimPoints, ());
+        calls[3] = abi.encodeCall(TransientStakingHarness.transientSlot, (entrySlot));
     }
 
     function test_fixedVaultPaysEntryBonusOnce() public {
-        vm.prank(user);
-        fixedVault.multicall(_stakeThenClaimTwice());
-        assertEq(fixedVault.pointsOf(user), BONUS, "entry bonus paid more than once");
         bytes32 entrySlot = fixedVault.watchedSlots()[1];
-        assertEq(fixedVault.transientSlot(entrySlot), 0, "entry slot left set");
+        vm.prank(user);
+        bytes[] memory results = fixedVault.multicall(_stakeClaimClaimRead(entrySlot));
+        assertEq(fixedVault.pointsOf(user), BONUS, "entry bonus paid more than once");
+        assertEq(abi.decode(results[3], (uint256)), 0, "entry slot left set after stake");
     }
 
     function test_leakyVaultPaysEntryBonusOnEveryLaterCall() public {
-        vm.prank(user);
-        leakyVault.multicall(_stakeThenClaimTwice());
-        assertEq(leakyVault.pointsOf(user), 3 * BONUS, "the leftover entry amount should be paid on every accrual");
         bytes32 entrySlot = leakyVault.watchedSlots()[1];
-        assertEq(leakyVault.transientSlot(entrySlot), AMOUNT, "entry slot should still hold the stake amount");
-
-        // The leak outlives the multicall: any later call in the same transaction is paid again.
         vm.prank(user);
-        leakyVault.claimPoints();
-        assertEq(leakyVault.pointsOf(user), 4 * BONUS, "a separate call in the same transaction is paid too");
+        bytes[] memory results = leakyVault.multicall(_stakeClaimClaimRead(entrySlot));
+        assertEq(leakyVault.pointsOf(user), 3 * BONUS, "the leftover entry amount should be paid on every accrual");
+        assertEq(abi.decode(results[3], (uint256)), AMOUNT, "entry slot should still hold the stake amount");
     }
 }
