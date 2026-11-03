@@ -162,6 +162,7 @@ class Function:
     unit: str | None = None
     callbacks: list[dict] = field(default_factory=list)  # external hook calls made in the body
     reads_self_balance: bool = False  # Preset 06: reads balanceOf(this) / this.balance (a spot price source)
+    internal_calls: list[str] = field(default_factory=list)  # Preset 06: same-contract functions this body calls
     vote_weighting: dict = field(default_factory=dict)   # Preset 07: {reads_live, reads_past}
     payout_settle: dict = field(default_factory=dict)    # Preset 08: {native, token} payment before settlement
 
@@ -425,6 +426,7 @@ def _function(node: dict, source: bytes | None, rules) -> Function:
         overrides=[_ref_name(o) for o in (overrides or {}).get("overrides", [])],
         callbacks=hook_reentrancy.detect_callbacks_ast(node.get("body")),
         reads_self_balance=flashloan_price.detect_self_balance_pricing_ast(node.get("body")),
+        internal_calls=flashloan_price.detect_internal_calls_ast(node.get("body")),
         vote_weighting=governance_flashmint.detect_vote_weighting_ast(node.get("body")),
         payout_settle=read_reentrancy_view.detect_payout_before_settle_ast(node.get("body")),
     )

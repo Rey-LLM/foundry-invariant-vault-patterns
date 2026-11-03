@@ -212,7 +212,7 @@ jobs:
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
 
   flashloan-price:
-    name: Preset 06 catches a price squeezable by a donation
+    name: Preset 06 flags a donation-movable price (report-only)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -222,30 +222,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - uses: foundry-rs/foundry-toolchain@v1
-      - run: forge install foundry-rs/forge-std --no-git
-      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
-      - run: forge build
-      - name: SpotPricedVault must fail the donation check, AccountedVault must pass
+      - name: Install solc 0.8.24
         run: |
-          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
-          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
-          cat forge-stderr.txt >> forge-results.json
-          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
-          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
-          grep -q "invariant_flashloan_priceNotMovableByDonation" report-from-stdout.md
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL -o "$HOME/.local/bin/solc" https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+          chmod +x "$HOME/.local/bin/solc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: solc --version
+      - name: SpotPricedVault is flagged, AccountedVault is not, and no invariant is generated
+        run: |
+          # Preset 06 is report-only: a donation moving a vault's share price is normal behaviour, not a bug a
+          # fuzzer can decide, so the preset surfaces the manipulable-price surface and generates no invariant.
           python3 - <<'PY'
-          import sys
+          import sys, pathlib
           sys.path.insert(0, "../../../../src/cli")
-          import reporter
-          run = reporter.load("forge-results.json")
-          failed = {t.contract for t in run.failures}
-          print("failed suites:", sorted(failed))
-          names = {t.name for t in run.failures if t.contract == "SpotPricedVaultGuardInvariantTest"}
-          assert "SpotPricedVaultGuardInvariantTest" in failed, "Preset 06 did not catch the donation-squeezable price"
-          assert "invariant_flashloan_priceNotMovableByDonation()" in names, f"wrong invariant reported: {names}"
-          assert not failed - {"SpotPricedVaultGuardInvariantTest"}, f"false positive on the fixed vault: {failed}"
-          print("SpotPricedVault failures:", sorted(names))
+          import parser as fg_parser, injector
+          root = pathlib.Path(".")
+          bp = fg_parser.build_blueprint(root, [])
+          out = root / "test" / "foundryguard"
+          report = {r["contract"]: r for r in injector.inject(bp, root, out, None, 4, "1e24", True, False, None)}
+
+          spot = report["SpotPricedVault"]["pricing"]
+          assert spot, "Preset 06 did not flag SpotPricedVault (convertToAssets is priced off the live balance)"
+          assert spot["priced_views"] == ["convertToAssets"], spot
+          assert "SpotPricedVault._backing" in spot["sources"][0], spot["sources"]
+
+          assert report["AccountedVault"]["pricing"] is None, \
+              "Preset 06 false-flagged AccountedVault, which prices off internal accounting"
+
+          for name in ("SpotPricedVault", "AccountedVault"):
+              bad = [i for i in report[name]["invariants"] if "priceNotMovableByDonation" in i]
+              assert not bad, f"{name} still emits a donation invariant: {bad}"
+          handler = (out / "SpotPricedVault" / "Handler.sol").read_text()
+          assert "donationSqueeze" not in handler, "the handler still carries the donationSqueeze action"
+
+          print("SpotPricedVault flagged (views:", spot["priced_views"], "); AccountedVault clean; no invariant.")
           PY
       - if: always()
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true

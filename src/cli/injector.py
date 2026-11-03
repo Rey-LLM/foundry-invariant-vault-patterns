@@ -886,13 +886,8 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
                              + transient_storage.render_handler_helpers(c["name"], t.transient))
         harness_src = transient_storage.render_harness(c["name"], harness["params"], harness["args"], harness["payable"])
 
-    # Preset 06: sample the priced views before and after a bare donation to the target.
-    pricing = t.pricing
-    pricing_state = pricing_helpers = ""
-    if pricing and pricing.quotes:
-        selectors.append("donationSqueeze")
-        pricing_state = flashloan_price.render_handler_state(c["name"], pricing)
-        pricing_helpers = flashloan_price.render_handler_helpers(c["name"], pricing)
+    # Preset 06 (flash-loan price squeezing) is report-only: the finding is surfaced in the report and the
+    # setup notes, with no handler action or invariant, so nothing is spliced into the handler here.
 
     # Preset 07: the flash-vote probe needs a mint-like function to flash-acquire the governance token.
     gov = t.governance
@@ -955,7 +950,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     uint256 public ghost_successfulFlows;
     /// Actions skipped because the actor had nothing to take out.
     uint256 public ghost_skipped;
-{erc_ghosts}{probes_decl}{transient_state}{pricing_state}{governance_state}
+{erc_ghosts}{probes_decl}{transient_state}{governance_state}
     /// @param _tokens every mock token the target uses: each actor gets INITIAL_BALANCE and approves the target.
     /// @param _rewardTokens the subset paid out as rewards (balance deltas feed ghost_rewardsPaid).{actor_doc}
     constructor({ctor_sig}) {{
@@ -984,7 +979,6 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
 
 {chr(10).join(chr(10).join([w, '']) for w in wrappers).rstrip()}
 {transient_helpers.rstrip(chr(10)) + chr(10) if harness else ''}
-{pricing_helpers.rstrip(chr(10)) + chr(10) if pricing_helpers else ''}
 {governance_helpers.rstrip(chr(10)) + chr(10) if governance_helpers else ''}
     /// @notice Advances time so time-weighted rewards and lock expiries are exercised.
     function warp(uint256 dtSeed) external {{
@@ -1171,10 +1165,6 @@ def render_invariant(t: Target, plan: SetupPlan, import_rel: str, support_rel: s
 
     if plan.harness:
         for fname, doc, body in transient_storage.invariants(name, t.transient):
-            add(fname, doc, body)
-
-    if t.pricing and t.pricing.quotes:
-        for fname, doc, body in flashloan_price.invariants(name, t.pricing):
             add(fname, doc, body)
 
     if t.governance and t.governance.grant:

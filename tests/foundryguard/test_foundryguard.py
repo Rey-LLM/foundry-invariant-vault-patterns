@@ -734,55 +734,65 @@ class FlashLoanPresetTests(ProjectCase):
     fixture = FLASHLOAN_FIXTURE
     ast_fixture = FLASHLOAN_AST_OUTPUT
 
-    def test_detects_self_balance_pricing(self):
+    def test_detects_self_balance_pricing_and_the_call_graph(self):
         bp = self.scan()
         cs = contracts(bp)
-        # The spot read is in the internal _backing() helper that convertToAssets / deposit call.
-        backing = next(f for f in cs["SpotPricedVault"]["functions"] if f["name"] == "_backing")
-        self.assertTrue(backing["reads_self_balance"])
+        spot = {f["name"]: f for f in cs["SpotPricedVault"]["functions"]}
+        # The balance read is one call deeper, in the internal _backing() helper...
+        self.assertTrue(spot["_backing"]["reads_self_balance"])
+        self.assertFalse(spot["convertToAssets"]["reads_self_balance"])
+        # ... which convertToAssets reaches through the call graph the parser now records.
+        self.assertIn("_backing", spot["convertToAssets"]["internal_calls"])
         # The fixed vault prices off internal accounting; only skimmable() reads the live balance.
         fixed = {f["name"]: f for f in cs["AccountedVault"]["functions"]}
         self.assertFalse(fixed["convertToAssets"]["reads_self_balance"])
         self.assertTrue(fixed["skimmable"]["reads_self_balance"])
+        self.assertNotIn("_backing", fixed["convertToAssets"]["internal_calls"])
         self.assertEqual(bp["summary"]["flashloan_price_contracts"], 2)
 
-    def test_both_vaults_get_the_donation_squeeze_check(self):
+    def test_only_the_balance_priced_vault_is_flagged(self):
+        # Preset 06 is report-only: it surfaces the finding, it does not generate a pass/fail invariant.
         report = {r["contract"]: r for r in self.gen(self.scan())}
+        spot = report["SpotPricedVault"]
+        self.assertEqual(spot["pricing"]["priced_views"], ["convertToAssets"])
+        self.assertIn("SpotPricedVault._backing", spot["pricing"]["sources"][0])
+        self.assertTrue(any("Preset 06" in n and "no pass/fail invariant" in n for n in spot["setup_notes"]))
+        # The fixed vault reads its balance only in skimmable(), which prices nothing, so it is not flagged.
+        self.assertIsNone(report["AccountedVault"]["pricing"])
+        self.assertEqual(report["AccountedVault"]["setup_notes"], [])
+        # No handler action and no invariant on either vault.
         for name in ("SpotPricedVault", "AccountedVault"):
-            r = report[name]
-            self.assertIn("invariant_flashloan_priceNotMovableByDonation", r["invariants"])
-            self.assertEqual(r["pricing"]["quotes"], ["convertToAssets(1e18)"])
-            self.assertEqual(r["setup_notes"], [])
-        self.assertIn("SpotPricedVault._backing", report["SpotPricedVault"]["pricing"]["sources"][0])
-        self.assertIn("AccountedVault.skimmable", report["AccountedVault"]["pricing"]["sources"][0])
+            self.assertNotIn("invariant_flashloan_priceNotMovableByDonation", report[name]["invariants"])
         handler = self.read("SpotPricedVault", "Handler.sol")
-        self.assertIn("function donationSqueeze(uint256 tokenSeed, uint256 amountSeed) external {", handler)
-        self.assertIn('abi.encodeWithSignature("convertToAssets(uint256)", uint256(1e18))', handler)
-        self.assertIn("ghost_priceMovedByDonation++;", handler)
-        inv = self.read("SpotPricedVault", "Invariant.t.sol")
-        self.assertIn("SpotPricedVaultGuardHandler.donationSqueeze.selector", inv)
-        self.assertIn("assertEq(handler.ghost_priceMovedByDonation(), 0,", inv)
+        self.assertNotIn("donationSqueeze", handler)
+        self.assertNotIn("ghost_priceMovedByDonation", handler)
 
-    def test_price_source_without_a_priced_view_is_reported_not_generated(self):
-        (self.root / "src" / "Bare.sol").write_text("""
-            // SPDX-License-Identifier: MIT
-            pragma solidity ^0.8.24;
-            interface IERC20 { function balanceOf(address) external view returns (uint256);
-                function transferFrom(address,address,uint256) external returns (bool); }
-            contract Bare {
-                IERC20 public token;
-                mapping(address => uint256) public stakedOf;
-                uint256 public totalStaked;
-                constructor(IERC20 t) { token = t; }
-                function stake(uint256 a) external { token.transferFrom(msg.sender, address(this), a);
-                    stakedOf[msg.sender] += a; totalStaked += a; }
-                function surplus() external view returns (uint256) { return token.balanceOf(address(this)) - totalStaked; }
-            }
-        """)
-        report = {r["contract"]: r for r in self.gen(self.compile(paths=["src/Bare.sol"]), only={"Bare"})}
-        r = report["Bare"]
-        self.assertNotIn("invariant_flashloan_priceNotMovableByDonation", r["invariants"])
-        self.assertTrue(any("no per-unit price view" in n for n in r["setup_notes"]))
+    def test_analyze_requires_a_priced_path_to_the_balance(self):
+        # convertToAssets -> _backing -> balanceOf(this): the quote is read off the balance, so it is flagged.
+        backing = {"name": "_backing", "mutability": "view", "visibility": "internal",
+                   "params": [], "reads_self_balance": True, "internal_calls": []}
+        priced = {"name": "convertToAssets", "mutability": "view", "visibility": "public",
+                  "params": [{"type": "uint256"}], "reads_self_balance": False, "internal_calls": ["_backing"]}
+        funcs = [priced, backing]
+        plan = flashloan_price.analyze("V", funcs, [{"signature": "withdraw(uint256)"}],
+                                       [{"name": "V", "functions": funcs}], [])
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.priced_views, ["convertToAssets"])
+        self.assertIn("V._backing", plan.sources[0])
+
+        # A surplus view that reads the balance but feeds no priced view or flow: not flagged.
+        skim = {"name": "skimmable", "mutability": "view", "visibility": "external",
+                "params": [], "reads_self_balance": True, "internal_calls": []}
+        safe = {**priced, "internal_calls": []}  # prices off internal accounting instead
+        funcs2 = [safe, skim]
+        self.assertIsNone(flashloan_price.analyze("W", funcs2, [{"signature": "withdraw(uint256)"}],
+                                                  [{"name": "W", "functions": funcs2}], []))
+
+        # A spot read on a linked contract used inside a flow is flagged even with no self-balance read.
+        plan3 = flashloan_price.analyze("X", [], [{"signature": "swap(uint256)"}], [{"name": "X", "functions": []}],
+                                        [{"var": "oracle", "calls": ["latestAnswer"], "used_in": ["swap(uint256)"]}])
+        self.assertIsNotNone(plan3)
+        self.assertIn("spot read oracle.latestAnswer", plan3.sources[0])
 
     def test_contract_without_price_source_is_not_flagged(self):
         root = self.tmp / "plain"

@@ -117,7 +117,7 @@ Every handler call runs in `try/catch` and ghost totals change only on success, 
 | Rewards | `rewardsBoundedByFunding_<token>` |
 | 04 Hook read-reentrancy | `hook_readConsistency`, `hook_lockEngagedDuringCallback`, `hook_guardedFlowsNotReentered` |
 | 05 Transient storage | `transient_slotsClearedBetweenCalls` |
-| 06 Flash-loan price squeezing | `flashloan_priceNotMovableByDonation` |
+| 06 Flash-loan price squeezing | report-only: the manipulable-price surface is flagged in the report, no invariant is generated |
 | 07 Governance flash-mint | `governance_powerNotFlashInflatable` |
 | 08 Economic read-reentrancy | `readReentrancy_viewsConsistentOnPayout` |
 | All | `afterInvariant` fails a run in which no value-flow call succeeded |
@@ -149,11 +149,11 @@ A contract cannot read another contract's transient storage, so the suite deploy
 
 ### Preset 06: flash-loan price squeezing
 
-Applies to contracts that read a price, value or amount from a source an attacker can move inside one transaction: their own token or ETH balance (`token.balanceOf(address(this))`, `address(this).balance`), or a spot read on a contract they hold (`getReserves`, `slot0`, `getAmountOut`, `latestAnswer`, ...) used in a value flow. The parser finds the self-balance reads in the AST and the spot reads from the link map.
+Applies to contracts that read a price, value or amount from a source an attacker can move inside one transaction: their own token or ETH balance (`token.balanceOf(address(this))`, `address(this).balance`), or a spot read on a contract they hold (`getReserves`, `slot0`, `getAmountOut`, `latestAnswer`, ...) used in a value flow. The parser records each function's self-balance reads and its internal call graph, so a priced view that reaches the balance through a helper — `convertToAssets` → `_backing` → `balanceOf(address(this))` — is caught, while a standalone `skimmable()` that reads the balance but prices nothing is not.
 
-The handler has a `donationSqueeze` action: it samples a priced view (`convertToAssets`, `previewRedeem`, `pricePerShare`, `exchangeRate`, ...), sends the target a bare donation (a direct transfer, no deposit, no shares), and samples the view again. `invariant_flashloan_priceNotMovableByDonation` fails if the view moved. A price read off a balance the donation changed moves; a price read off internal accounting that ignores unsolicited transfers does not. A view that moves is what a flash loan squeezes: borrow, donate to push the price, transact against it, withdraw the donation, repay. Price off a TWAP or internal accounting instead. A contract with a manipulable source but no priced view is reported, not generated.
+This preset is report-only: it names the manipulable price source and the priced views read off it in the report and the setup notes, and generates no pass/fail invariant. The obvious check — "a bare donation never moves a priced view" — is a false positive, because a donation moving a vault's share price up is normal, correct behaviour (the amount is shared among existing holders), not a bug. Whether it is exploitable turns on whether value then flows at the squeezed price within the same transaction, an economic judgement a fuzzer cannot make — so FoundryGuard surfaces the surface to squeeze (borrow, donate to push the price, transact against it, withdraw the donation, repay) and leaves the call to a human. Price off a TWAP or internal accounting that ignores unsolicited transfers.
 
-`tests/foundryguard/fixtures/flashloan` has a spot-priced `SpotPricedVault` and an internally accounted `AccountedVault`. CI requires the first to fail and the second to pass.
+`tests/foundryguard/fixtures/flashloan` has a spot-priced `SpotPricedVault` (its redemption price is read off the live balance) and an internally accounted `AccountedVault` (it is not). CI requires the first to be flagged and the second to be left clean, with no invariant generated for either.
 
 ### Preset 07: governance flash-mint vote hijacking
 
