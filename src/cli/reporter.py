@@ -199,14 +199,10 @@ def _kind_from_json(res: dict, t: TestResult) -> None:
 
 def parse_json(data: dict, source: str = "forge JSON") -> Run:
     run = Run(source=source, fmt="forge JSON")
-    events: dict[str, list[dict]] = {}
-    for ev in data.get(EVENTS_KEY, []):
-        events.setdefault(ev.get("target", ""), []).append(ev)
     for suite_id, suite in sorted(data.items()):
         if suite_id == EVENTS_KEY or not isinstance(suite, dict):
             continue
         results = suite.get("test_results") or {}
-        campaign: TestResult | None = None
         for name, res in sorted(results.items()):
             if not isinstance(res, dict):
                 continue
@@ -223,29 +219,60 @@ def parse_json(data: dict, source: str = "forge JSON") -> Run:
                     if t.kind == "unit":
                         t.kind = "fuzz"
             t.logs = [str(x) for x in res.get("decoded_logs") or []]
-            if t.status == FAILED and campaign is None:
-                campaign = t
             run.tests.append(t)
-        # Forge runs every invariant of a contract in one shared campaign and can file the failure under
-        # the first invariant's name; the invariant that actually broke comes as a separate event.
-        for ev in events.pop(suite_id, []):
-            inv = ev.get("invariant", "?")
-            name = inv if inv.endswith(")") else f"{inv}()"
-            hit = next((t for t in run.tests if t.suite == suite_id and t.name == name), None)
-            if hit is None:
-                hit = TestResult(suite=suite_id, name=name, status=FAILED, kind="invariant")
-                run.tests.append(hit)
-            hit.status, hit.reason = FAILED, ev.get("reason") or hit.reason
-            if campaign is not None and campaign is not hit:
-                hit.sequence = hit.sequence or campaign.sequence
-                hit.runs, hit.calls, hit.reverts = campaign.runs, campaign.calls, campaign.reverts
-                campaign.note = f"forge filed the shared invariant campaign under this name; the invariant that broke is `{name}`"
-    for target, evs in events.items():  # events for suites without a result entry
-        for ev in evs:
-            inv = ev.get("invariant", "?")
-            run.tests.append(TestResult(suite=target, name=inv if inv.endswith(")") else f"{inv}()", status=FAILED,
-                                        reason=ev.get("reason"), kind="invariant"))
+    for ev in data.get(EVENTS_KEY, []):
+        attribute(run, ev.get("target", ""), ev.get("invariant", "?"), ev.get("reason"))
     return run
+
+
+def attribute(run: Run, suite_id: str, invariant: str, reason: str | None, how: str = "forge") -> TestResult:
+    """Mark ``invariant`` of ``suite_id`` as the one that broke.
+
+    Forge runs every invariant of a contract in one shared campaign. Its JSON files that campaign under
+    the first invariant's name and reports the invariant that really broke in a separate
+    ``{"event": "failure"}`` line (on stderr). The counter-example and campaign stats move to the real
+    invariant; the stand-in entry becomes PASSED unless it broke too.
+    """
+    name = invariant if invariant.endswith(")") else f"{invariant}()"
+    tests = [t for t in run.tests if t.suite == suite_id]
+    hit = next((t for t in tests if t.name == name), None)
+    if hit is None:
+        hit = TestResult(suite=suite_id, name=name, status=FAILED, kind="invariant")
+        run.tests.append(hit)
+    campaign = next((t for t in tests if t is not hit and t.status == FAILED and not t.note and t.sequence), None) or \
+        next((t for t in tests if t is not hit and t.status == FAILED and not t.note and t.kind == "invariant"), None)
+    hit.status, hit.kind = FAILED, "invariant"
+    hit.reason = reason or hit.reason
+    if campaign is not None and (campaign.reason == hit.reason or not campaign.reason or how == "forge"):
+        hit.sequence = hit.sequence or campaign.sequence
+        hit.shrunk_from = hit.shrunk_from or campaign.shrunk_from
+        for k in ("runs", "calls", "reverts"):
+            if getattr(hit, k) is None:
+                setattr(hit, k, getattr(campaign, k))
+        hit.traces = hit.traces or campaign.traces
+        campaign.status = PASSED
+        campaign.note = (f"forge filed the shared invariant campaign under this name; the invariant that broke is `{name}`"
+                         + (" (matched by its assertion message)" if how == "source" else ""))
+    return hit
+
+
+def resolve_from_source(run: Run, root: Path) -> None:
+    """Without forge's failure events, find the broken invariant by its assertion message in the test source."""
+    for t in list(run.failures):
+        if t.kind != "invariant" or not t.reason or t.note:
+            continue
+        try:
+            src = (root / t.file).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for cand in (t.reason, t.reason.rsplit(": ", 1)[0]):
+            idx = src.find(f'"{cand}"')
+            if idx < 0:
+                continue
+            fns = list(re.finditer(r"\bfunction\s+(\w+)\s*\(", src[:idx]))
+            if fns and fns[-1].group(1) != t.func and fns[-1].group(1).startswith(("invariant", "afterInvariant")):
+                attribute(run, t.suite, fns[-1].group(1), t.reason, how="source")
+            break
 
 
 # --------------------------------------------------------------------------- #
@@ -255,8 +282,11 @@ def parse_json(data: dict, source: str = "forge JSON") -> Run:
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RAN_RE = re.compile(r"^Ran \d+ tests? for (\S+)")
 # The reason itself can contain brackets (`args=[1, 2]`), so it runs to the last `]` before the test name.
-RESULT_RE = re.compile(r"^\[(PASS|FAIL|SKIP)(?:[:.]\s*(?:Reason:\s*)?(?P<reason>.*))?\]\s*(?P<rest>(?:[A-Za-z_$][\w$]*\(.*)?)$")
-TEST_LINE_RE = re.compile(r"^(?P<name>[A-Za-z_$][\w$]*\([^)]*\))\s*(?P<stats>\(.*\))?\s*$")
+# Forge 1.x prints invariant names without parentheses (`[PASS] invariant_tokenSolvency`).
+RESULT_RE = re.compile(r"^\[(PASS|FAIL|SKIP)(?:[:.]\s*(?:Reason:\s*)?(?P<reason>.*))?\]\s*(?P<rest>(?:[A-Za-z_$][\w$]*(?:\(.*)?)?)$")
+TEST_LINE_RE = re.compile(r"^(?P<name>[A-Za-z_$][\w$]*(?:\([^)]*\))?)\s*(?P<stats>\(.*\))?\s*$")
+BLOCK_HEAD_RE = re.compile(r"^(\S+) invariants:")                  # "XTest invariants: 1/3 invariants broken"
+BLOCK_STATS_RE = re.compile(r"^(\S+) invariants (\(.*\))\s*$")     # "XTest invariants (runs: 32, calls: 1024, ...)"
 SEQ_HEAD_RE = re.compile(r"^\[Sequence\](?:\s*\(original:\s*(\d+),\s*shrunk:\s*(\d+)\))?")
 SEQ_STEP_RE = re.compile(
     r"sender=(?P<sender>0x[0-9a-fA-F]+)\s+addr=\[(?P<target>[^\]]+)\](?P<addr>0x[0-9a-fA-F]+)\s+"
@@ -264,6 +294,10 @@ SEQ_STEP_RE = re.compile(
 )
 COUNTER_RE = re.compile(r"counterexample:\s*calldata=(?P<calldata>0x[0-9a-fA-F]*)\s*args=(?P<args>\[.*\])", re.I)
 STATS_RE = re.compile(r"(runs|calls|reverts|gas|μ|~):\s*(\d+)")
+
+
+def _norm_name(name: str) -> str:
+    return name if "(" in name else f"{name}()"
 
 
 def _stats(text: str | None, t: TestResult) -> None:
@@ -277,7 +311,7 @@ def _stats(text: str | None, t: TestResult) -> None:
             t.reverts = v
         elif key in ("gas", "~") or (key == "μ" and t.gas is None):
             t.gas = v
-    if t.calls is not None or t.name.startswith(("invariant", "statefulFuzz")):
+    if t.calls is not None or t.name.startswith(("invariant", "statefulFuzz", "afterInvariant")):
         t.kind = "invariant"
     elif t.runs is not None:
         t.kind = "fuzz"
@@ -296,30 +330,57 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
     suite = "unknown:Unknown"
     pending: TestResult | None = None  # a [FAIL: ...] whose test name comes after its [Sequence]
     last: TestResult | None = None
+    block: list[TestResult] | None = None  # forge 1.x "<Suite> invariants:" listing
     section: str | None = None           # "logs" | "traces" while inside one of those blocks
-    seen: set[tuple[str, str]] = set()
+    seen: dict[tuple[str, str], TestResult] = {}
+    events: list[dict] = []
 
-    def finish(t: TestResult) -> None:
+    def finish(t: TestResult) -> TestResult:
         nonlocal last
         key = (t.suite, t.name)
-        if key in seen:  # the "Failing tests:" recap repeats each failure
-            return
-        seen.add(key)
-        run.tests.append(t)
+        if key in seen:  # the "Failing tests:" recap and the 1.x campaign header repeat results
+            t = seen[key]
+        else:
+            seen[key] = t
+            run.tests.append(t)
+        if block is not None and t not in block:
+            block.append(t)
         last = t
+        return t
 
     for raw in text.splitlines():
         line = ANSI.sub("", raw).rstrip()
         s = line.strip()
+        if s.startswith("{") and '"event"' in s:
+            try:
+                ev = json.loads(s)
+                if isinstance(ev, dict) and ev.get("event") == "failure" and "invariant" in ev:
+                    events.append(ev)
+                    continue
+            except json.JSONDecodeError:
+                pass
         m = RAN_RE.match(s)
         if m:
-            suite, pending, last, section = m.group(1), None, None, None
+            suite, pending, last, block, section = m.group(1), None, None, None, None
             continue
         if s.startswith(("Suite result:", "Ran ", "Failing tests:", "Encountered ")):
             m2 = re.match(r"^Encountered \d+ failing tests? in (\S+)", s)
             if m2:
                 suite = m2.group(1)
-            section = None
+            section, block = None, None
+            continue
+        m = BLOCK_HEAD_RE.match(s)
+        if m:
+            if pending is not None and pending.name == "?":
+                pending = None  # bare [PASS] / [FAIL] campaign header
+            block, section = [], None
+            continue
+        m = BLOCK_STATS_RE.match(s)
+        if m and block is not None:
+            for t in block:
+                _stats(m.group(2), t)
+            last = next((t for t in block if t.status == FAILED), None)
+            block, section = None, None
             continue
         m = RESULT_RE.match(s)
         if m:
@@ -336,7 +397,7 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
                     t.kind = "fuzz"
             tm = TEST_LINE_RE.match(m.group("rest") or "")
             if tm:
-                t.name = tm.group("name")
+                t.name = _norm_name(tm.group("name"))
                 _stats(tm.group("stats"), t)
                 pending = None
                 finish(t)
@@ -355,8 +416,8 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
                 pending.sequence.append(_call_from_text(sm))
                 continue
             tm = TEST_LINE_RE.match(s)
-            if tm:
-                pending.name = tm.group("name")
+            if tm and tm.group("stats"):
+                pending.name = _norm_name(tm.group("name"))
                 _stats(tm.group("stats"), pending)
                 finish(pending)
                 pending = None
@@ -373,10 +434,10 @@ def parse_stdout(text: str, source: str = "forge stdout") -> Run:
                 continue
             if not s and section == "logs":
                 section = None
-    if pending is not None:
-        if pending.name == "?":
-            pending.name = "(unnamed)()"
+    if pending is not None and pending.name != "?":
         finish(pending)
+    for ev in events:
+        attribute(run, ev.get("target", ""), ev.get("invariant", "?"), ev.get("reason"))
     return run
 
 
@@ -396,30 +457,35 @@ def load(path: str) -> Run:
 
 def parse_text(text: str, source: str = "forge output") -> Run:
     data = try_json(text)
-    if data and any(isinstance(v, dict) and "test_results" in v for v in data.values()) or (data and EVENTS_KEY in data):
+    if data and any(isinstance(v, dict) and "test_results" in v for v in data.values()):
         return parse_json(data, source)
     return parse_stdout(text, source)
 
 
 def try_json(text: str) -> dict | None:
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        pass
+    """Merge every JSON object that starts a line: the forge --json document (one line or pretty-printed)
+    plus ``{"event": "failure"}`` lines, ignoring compiler chatter mixed in through ``2>&1``."""
+    text = ANSI.sub("", text)
+    dec = json.JSONDecoder()
     merged: dict = {}
-    for line in text.splitlines():
-        line = ANSI.sub("", line).strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and obj.get("event") == "failure" and "invariant" in obj:
-            merged.setdefault(EVENTS_KEY, []).append(obj)
-        elif isinstance(obj, dict):
-            merged.update(obj)
+    pos = 0
+    while pos < len(text):
+        nl = text.find("\n", pos)
+        line_end = len(text) if nl < 0 else nl
+        start = pos + (len(text[pos:line_end]) - len(text[pos:line_end].lstrip()))
+        if start < line_end and text[start] == "{":
+            try:
+                obj, end = dec.raw_decode(text, start)
+            except json.JSONDecodeError:
+                obj, end = None, line_end
+            if isinstance(obj, dict):
+                if obj.get("event") == "failure" and "invariant" in obj:
+                    merged.setdefault(EVENTS_KEY, []).append(obj)
+                elif obj.get("event") is None:
+                    merged.update(obj)
+            nl = text.find("\n", end)
+            line_end = len(text) if nl < 0 else nl
+        pos = line_end + 1
     return merged or None
 
 
@@ -605,7 +671,30 @@ def render(run: Run, root: Path | None = None, generated: str | None = None) -> 
     return "\n".join(out)
 
 
+def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> None:
+    """Fill missing counter-examples from forge's persisted failures.
+
+    Forge 1.x prints no ``[Sequence]`` for a shared invariant campaign, but it stores the shrunk call
+    sequence of every broken invariant in ``cache/invariant/failures/<TestContract>/<invariant>``.
+    """
+    for t in run.failures:
+        if t.sequence or t.kind != "invariant":
+            continue
+        path = root / cache_dir / "invariant" / "failures" / t.contract / t.func
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        seq = data.get("call_sequence") if isinstance(data, dict) else data
+        if isinstance(seq, list):
+            t.sequence = [_call_from_json(step) for step in seq if isinstance(step, dict)]
+            if t.sequence:
+                t.note = (t.note + "; " if t.note else "") + f"counter-example read from `{path.relative_to(root).as_posix()}`"
+
+
 def write_report(run: Run, root: Path, output: str | None = None) -> Path:
+    resolve_from_source(run, root)
+    load_persisted_sequences(run, root)
     path = Path(output) if output else root / REPORT_FILE
     if not path.is_absolute() and output:
         path = Path.cwd() / path

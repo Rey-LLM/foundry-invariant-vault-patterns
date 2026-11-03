@@ -31,6 +31,7 @@ AST_OUTPUT = FIXTURES / "ast" / "solc-output.json"
 HOOKS_AST_OUTPUT = FIXTURES / "ast" / "hooks-solc-output.json"
 FORGE_STDOUT = FIXTURES / "forge" / "leaky-stdout.txt"
 FORGE_JSON = FIXTURES / "forge" / "leaky-results.json"
+FORGE1_STDOUT = FIXTURES / "forge" / "hooks-stdout-forge1.txt"
 
 
 def contracts(blueprint: dict) -> dict[str, dict]:
@@ -348,6 +349,46 @@ class ReporterTests(unittest.TestCase):
         fuzz = next(t for t in run.failures if t.name == "testFuzz_roundTrip(uint256)")
         self.assertEqual((fuzz.kind, fuzz.reason, fuzz.sequence[0].args), ("fuzz", "assertion failed: 1 != 2", ["42"]))
         self.assertEqual(fuzz.logs, ["amount 42"])
+
+    def test_parses_forge_1x_invariant_blocks(self):
+        run = reporter.parse_text(FORGE1_STDOUT.read_text(), "forge.log")
+        self.assertEqual(run.fmt, "forge stdout")
+        self.assertEqual([t.name for t in run.failures], ["invariant_hook_readConsistency()"])
+        self.assertEqual((run.count(reporter.PASSED), run.count(reporter.FAILED)), (7, 1))
+        broken = run.failures[0]
+        self.assertEqual((broken.kind, broken.runs, broken.calls), ("invariant", 32, 1024))
+        self.assertTrue(broken.traces)
+
+    def test_persisted_failure_supplies_counterexample(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        failures = root / "cache" / "invariant" / "failures" / "HookedVaultGuardInvariantTest"
+        failures.mkdir(parents=True)
+        (failures / "invariant_hook_readConsistency").write_text(json.dumps({"call_sequence": [
+            {"sender": "0x0000000000000000000000000000000000000001", "addr": "0x00000000000000000000000000000000000000aa",
+             "calldata": "0x", "contract_name": "test/foundryguard/HookedVault/Handler.sol:HookedVaultGuardHandler",
+             "signature": "deposit(uint256,uint256)", "args": "0, 5"},
+            {"sender": "0x0000000000000000000000000000000000000002", "addr": "0x00000000000000000000000000000000000000aa",
+             "calldata": "0x", "contract_name": "test/foundryguard/HookedVault/Handler.sol:HookedVaultGuardHandler",
+             "signature": "withdraw(uint256,uint256)", "args": "0, 1"}], "driver_bytecode": "0x"}))
+        run = reporter.parse_text(FORGE1_STDOUT.read_text())
+        path = reporter.write_report(run, root)
+        md = path.read_text()
+        self.assertEqual(path, root / reporter.REPORT_FILE)
+        self.assertIn("#### Counter-example call trace", md)
+        self.assertIn("handler.withdraw(0, 1);\n    invariant_hook_readConsistency();", md)
+
+    def test_campaign_attributed_by_assertion_message(self):
+        root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        test_file = root / "test" / "X.t.sol"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text('function invariant_a() public view { assertLe(a, b, "a too big"); }\n'
+                             'function invariant_b() public view { assertEq(c, 0, "c moved"); }\n')
+        data = {"test/X.t.sol:XTest": {"test_results": {"invariant_a()": {"status": "Failure", "reason": "c moved: 1 != 0"}}}}
+        run = reporter.parse_json(data)
+        reporter.resolve_from_source(run, root)
+        self.assertEqual([t.name for t in run.failures], ["invariant_b()"])
 
     def test_parses_forge_json(self):
         run = reporter.parse_text(FORGE_JSON.read_text(), "results.json")

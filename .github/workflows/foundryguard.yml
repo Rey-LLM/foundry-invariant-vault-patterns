@@ -72,6 +72,27 @@ jobs:
             echo "::error::FoundryGuard did not catch the LeakyVault bug"
             exit 1
           fi
+      - name: Show what forge recorded for the failure
+        if: always()
+        run: |
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          data = reporter.try_json(open("forge-results.json").read()) or {}
+          for suite, body in data.items():
+              if suite == reporter.EVENTS_KEY:
+                  print("events:", body)
+                  continue
+              for name, res in (body.get("test_results") or {}).items():
+                  if res.get("status") != "Success":
+                      print(suite, name, "keys:", sorted(res))
+                      print("  counterexample:", json.dumps(res.get("counterexample"))[:1500])
+          PY
+          find cache/invariant -type f | head -20 || true
+          for f in $(find cache/invariant -type f | head -3); do echo "== $f"; head -c 1500 "$f"; echo; done
       - name: FoundryGuard_Report.md documents the counter-example (JSON and stdout input)
         run: |
           python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
@@ -100,8 +121,11 @@ jobs:
       - name: HookedVault must fail, GuardedHookVault and UnlockPool must pass
         run: |
           forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
-          forge test --match-path "test/foundryguard/*" --json > forge-results.json || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
           python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
+          grep -q "invariant_hook_readConsistency" report-from-stdout.md
           python3 - <<'PY'
           import sys
           sys.path.insert(0, "../../../../src/cli")
@@ -110,6 +134,7 @@ jobs:
           failed = {t.contract for t in run.failures}
           print("failed suites:", sorted(failed))
           names = {t.name for t in run.failures if t.contract == "HookedVaultGuardInvariantTest"}
+          assert "invariant_hook_readConsistency()" in names, f"wrong invariant reported: {names}"
           assert "HookedVaultGuardInvariantTest" in failed, "Preset 04 did not catch the HookedVault read-reentrancy bug"
           assert not failed - {"HookedVaultGuardInvariantTest"}, f"false positive on a safe contract: {failed}"
           print("HookedVault failures:", sorted(names))

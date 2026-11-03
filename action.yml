@@ -41,6 +41,8 @@ runs:
       shell: bash
       working-directory: ${{ inputs.root }}
       run: |
-        forge test --match-path "${{ inputs.out }}/*" --json > foundryguard-results.json || true
+        forge test --match-path "${{ inputs.out }}/*" --json > foundryguard-results.json 2> foundryguard-stderr.txt || true
+        # forge prints which invariant of a shared campaign broke as a JSON event on stderr.
+        cat foundryguard-stderr.txt >> foundryguard-results.json
         python3 "$GITHUB_ACTION_PATH/src/cli/foundryguard.py" report foundryguard-results.json \
           --md foundryguard-results.md --sarif "${{ inputs.sarif }}" --fail-on-failure
