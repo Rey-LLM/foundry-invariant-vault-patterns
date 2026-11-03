@@ -362,7 +362,7 @@ class ReporterTests(unittest.TestCase):
     def test_persisted_failure_supplies_counterexample(self):
         root = Path(tempfile.mkdtemp(prefix="foundryguard-report-"))
         self.addCleanup(shutil.rmtree, root, True)
-        failures = root / "cache" / "invariant" / "failures" / "HookedVaultGuardInvariantTest"
+        failures = root / "cache" / "invariant" / "failures" / "HookedVaultGuardInvariantTest" / "invariants"
         failures.mkdir(parents=True)
         (failures / "invariant_hook_readConsistency").write_text(json.dumps({"call_sequence": [
             {"sender": "0x0000000000000000000000000000000000000001", "addr": "0x00000000000000000000000000000000000000aa",

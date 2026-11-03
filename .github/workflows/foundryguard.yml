@@ -72,32 +72,16 @@ jobs:
             echo "::error::FoundryGuard did not catch the LeakyVault bug"
             exit 1
           fi
-      - name: Show what forge recorded for the failure
-        if: always()
+      - name: Collect forge JSON results with the failure events from stderr
         run: |
           forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
           cat forge-stderr.txt >> forge-results.json
-          python3 - <<'PY'
-          import json, sys
-          sys.path.insert(0, "../../../../src/cli")
-          import reporter
-          data = reporter.try_json(open("forge-results.json").read()) or {}
-          for suite, body in data.items():
-              if suite == reporter.EVENTS_KEY:
-                  print("events:", body)
-                  continue
-              for name, res in (body.get("test_results") or {}).items():
-                  if res.get("status") != "Success":
-                      print(suite, name, "keys:", sorted(res))
-                      print("  counterexample:", json.dumps(res.get("counterexample"))[:1500])
-          PY
-          find cache/invariant -type f | head -20 || true
-          for f in $(find cache/invariant -type f | head -3); do echo "== $f"; head -c 1500 "$f"; echo; done
       - name: FoundryGuard_Report.md documents the counter-example (JSON and stdout input)
         run: |
           python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
           grep -q "FoundryGuard-FAILED" FoundryGuard_Report.md
           grep -q "Counter-example call trace" FoundryGuard_Report.md
+          grep -q "invariant_tokenSolvency" FoundryGuard_Report.md
           forge test --match-path "test/foundryguard/*" -vvv > forge-output.txt || true
           python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
           grep -q "Counter-example call trace" report-from-stdout.md

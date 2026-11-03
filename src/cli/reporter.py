@@ -675,15 +675,21 @@ def load_persisted_sequences(run: Run, root: Path, cache_dir: str = "cache") -> 
     """Fill missing counter-examples from forge's persisted failures.
 
     Forge 1.x prints no ``[Sequence]`` for a shared invariant campaign, but it stores the shrunk call
-    sequence of every broken invariant in ``cache/invariant/failures/<TestContract>/<invariant>``.
+    sequence of every broken invariant in ``cache/invariant/failures/<TestContract>/invariants/<invariant>``
+    (older forge: ``cache/invariant/failures/<TestContract>/<invariant>``).
     """
     for t in run.failures:
         if t.sequence or t.kind != "invariant":
             continue
-        path = root / cache_dir / "invariant" / "failures" / t.contract / t.func
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        base = root / cache_dir / "invariant" / "failures" / t.contract
+        data = path = None
+        for path in (base / "invariants" / t.func, base / t.func):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                data = None
+        if data is None:
             continue
         seq = data.get("call_sequence") if isinstance(data, dict) else data
         if isinstance(seq, list):
