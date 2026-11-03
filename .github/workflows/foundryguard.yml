@@ -92,12 +92,14 @@ jobs:
       - name: FoundryGuard_Report.md documents the counter-example (JSON and stdout input)
         run: |
           python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
-          grep -q "FoundryGuard-FAILED" FoundryGuard_Report.md
-          grep -q "Counter-example call trace" FoundryGuard_Report.md
-          grep -q "invariant_tokenSolvency" FoundryGuard_Report.md
+          must() { grep -qE "$1" "$2" || { echo "::error::$2 lacks: $1"; cat "$2"; exit 1; }; }
+          must "FoundryGuard-FAILED" FoundryGuard_Report.md
+          must "Counter-example call trace" FoundryGuard_Report.md
+          # The leak breaks both accounting invariants; the fuzzer reports whichever it hits first.
+          must "invariant_(tokenSolvency|actorBalancesBoundedByTotal)" FoundryGuard_Report.md
           forge test --match-path "test/foundryguard/*" -vvv > forge-output.txt || true
           python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
-          grep -q "Counter-example call trace" report-from-stdout.md
+          must "Counter-example call trace" report-from-stdout.md
           cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY"
 
   hook-reentrancy:
