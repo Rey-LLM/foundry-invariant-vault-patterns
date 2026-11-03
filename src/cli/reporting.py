@@ -41,7 +41,13 @@ def markdown_report(report: list[dict], blueprint: dict | None = None) -> str:
             kind += " (hooks)"
         if (r.get("transient") or {}).get("slots"):
             kind += " (transient)"
+        if r.get("ecosystem"):
+            kind += " (ecosystem: " + ", ".join(r["ecosystem"]["members"]) + ")"
         out.append(f"| `{r['contract']}`{kind} | {len(r.get('flows', []))} | {invs} | {toks} | {status} |")
+    for r in report:
+        if r.get("ecosystem"):
+            out += ["", f"Dependency matrix for `{r['contract']}` (row depends on column):", "", "```text",
+                    r["ecosystem"]["matrix_text"], "```"]
     notes = [(r["contract"], n) for r in report
              for n in r.get("blocked", []) + r.get("warnings", []) + r.get("setup_notes", []) + r.get("skipped", [])]
     if notes:

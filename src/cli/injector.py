@@ -35,6 +35,14 @@ Invariant presets are emitted only when the blueprint proves they apply:
   that every slot is back to zero
 * ``afterInvariant``: fails a run in which every value-flow call reverted
 
+Contracts that hold other project contracts (an ``IPriceOracle`` a vault reads, a strategy a vault
+deposits into) are grouped by the parser into ecosystems (Layer 07). Each ecosystem gets one suite in
+``<out>/<Name>Ecosystem/``: ``setUp`` deploys every member in dependency order and passes each one the
+addresses it needs (constructor, initializer or setter), and a single master handler fuzzes value flows
+on every member plus keeper calls (price pushes, rate updates) on the members others depend on. The
+invariants span the matrix: wiring intact, per-member solvency and flow bounds, token conservation.
+A contract that needs another member to be deployed gets only the ecosystem suite.
+
 Contracts that match none of the presets but still have public state-changing functions (custom
 logic: auctions, curves, vesting ...) are skipped. With ``--ai`` (or ``[ai] enabled = true``) and
 ``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` set, they are sent to ``ai_generator.py`` instead, which
@@ -276,6 +284,29 @@ def is_custom_candidate(t: Target) -> bool:
                for f in t.functions)
 
 
+def make_target(c: dict, index: "Index", config: dict) -> Target:
+    """Effective functions, getters and drivable value flows of one contract."""
+    missing: set[str] = set()
+    functions = effective_functions(c, index, missing)
+    t = Target(contract=c, functions=functions, flows=[], getters=collect_getters(c, index, functions),
+               lineage=[x["name"] for x in linearize(c["name"], index, contract=c)],
+               settings=config.get("contracts", {}).get(c["name"], {}))
+    for m in sorted(missing):
+        t.warnings.append(f"parent contract '{m}' was not found, so its functions are invisible "
+                          f"(run `forge install` / check remappings, then scan again)")
+    for fn in functions:
+        if not fn.get("category"):
+            continue
+        reason = unsupported_reason(fn)
+        if reason:
+            t.skipped.append((fn["signature"], reason))
+        elif is_admin_only(fn):
+            t.skipped.append((fn["signature"], f"admin-only ({', '.join(fn['modifiers'])}); not fuzzed from actors"))
+        else:
+            t.flows.append(fn)
+    return t
+
+
 def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = None,
                   unmatched: list[Target] | None = None) -> list[Target]:
     """Targets the presets can drive. Contracts no preset matches are appended to ``unmatched``."""
@@ -294,24 +325,8 @@ def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = 
         if c["name"] in exclude:
             log.info("skip %s: excluded in foundryguard.toml", c["name"])
             continue
-        missing: set[str] = set()
-        functions = effective_functions(c, index, missing)
-        t = Target(contract=c, functions=functions, flows=[], getters=collect_getters(c, index, functions),
-                   lineage=[x["name"] for x in linearize(c["name"], index, contract=c)],
-                   settings=config.get("contracts", {}).get(c["name"], {}))
-        for m in sorted(missing):
-            t.warnings.append(f"parent contract '{m}' was not found, so its functions are invisible "
-                              f"(run `forge install` / check remappings, then scan again)")
-        for fn in functions:
-            if not fn.get("category"):
-                continue
-            reason = unsupported_reason(fn)
-            if reason:
-                t.skipped.append((fn["signature"], reason))
-            elif is_admin_only(fn):
-                t.skipped.append((fn["signature"], f"admin-only ({', '.join(fn['modifiers'])}); not fuzzed from actors"))
-            else:
-                t.flows.append(fn)
+        t = make_target(c, index, config)
+        functions = t.functions
         if t.flows and looks_like_plain_token(t) and c["name"] not in include and not only:
             log.info("skip %s: plain ERC-20 token (mint/burn only); add it to [targets] include to fuzz it", c["name"])
             continue
@@ -1205,6 +1220,643 @@ def abi_signature(fn: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Layer 07: ecosystem suites (several contracts deployed and wired together)
+# --------------------------------------------------------------------------- #
+
+# Functions never fuzzed as ecosystem actions: they rewire ownership, upgrade code or only move approvals.
+ECO_SKIP_FN = re.compile(r"^_?(transferOwnership|renounceOwnership|acceptOwnership|grantRole|revokeRole|renounceRole|"
+                         r"setOwner|upgradeTo\w*|initialize\w*|pause|unpause|multicall|permit|approve|transfer|"
+                         r"transferFrom|increaseAllowance|decreaseAllowance|selfdestruct|kill)$")
+ECO_RESERVED = {"handler", "tokens", "target", "actors", "members", "admin", "actor", "selectors", "i", "j"}
+
+
+@dataclass
+class Member:
+    name: str
+    var: str                        # Solidity variable in the test and the handler, e.g. "priceFeed"
+    target: Target
+    file: str
+    plan: SetupPlan = field(default_factory=SetupPlan)
+    dependency: bool = False        # another member points at it
+    needs_members: bool = False     # its constructor / initializer takes another member's address
+    created_by: tuple[str, str] | None = None  # (parent var, getter) when the parent deploys it with `new`
+    driven: bool = True
+    flows: list[dict] = field(default_factory=list)
+    actions: list[tuple[dict, str]] = field(default_factory=list)  # (fn, "action" | "keeper")
+
+
+@dataclass
+class EcosystemPlan:
+    name: str
+    cluster: dict
+    edges: list[dict]
+    members: list[Member] = field(default_factory=list)
+    tokens: list[Token] = field(default_factory=list)
+    token_by_param: dict[tuple[str, str], str] = field(default_factory=dict)  # (member, param) -> token var
+    wiring: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    matrix_text: str = ""
+    setup: list[str] = field(default_factory=list)  # extra setUp lines: [ecosystem] setup + [ecosystem.suites.<Name>] setup
+
+    @property
+    def suite(self) -> str:
+        return f"{self.name}Ecosystem"
+
+    def member(self, name: str) -> Member | None:
+        return next((m for m in self.members if m.name == name), None)
+
+
+def _lower_first(name: str) -> str:
+    i = 0
+    while i < len(name) and name[i].isupper():
+        i += 1
+    if i > 1 and i < len(name):
+        i -= 1  # "ERC4626Vault" -> "erc4626Vault", "PriceFeed" -> "priceFeed"
+    return name[:i].lower() + name[i:] if i else name
+
+
+def _getter_name(getter: str | None) -> str | None:
+    if getter and getter.endswith("()"):
+        return getter[:-2]
+    return None
+
+
+def build_ecosystems(blueprint: dict, only: set[str] | None, config: dict | None = None) -> list[EcosystemPlan]:
+    """Plans for every cluster of linked project contracts in the blueprint (Layer 07)."""
+    config = config or {}
+    ecfg = config.get("ecosystem", {})
+    eco = blueprint.get("ecosystem") or {}
+    if ecfg.get("enabled", True) is False or not eco.get("clusters"):
+        return []
+    exclude = set(config.get("targets", {}).get("exclude", []))
+    index = Index(blueprint["contracts"])
+    by_name = {c["name"]: c for c in blueprint["contracts"] if not c.get("external")}
+    plans = []
+    for cl in eco["clusters"]:
+        if only and not set(cl["members"]) & only:
+            continue
+        names = [n for n in cl["members"] if n not in exclude and n in by_name]
+        if len(names) < 2:
+            continue
+        edges = [e for e in eco.get("edges", []) if e["from"] in names]
+        if names != cl["members"]:  # [targets] exclude took members out: redraw the matrix without them
+            linked = lambda a, b: any(e["from"] == a and e["to"] == b and e["status"] in ("member", "created") for e in edges)
+            cl = {**cl, "members": names, "matrix": {"order": names, "rows": [[int(linked(a, b)) for b in names] for a in names]}}
+        plan = EcosystemPlan(name=sol_ident(cl["name"]), cluster=cl, edges=edges, matrix_text=_matrix_text(cl))
+        plan.setup = [str(x) for x in ecfg.get("setup", [])] + [
+            str(x) for x in ecfg.get("suites", {}).get(cl["name"], {}).get("setup", [])]
+        if cl.get("cycles"):
+            plan.blockers.append("constructor dependencies form a cycle (" + " -> ".join(cl["cycles"][0])
+                                 + "); deploy one side first and wire it through a setter, or set constructor_args")
+        used = set(ECO_RESERVED)
+        for n in names:
+            var = sol_ident(_lower_first(n))
+            while var in used:
+                var += "_"
+            used.add(var)
+            plan.members.append(Member(name=n, var=var, target=make_target(by_name[n], index, config),
+                                       file=by_name[n]["file"]))
+        _plan_ecosystem(plan, used)
+        plans.append(plan)
+    return plans
+
+
+def _matrix_text(cl: dict) -> str:
+    order = cl["matrix"]["order"]
+    width = max(len(n) for n in order)
+    lines = [" " * width + "  " + " ".join(str(i % 10) for i in range(len(order)))]
+    for i, (n, row) in enumerate(zip(order, cl["matrix"]["rows"])):
+        lines.append(f"{n.ljust(width)}  " + " ".join("x" if v else "." for v in row) + f"   {i}")
+    return "\n".join(lines)
+
+
+def _plan_ecosystem(plan: EcosystemPlan, used: set[str]) -> None:
+    members = {m.name: m for m in plan.members}
+    for e in plan.edges:
+        if e["status"] in ("member", "created") and e["to"] in members:
+            members[e["to"]].dependency = True
+            if e["via"] in ("constructor", "initializer"):
+                members[e["from"]].needs_members = True
+
+    for m in plan.members:
+        created = next((e for e in plan.edges if e["to"] == m.name and e["status"] == "created"), None)
+        if created and created["from"] in members:
+            getter = _getter_name(created.get("getter"))
+            if getter:
+                m.created_by = (members[created["from"]].var, getter)
+            else:
+                m.driven = False
+                plan.notes.append(f"{m.name} is deployed by {created['from']} with `new` and has no public getter; "
+                                  "it is not fuzzed directly")
+            continue
+        _plan_member(plan, m, members, used)
+
+    for e in plan.edges:
+        if e["from"] not in members:
+            continue
+        frm = members[e["from"]]
+        if e["status"] == "member" and e["to"] in members and e["via"] == "setter":
+            sig = e["function"]
+            to = members[e["to"]]
+            plan.wiring.append(f"// {e['from']}.{e['var']} is set after deployment through {sig}.")
+            plan.wiring.append(f'(bool wired{len(plan.wiring)}, ) = address({frm.var}).call(abi.encodeWithSignature('
+                               f'"{_abi_sig(sig)}", address({to.var})));')
+            plan.wiring.append(f'require(wired{len(plan.wiring) - 1}, "FoundryGuard: {sig} reverted; wire it in [ecosystem] setup");')
+        elif e["status"] == "member" and e["to"] in members and e["via"] == "unknown":
+            plan.notes.append(f"{e['from']}.{e['var']} ({e['type']}) is set by code FoundryGuard cannot follow; "
+                              f"wire it to {e['to']} under [ecosystem] setup")
+        elif e["status"] == "unresolved":
+            plan.notes.append(f"{e['from']}.{e['var']} ({e['type']}): no project contract implements {e['type']}; "
+                              "it gets a placeholder")
+        elif e["status"] == "member" and len(e.get("candidates", [])) > 1:
+            plan.notes.append(f"{e['from']}.{e['var']}: {', '.join(e['candidates'])} all implement {e['type']}; "
+                              f"using {e['to']} (choose with [ecosystem] bind)")
+
+    setters = {(e["from"], e["function"]) for e in plan.edges if e["via"] == "setter"}
+    for m in plan.members:
+        if not m.driven:
+            continue
+        m.flows = list(m.target.flows)
+        flow_sigs = {f["signature"] for f in m.flows}
+        for fn in m.target.functions:
+            if fn["signature"] in flow_sigs or fn.get("category") or fn["kind"] != "function":
+                continue
+            if fn["mutability"] != "nonpayable" or fn["visibility"] not in ("public", "external"):
+                continue
+            if ECO_SKIP_FN.match(fn["name"]) or hook_reentrancy.is_callback_name(fn["name"]):
+                continue
+            if any(INITIALIZER_MODIFIER.match(x) for x in fn.get("modifiers", [])) or unsupported_reason(fn):
+                continue
+            if (m.name, fn["signature"]) in setters:
+                continue  # rewiring the matrix is not an action
+            admin = is_admin_only(fn)
+            if admin and (not m.dependency or any(p["type"] == "address" for p in fn["params"])):
+                continue  # only a dependency's keeper moves (price pushes, rate updates) are fuzzed
+            m.actions.append((fn, "keeper" if admin else "action"))
+    if not any(m.flows for m in plan.members):
+        plan.blockers.append("no member has a drivable deposit / withdraw / stake_lock function")
+
+
+def _abi_sig(sig: str) -> str:
+    name, _, rest = sig.partition("(")
+    return f"{name}({','.join(abi_type(t) for t in rest.rstrip(')').split(',') if t)})"
+
+
+def _plan_member(plan: EcosystemPlan, m: Member, members: dict[str, Member], used: set[str]) -> None:
+    c = m.target.contract
+    sp = SetupPlan()
+    links = {(e["via"], e["param"]): e for e in plan.edges if e["from"] == m.name and e["param"]}
+
+    def args(params: list[dict], via: str, overrides: list | None, where: str) -> list[tuple[str, str]]:
+        if overrides is not None:
+            if len(overrides) != len(params):
+                plan.blockers.append(f"{m.name} {where}: config gives {len(overrides)} argument(s), "
+                                     f"the signature takes {len(params)}")
+                return []
+            return [(str(x), f"{p['type']} {p['name']}") for x, p in zip(overrides, params)]
+        out = []
+        for p in params:
+            e = links.get((via, p["name"]))
+            label = f"{p['type']} {p['name']}"
+            if e and e["status"] in ("member", "created") and e["to"] in members:
+                out.append((f"address({members[e['to']].var})", f"{label}: {e['to']}"))
+                continue
+            if is_token_param(p) or (e and e["status"] == "mock"):
+                key = sol_ident(p["name"].strip("_")) or "token"
+                var = next((tk.var for tk in plan.tokens if tk.param.strip("_") == p["name"].strip("_")), None)
+                if var is None:
+                    var, k = key, 2
+                    while var in used:
+                        var, k = f"{key}{k}", k + 1
+                    used.add(var)
+                    plan.tokens.append(Token(var=var, role=token_role(p["name"]), param=p["name"], type=p["type"]))
+                plan.token_by_param[(m.name, p["name"])] = var
+                sp.tokens.append(next(tk for tk in plan.tokens if tk.var == var))
+                out.append((f"address({var})", label))
+                continue
+            if hook_reentrancy.is_hook_param(p):
+                plan.notes.append(f"{m.name} {where}: '{p['name']}' is a hook; ecosystem suites leave hooks "
+                                  "to the standalone Preset 04 suite and pass address(this)")
+                out.append(("address(this)", label))
+                continue
+            expr, warn = default_value(p["type"], p["name"])
+            if warn:
+                (plan.blockers if expr is None else plan.notes).append(f"{m.name} {where}: {warn}")
+            out.append((expr or "0", label))
+        return out
+
+    ctor = c.get("constructor")
+    cfg = m.target.settings
+    sp.ctor_args = args(ctor["params"] if ctor else [], "constructor", cfg.get("constructor_args"), "constructor")
+    inits = [f for f in m.target.functions if f["name"].startswith("initialize")
+             and any(INITIALIZER_MODIFIER.match(x) for x in f.get("modifiers", []))]
+    want = cfg.get("initializer")
+    if inits or want:
+        init = next((f for f in m.target.functions if f["signature"] == want or f["name"] == want), None) if want else inits[0]
+        if init is None:
+            plan.blockers.append(f"{m.name}: initializer '{want}' from foundryguard.toml not found")
+        else:
+            sp.init_fn = init
+            sp.init_args = args(init["params"], "initializer", cfg.get("initializer_args"), init["name"])
+    m.plan = sp
+
+
+def _eco_arg(m: Member, fn: dict, p: dict, i: int, max_amount: str, kind: str) -> Arg:
+    """A handler argument for a member call. Amounts are bounded like the standalone suites; other
+    integers of actions and keeper calls are bounded to [1, MAX_AMOUNT] so a price push or a rate update
+    stays in a usable range."""
+    a = build_arg(m.target, fn, p, i, max_amount)
+    a.prelude = [ln.replace("target.", f"{m.var}.") for ln in a.prelude]
+    um = UINT_RE.match(p["type"])
+    if kind != "flow" and um and p["name"] != fn.get("amount_param"):
+        bits = int(um.group(1) or 256)
+        name = sol_ident(p["name"]) or f"arg{i}"
+        cap = "MAX_AMOUNT" if bits >= 80 else f"type(uint{bits}).max"
+        a = Arg(f"uint256 {name}Seed", [f"uint256 {name}_ = bound({name}Seed, 1, {cap});"], _cast(f"{name}_", bits), f"{name}_")
+    return a
+
+
+def render_ecosystem_handler(eco: EcosystemPlan, dest: Path, root: Path, support_rel: str, actors: int,
+                             max_amount: str) -> tuple[str, list[str], dict]:
+    hname = f"{eco.suite}Handler"
+    driven = [m for m in eco.members if m.driven]
+    used: set[str] = set()
+    wrappers, selectors, seq = [], [], []
+    meta: dict = {"units": {}, "flows": [], "actions": []}
+
+    for m in driven:
+        calls = [(fn, "flow") for fn in m.flows] + list(m.actions)
+        for fn, kind in calls:
+            hfn = handler_fn_name({"name": f"{m.var}_{fn['name']}"}, used)
+            selectors.append(hfn)
+            args = [_eco_arg(m, fn, p, i, max_amount, kind) for i, p in enumerate(fn["params"])]
+            decls = ([] if kind == "keeper" else ["uint256 actorSeed"]) + [a.fuzz_decl for a in args if a.fuzz_decl]
+            body = [] if kind == "keeper" else ["address actor = _actor(actorSeed);"]
+            for a in args:
+                body.extend(a.prelude)
+            call_opts = ""
+            if kind == "flow" and fn["mutability"] == "payable":
+                decls.append("uint256 valueSeed")
+                body.append(f"uint256 value_ = bound(valueSeed, {'1' if fn.get('unit') == 'native' else '0'}, MAX_AMOUNT);")
+                body.append("vm.deal(actor, actor.balance + value_);")
+                call_opts = "{value: value_}"
+            on_success = [f"ghost_calls[{_q(hfn)}]++;"]
+            if kind == "flow":
+                on_success.append("ghost_successfulFlows++;")
+                amount = None
+                if fn.get("amount_param") == "msg.value":
+                    amount = "value_"
+                elif fn.get("amount_param"):
+                    idx = next(i for i, p in enumerate(fn["params"]) if p["name"] == fn["amount_param"])
+                    amount = args[idx].raw or args[idx].expr
+                if amount and fn.get("unit") and fn["direction"] in ("in", "out"):
+                    key = f"{m.name}:{fn['unit']}"
+                    on_success.append(f"{'ghost_in' if fn['direction'] == 'in' else 'ghost_out'}[{_q(key)}] += {amount};")
+                    meta["units"].setdefault(m.name, {}).setdefault(fn["unit"], set()).add(fn["direction"])
+                meta["flows"].append(f"{m.name}.{fn['category']}:{fn['signature']}")
+            else:
+                on_success.append("ghost_successfulActions++;")
+                meta["actions"].append(f"{m.name}.{kind}:{fn['signature']}")
+            body.append("vm.prank(admin);" if kind == "keeper" else "vm.prank(actor);")
+            body.append(f"try {m.var}.{fn['name']}{call_opts}({', '.join(a.expr for a in args)}) {{")
+            body.extend("    " + x for x in on_success)
+            body.append("} catch {")
+            body.append(f"    ghost_reverts[{_q(hfn)}]++;")
+            body.append("}")
+            what = {"flow": f"{fn['category']} ({fn['direction']})", "action": "action",
+                    "keeper": f"keeper call as admin ({', '.join(fn.get('modifiers', []))})"}[kind]
+            wrappers.append(f"    /// @notice {what} -> {m.name}.{fn['signature']}\n"
+                            f"    function {hfn}({', '.join(decls)}) external {{\n"
+                            + "\n".join("        " + ln for ln in body) + "\n    }")
+            seq.append((hfn, decls))
+
+    branches = []
+    for i, (n, decls) in enumerate(seq):
+        call_args = ", ".join(transient_storage._derive(d, k) for k, d in enumerate(decls))
+        kw = "if" if i == 0 else "} else if"
+        branches.append(f"            {kw} (op == {i}) {{\n                try this.{n}({call_args}) {{ }} catch {{ }}")
+    sequence = ""
+    if seq:
+        selectors.append("ecosystemSequence")
+        sequence = f"""
+    /// @notice Two to four calls on any members back to back in one transaction, so a price push and
+    ///         the vault call that reads it can land in the same block, the way a bundle or a router runs them.
+    function ecosystemSequence(uint256 seed) external {{
+        uint256 steps = 2 + seed % 3;
+        for (uint256 i = 0; i < steps; i++) {{
+            uint256 s = _seed(seed, i);
+            uint256 op = s % {len(seq)};
+{chr(10).join(branches)}
+            }}
+        }}
+        ghost_sequences++;
+    }}
+"""
+    imports = _member_imports(eco, dest, root)
+    member_decls = "\n".join(f"    {m.name} public immutable {m.var};" for m in driven)
+    ctor_params = ", ".join([f"{m.name} _{m.var}" for m in driven] + ["address[] memory _tokens", "address _admin"])
+    ctor_assign = "\n".join(f"        {m.var} = _{m.var};\n        members.push(address(_{m.var}));" for m in driven)
+    approvals = "\n".join(f"                FoundryGuardMockERC20(_tokens[j]).approve(address(_{m.var}), type(uint256).max);"
+                          for m in driven)
+    pragma = pragma_for(eco.members[0].target.contract)
+    matrix = "\n".join("/// " + ln for ln in eco.matrix_text.splitlines())
+    src = f"""// SPDX-License-Identifier: MIT
+pragma solidity {pragma};
+
+{GENERATED_MARKER} from the {eco.name} ecosystem ({', '.join(m.name for m in eco.members)}). Edit freely: the injector only overwrites with --force.
+
+import {{ CommonBase }} from "forge-std/Base.sol";
+import {{ StdUtils }} from "forge-std/StdUtils.sol";
+{imports}import {{ FoundryGuardMockERC20, IFoundryGuardERC20 }} from "{support_rel}";
+
+/// @title {hname}
+/// @notice One handler for every contract in the {eco.name} ecosystem. Actors deposit and withdraw on
+///         each member, the admin pushes keeper updates on the members others depend on, and
+///         ecosystemSequence mixes calls across members in one transaction.
+/// @dev Dependency matrix (row depends on column):
+{matrix}
+contract {hname} is CommonBase, StdUtils {{
+{member_decls}
+    /// The test contract: it deployed every member, so it owns them.
+    address public immutable admin;
+
+    uint256 public constant MAX_AMOUNT = {max_amount};
+    uint256 public constant INITIAL_BALANCE = MAX_AMOUNT * 1000;
+
+    address[] public actors;
+    address[] public tokens;
+    address[] public members;
+
+    /// Successful inbound / outbound amounts, keyed by "<Member>:<unit>".
+    mapping(string => uint256) public ghost_in;
+    mapping(string => uint256) public ghost_out;
+    mapping(string => uint256) public ghost_calls;
+    mapping(string => uint256) public ghost_reverts;
+    uint256 public ghost_successfulFlows;
+    uint256 public ghost_successfulActions;
+    uint256 public ghost_sequences;
+    /// Actions skipped because the actor had nothing to take out.
+    uint256 public ghost_skipped;
+
+    constructor({ctor_params}) {{
+{ctor_assign}
+        admin = _admin;
+        tokens = _tokens;
+        for (uint256 i = 0; i < {actors}; i++) {{
+            address actor = address(uint160(0xF0A0 + i));
+            actors.push(actor);
+            for (uint256 j = 0; j < _tokens.length; j++) {{
+                FoundryGuardMockERC20(_tokens[j]).mint(actor, INITIAL_BALANCE);
+                vm.startPrank(actor);
+{approvals}
+                vm.stopPrank();
+            }}
+        }}
+    }}
+
+    function actorCount() external view returns (uint256) {{
+        return actors.length;
+    }}
+
+    function memberCount() external view returns (uint256) {{
+        return members.length;
+    }}
+
+{chr(10).join(chr(10).join([w, '']) for w in wrappers).rstrip()}
+{sequence}
+    /// @notice Advances time so time-based logic (staleness, locks, rewards) in any member is exercised.
+    function warp(uint256 dtSeed) external {{
+        vm.warp(block.timestamp + bound(dtSeed, 1, 7 days));
+        vm.roll(block.number + 1);
+    }}
+
+    function _actor(uint256 seed) internal view returns (address) {{
+        return actors[bound(seed, 0, actors.length - 1)];
+    }}
+
+    function _seed(uint256 s, uint256 k) internal pure returns (uint256) {{
+        return uint256(keccak256(abi.encode(s, k)));
+    }}
+}}
+"""
+    return src, selectors + ["warp"], meta
+
+
+def _member_imports(eco: EcosystemPlan, dest: Path, root: Path) -> str:
+    by_file: dict[str, list[str]] = {}
+    for m in eco.members:
+        by_file.setdefault(m.file, []).append(m.name)
+    return "".join(f'import {{ {", ".join(names)} }} from "{import_path(dest, root, f)}";\n' for f, names in by_file.items())
+
+
+def render_ecosystem_invariant(eco: EcosystemPlan, dest: Path, root: Path, support_rel: str, selectors: list[str],
+                               meta: dict) -> tuple[str, list[str]]:
+    hname = f"{eco.suite}Handler"
+    members = {m.name: m for m in eco.members}
+    driven = [m for m in eco.members if m.driven]
+    lines: list[str] = []
+    for tk in eco.tokens:
+        sym = sol_ident(tk.var)[:8].upper()
+        lines.append(f'{tk.var} = new FoundryGuardMockERC20("FoundryGuard {tk.var}", "fg{sym}", 18);')
+    for note in eco.notes:
+        lines.append(f"// FOUNDRYGUARD: {note}")
+    proxy = False
+    for m in eco.members:
+        if m.created_by:
+            parent, getter = m.created_by
+            lines.append(f"// {m.name} is deployed by its parent; read it back through {getter}().")
+            lines.append(f"{m.var} = {m.name}(payable(address({parent}.{getter}())));")
+            continue
+        if not m.driven:
+            continue
+        sp = m.plan
+        deploy = (f"_deploy(abi.encodePacked(\n            type({m.name}).creationCode,\n            abi.encode(\n"
+                  f"{_encode_args(sp.ctor_args, '                ')}\n            )\n        ))"
+                  if sp.ctor_args else f"address(new {m.name}())")
+        deps = [label.split(": ", 1)[1] for _, label in sp.ctor_args + sp.init_args if ": " in label]
+        lines.append(f"// {m.name}" + (f", wired to {', '.join(deps)}" if deps else "") + ".")
+        if sp.init_fn:
+            proxy = True
+            init = sp.init_fn
+            call = f'abi.encodeWithSignature("{abi_signature(init)}"' + (
+                "" if not sp.init_args else ",\n" + _encode_args(sp.init_args, "                ")) + ")"
+            lines.append(f"address {m.var}Implementation = {deploy};")
+            lines.append(f"{m.var} = {m.name}(payable(address(new FoundryGuardERC1967Proxy(\n"
+                         f"            {m.var}Implementation,\n            {call}\n        ))));")
+        else:
+            lines.append(f"{m.var} = {m.name}(payable({deploy}));")
+    lines.extend(eco.wiring)
+    for extra in eco.setup:
+        lines.append(str(extra))
+    lines.append("")
+    lines.append(f"address[] memory tokens = new address[]({len(eco.tokens)});")
+    for i, tk in enumerate(eco.tokens):
+        lines.append(f"tokens[{i}] = address({tk.var});")
+    lines.append(f"handler = new {hname}({', '.join([m.var for m in driven] + ['tokens', 'address(this)'])});")
+
+    names: list[str] = []
+    invariants: list[str] = []
+
+    def add(fname: str, doc: str, body: str) -> None:
+        names.append(fname)
+        invariants.append(f"    {doc}\n    function {fname}() public view {{\n{body}\n    }}")
+
+    checks = []
+    for e in eco.edges:
+        frm = members.get(e["from"])
+        getter = _getter_name(e.get("getter"))
+        if not frm or not frm.driven or not getter or e.get("via") == "created":
+            continue
+        if e["status"] == "member" and e["to"] in members:
+            want, label = f"address({members[e['to']].var})", e["to"]
+        elif e["status"] == "mock" and (e["from"], e.get("param")) in eco.token_by_param:
+            tok = eco.token_by_param[(e["from"], e["param"])]
+            want, label = f"address({tok})", f"the {tok} mock"
+        else:
+            continue
+        checks.append(f'        assertEq(address({frm.var}.{getter}()), {want}, "{e["from"]}.{e["var"]} no longer points at {label}");')
+    if checks:
+        add("invariant_ecosystem_wiringIntact",
+            "/// @notice Every link in the matrix still points at the contract setUp wired it to. A call that\n"
+            "    ///         swaps an oracle, a token or a vault from an actor account breaks this.",
+            "\n".join(checks))
+
+    for m in driven:
+        for unit, dirs in sorted(meta["units"].get(m.name, {}).items()):
+            if {"in", "out"} <= dirs:
+                key = f"{m.name}:{unit}"
+                add(f"invariant_ecosystem_{m.name}_{unit}OutBoundedByIn",
+                    f"/// @notice Actors never take more {unit} out of {m.name} than they put in, whatever the\n"
+                    f"    ///         other members did in between.\n    /// @dev Relax this bound if {m.name} pays yield.",
+                    f'        assertLe(handler.ghost_out("{key}"), handler.ghost_in("{key}"), "{m.name}: more {unit} left than entered");')
+        t = m.target
+        stake_total = next((g for g in ("totalStaked", "totalLocked", "totalDeposits", "totalAssets") if t.has(g, 0)), None)
+        backing = next((tk for tk in m.plan.tokens if tk.role == "staking"), None) or next(
+            (tk for tk in m.plan.tokens if tk.role == "asset"), None)
+        if stake_total and backing:
+            add(f"invariant_ecosystem_{m.name}_tokenSolvency",
+                f"/// @notice {m.name} holds at least the {backing.var} it says it owes ({stake_total}()), after any\n"
+                "    ///         sequence of calls on it and on the contracts it reads.",
+                f"        assertGe(\n            IFoundryGuardERC20(address({backing.var})).balanceOf(address({m.var})),\n"
+                f"            {m.var}.{stake_total}(),\n            \"{m.name} holds less {backing.var} than {stake_total}()\"\n        );")
+        total = next((g for g in TOTAL_GETTERS if g in t.getters), None)
+        balance = next((g for g in BALANCE_GETTERS if g in t.getters), None)
+        if total and balance:
+            add(f"invariant_ecosystem_{m.name}_actorBalancesBoundedByTotal",
+                f"/// @notice The sum of actor balances in {m.name} never exceeds its reported total.",
+                "        uint256 sum;\n        for (uint256 i = 0; i < handler.actorCount(); i++) {\n"
+                f"            sum += {m.var}.{balance}(handler.actors(i));\n        }}\n"
+                f'        assertLe(sum, {m.var}.{total}(), "{m.name}: {balance} sum exceeds {total}");')
+
+    for tk in eco.tokens:
+        add(f"invariant_ecosystem_tokenConservation_{tk.var}",
+            f"/// @notice No {tk.var} leaves the ecosystem: actors, members, the handler and this test hold\n"
+            f"    ///         all of it. Fails when a member sends {tk.var} to an address nobody wired in.\n"
+            "    /// @dev Relax this if a member pays fees or rewards to an outside address on purpose.",
+            "        IFoundryGuardERC20 t = IFoundryGuardERC20(address(" + tk.var + "));\n"
+            "        uint256 held = t.balanceOf(address(this)) + t.balanceOf(address(handler));\n"
+            "        for (uint256 i = 0; i < handler.actorCount(); i++) {\n"
+            "            held += t.balanceOf(handler.actors(i));\n        }\n"
+            "        for (uint256 i = 0; i < handler.memberCount(); i++) {\n"
+            "            held += t.balanceOf(handler.members(i));\n        }\n"
+            f'        assertEq(held, t.totalSupply(), "{tk.var} left the ecosystem");')
+
+    names.append("afterInvariant")
+    invariants.append("""    /// @notice Runs once per fuzz run: if no value-flow call ever succeeded, the invariants above were
+    ///         checked against an untouched ecosystem. Fix the wiring or funding in setUp.
+    function afterInvariant() public view {
+        assertGt(handler.ghost_successfulFlows(), 0, "no value-flow call succeeded in the ecosystem: check the wiring");
+    }""")
+
+    decls = "".join(f"    {m.name} internal {m.var};\n" for m in eco.members if m.driven or m.created_by)
+    decls += "".join(f"    FoundryGuardMockERC20 internal {tk.var};\n" for tk in eco.tokens)
+    support = ["FoundryGuardMockERC20", "IFoundryGuardERC20"] + (["FoundryGuardERC1967Proxy"] if proxy else [])
+    setup = "\n".join(("        " + ln) if ln else "" for ln in lines)
+    sel = "\n".join(f"        selectors[{i}] = {hname}.{s}.selector;" for i, s in enumerate(selectors))
+    matrix = "\n".join("/// " + ln for ln in eco.matrix_text.splitlines())
+    src = f"""// SPDX-License-Identifier: MIT
+pragma solidity {pragma_for(eco.members[0].target.contract)};
+
+{GENERATED_MARKER} from the {eco.name} ecosystem ({', '.join(m.name for m in eco.members)})
+
+import {{ Test }} from "forge-std/Test.sol";
+{_member_imports(eco, dest, root)}import {{ {hname} }} from "./Handler.sol";
+import {{ {', '.join(support)} }} from "{support_rel}";
+
+/// @title {eco.suite}InvariantTest
+/// @notice Deploys {', '.join(m.name for m in eco.members)} in dependency order, wires them to each
+///         other, and fuzzes all of them through one handler. The invariants hold across the whole
+///         matrix, so a bug that needs one contract to move under another (a price push under a vault)
+///         is in reach.
+/// @dev Dependency matrix (row depends on column):
+{matrix}
+contract {eco.suite}InvariantTest is Test {{
+{decls}    {hname} internal handler;
+
+    function setUp() public {{
+        // FOUNDRYGUARD: review the constructor arguments below; override them per contract in
+        // foundryguard.toml ([contracts.<Name>] constructor_args) so regeneration keeps them.
+{setup}
+
+        bytes4[] memory selectors = new bytes4[]({len(selectors)});
+{sel}
+
+        targetContract(address(handler));
+        targetSelector(FuzzSelector({{ addr: address(handler), selectors: selectors }}));
+    }}
+
+{chr(10).join(chr(10).join([inv, '']) for inv in invariants).rstrip()}
+
+    /// @dev Deploys creation code + ABI-encoded constructor arguments, so contract-typed parameters need no
+    ///      extra imports.
+    function _deploy(bytes memory code) internal returns (address addr) {{
+        assembly {{
+            addr := create(0, add(code, 0x20), mload(code))
+        }}
+        require(addr != address(0), "FoundryGuard: a member constructor reverted - check its arguments");
+    }}
+}}
+"""
+    return src, names
+
+
+def inject_ecosystem(eco: EcosystemPlan, root: Path, out_dir: Path, force: bool, dry_run: bool, actors: int,
+                     max_amount: str, support_status: str | None) -> dict:
+    dest = (out_dir / eco.suite).resolve()
+    first = eco.members[0].target.contract
+    entry = {
+        "contract": eco.suite, "file": first["file"], "line": first["line"], "dir": dest.as_posix(),
+        "flows": [], "actions": [], "skipped": [], "warnings": [w for m in eco.members for w in m.target.warnings],
+        "setup_notes": list(eco.notes),
+        "tokens": [{"var": tk.var, "role": tk.role, "param": tk.param} for tk in eco.tokens],
+        "upgradeable": any(m.plan.init_fn for m in eco.members), "erc4626": False, "hooks": None, "transient": None,
+        "support": support_status,
+        "ecosystem": {
+            "members": [m.name for m in eco.members],
+            "deploy_order": [m.name for m in eco.members if not m.created_by],
+            "replaces": [m.name for m in eco.members if m.needs_members],
+            "edges": [{k: e[k] for k in ("from", "var", "type", "to", "status", "via")} for e in eco.edges],
+            "matrix": eco.cluster["matrix"],
+            "matrix_text": eco.matrix_text,
+        },
+    }
+    if eco.blockers:
+        entry.update(handler="not generated", invariant="not generated", invariants=[], blocked=list(eco.blockers))
+        for b in eco.blockers:
+            log.warning("%s: %s", eco.suite, b)
+        return entry
+    support_rel = import_path(dest, out_dir.resolve(), SUPPORT_FILE)
+    handler_src, selectors, meta = render_ecosystem_handler(eco, dest, root, support_rel, actors, max_amount)
+    inv_src, names = render_ecosystem_invariant(eco, dest, root, support_rel, selectors, meta)
+    entry["flows"], entry["actions"] = meta["flows"], meta["actions"]
+    entry["handler"] = write_file(dest / "Handler.sol", handler_src, force, dry_run)
+    entry["invariant"] = write_file(dest / "Invariant.t.sol", inv_src, force, dry_run)
+    entry["invariants"] = names
+    return entry
+
+
+# --------------------------------------------------------------------------- #
 # Writing
 # --------------------------------------------------------------------------- #
 
@@ -1260,8 +1912,14 @@ def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, ac
     report = []
     unmatched: list[Target] = []
     targets = build_targets(blueprint, only, config, unmatched if ai else None)
+    ecosystems = build_ecosystems(blueprint, only, config)
+    # A contract whose constructor needs another project contract only works wired to it, so its suite is
+    # the ecosystem one; a standalone suite would deploy it against a placeholder address.
+    covered = {m.name: eco.suite for eco in ecosystems for m in eco.members if m.needs_members}
+    targets = [t for t in targets if t.name not in covered]
+    unmatched = [t for t in unmatched if t.name not in covered]
     support_status = None
-    if targets or unmatched:
+    if targets or unmatched or ecosystems:
         support_status = write_file(out_dir / SUPPORT_FILE, render_support(), force, dry_run)
     for t in targets:
         dest = (out_dir / t.name).resolve()
@@ -1296,6 +1954,8 @@ def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, ac
         entry["invariant"] = write_file(dest / "Invariant.t.sol", invariant_src, force, dry_run)
         entry["invariants"] = names
         report.append(entry)
+    for eco in ecosystems:
+        report.append(inject_ecosystem(eco, root, out_dir, force, dry_run, actors, max_amount, support_status))
     for t in unmatched:
         entry = inject_ai(t, root, out_dir, force, dry_run, ai, ai_transport)
         entry["support"] = support_status
@@ -1324,6 +1984,8 @@ def add_gen_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--json", action="store_true", help="print the generation report as JSON")
     ap.add_argument("--report-md", help="also write a Markdown summary (e.g. for $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--sarif", help="also write setup warnings and skipped functions as SARIF")
+    ap.add_argument("--no-ecosystem", action="store_true",
+                    help="do not generate cross-contract ecosystem suites (Layer 07)")
     ap.add_argument("--ai", action="store_true",
                     help="send contracts no preset matches to an LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
@@ -1340,6 +2002,8 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
     out_dir = out_dir if out_dir.is_absolute() else root / out_dir
     only = set(args.contract) if args.contract else None
     dry = args.dry_run or args.check
+    if getattr(args, "no_ecosystem", False):
+        config = {**config, "ecosystem": {**config.get("ecosystem", {}), "enabled": False}}
     ai = None
     if getattr(args, "ai", False) or config.get("ai", {}).get("enabled") is True:
         try:
@@ -1366,8 +2030,12 @@ def gen_from_args(args: argparse.Namespace, blueprint: dict, config: dict, root:
         for r in report:
             via = f" [AI {r['ai']['model']}]" if r.get("ai") else ""
             print(f"{r['contract']}{via}: Handler.sol {r['handler']}, Invariant.t.sol {r['invariant']} -> {os.path.relpath(r['dir'])}")
+            if r.get("ecosystem"):
+                print("    matrix: " + "\n            ".join(r["ecosystem"]["matrix_text"].splitlines()))
             for f in r["flows"]:
                 print(f"    + {f}")
+            for a in r.get("actions", []):
+                print(f"    ~ {a}")
             for s in r["skipped"]:
                 print(f"    - {s}")
             for inv in r.get("invariants", []):

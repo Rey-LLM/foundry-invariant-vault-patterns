@@ -181,6 +181,47 @@ jobs:
       - if: always()
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
 
+  ecosystem:
+    name: Layer 07 catches a vault that breaks when its oracle moves
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/ecosystem
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
+      - run: forge build
+      - name: The PriceFeed ecosystem must fail on LeakyOracleVault solvency only
+        run: |
+          test ! -e test/foundryguard/OracleVault && test ! -e test/foundryguard/LeakyOracleVault
+          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          run = reporter.load("forge-results.json")
+          names = {t.name for t in run.failures}
+          print("failed invariants:", sorted(names))
+          assert "invariant_ecosystem_LeakyOracleVault_tokenSolvency()" in names, "Layer 07 did not catch the oracle-driven insolvency"
+          assert all("LeakyOracleVault" in n for n in names), f"false positive outside LeakyOracleVault: {names}"
+          PY
+      - name: Without the leaky vault the ecosystem passes
+        run: |
+          rm -rf test/foundryguard
+          printf '[targets]\nexclude = ["LeakyOracleVault"]\n' > foundryguard.toml
+          python3 ../../../../src/cli/foundryguard.py run --compiler forge
+          forge test --match-path "test/foundryguard/*" -vv
+      - if: always()
+        run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
   patterns:
     name: AST parser maps the repo patterns (ERC-4626, TWAP, Staking, Transient)
     runs-on: ubuntu-latest

@@ -22,6 +22,14 @@ its nodes:
   Yul inside them for ``tstore`` / ``tload`` calls (``YulFunctionCall`` nodes),
   with the slot resolved through ``externalReferences`` to the Solidity constant
   it names, for Preset 05 (``blueprints/transient_storage.py``).
+* state variables that hold another contract (``IPriceOracle public oracle``,
+  ``IERC20 immutable asset``, or an ``address`` that the code casts with
+  ``IPriceOracle(oracle)``) become links: where the address is set (constructor,
+  initializer or setter parameter, or ``new X()``), which external functions are
+  called on it and from where. ``build_ecosystem`` resolves every link to a
+  project contract (by the exact interface in each candidate's C3 lineage), a
+  mock token, or nothing, and groups the linked contracts into clusters with a
+  deploy order and a dependency matrix (Layer 07, ``ecosystem`` in the blueprint).
 
 Every public / external state-changing function is then classified into the
 value-flow categories FoundryGuard writes invariants for: ``deposit``,
@@ -67,7 +75,7 @@ else:  # executed as a plain script directory (python3 src/cli/parser.py)
     from compiler import Diagnostic, SolidityError  # type: ignore
 
 SCHEMA = "foundryguard.blueprint/v2"
-TOOL_VERSION = "0.6.0"
+TOOL_VERSION = "0.7.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -177,6 +185,7 @@ class Contract:
     linearized_bases: list[str] = field(default_factory=list)  # C3 order (self first), as fqns
     interfaces: list[str] = field(default_factory=list)  # interface names anywhere in the lineage
     fully_implemented: bool = True
+    links: list[dict] = field(default_factory=list)  # Layer 07: state variables that hold another contract
 
     @property
     def is_deployable(self) -> bool:
@@ -485,6 +494,320 @@ def _imports_test_lib(unit: dict) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Layer 07: links to other contracts
+# --------------------------------------------------------------------------- #
+
+# typeIdentifier of a contract or interface type, e.g. t_contract$_IPriceOracle_$12 (the number is the node id).
+CONTRACT_TID = re.compile(r"t_contract\$_(.+?)_\$(\d+)")
+# Role of a linked contract, from its type name (first match wins), then from the variable name.
+LINK_ROLES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("hook", re.compile(r"Hook|Callback", re.I)),
+    ("oracle", re.compile(r"Oracle|PriceFeed|Feed$|Aggregator|Price|RateProvider|TWAP", re.I)),
+    ("vault", re.compile(r"Vault|4626|Strategy", re.I)),
+    ("token", re.compile(r"^(I?ERC20\w*|I?ERC777\w*|IWETH\w*|WETH\w*|\w*Token\w*|MockERC20)$", re.I)),
+    ("pool", re.compile(r"Pool|Pair|Router|Market|Amm|Comptroller|Manager", re.I)),
+)
+# Address parameters / variables whose name says token, for `address token_` style links.
+TOKEN_VAR = re.compile(r"(token|asset|underlying|want|collateral|weth)", re.I)
+
+
+def link_role(type_name: str, var_name: str) -> str:
+    for role, pattern in LINK_ROLES:
+        if pattern.search(type_name) if role != "token" else pattern.match(type_name):
+            return role
+    if TOKEN_VAR.search(var_name):
+        return "token"
+    for role, pattern in LINK_ROLES[:3]:
+        if pattern.search(var_name):
+            return role
+    return "contract"
+
+
+def _walk(node):
+    """Every dict node below ``node`` (any order)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            yield n
+            stack.extend(v for v in n.values() if isinstance(v, (dict, list)))
+        elif isinstance(n, list):
+            stack.extend(n)
+
+
+def _unwrap(expr):
+    """``IFoo(x)``, ``address(x)``, ``payable(x)`` and ``(x)`` -> ``x``."""
+    while isinstance(expr, dict):
+        if (expr.get("nodeType") == "FunctionCall" and expr.get("kind") == "typeConversion"
+                and len(expr.get("arguments") or []) == 1):
+            expr = expr["arguments"][0]
+        elif expr.get("nodeType") == "TupleExpression" and len(expr.get("components") or []) == 1:
+            expr = expr["components"][0]
+        else:
+            break
+    return expr
+
+
+def _ref(expr) -> int | None:
+    expr = _unwrap(expr)
+    if isinstance(expr, dict) and expr.get("nodeType") == "Identifier":
+        return expr.get("referencedDeclaration")
+    return None
+
+
+def _contract_of_tid(tid: str | None, group: str, index: dict) -> tuple[str, dict | None, str | None]:
+    """(type name, ContractDefinition or None, fqn or None) for a contract typeIdentifier."""
+    m = CONTRACT_TID.search(tid or "")
+    if not m:
+        return "", None, None
+    hit = index.get((group, int(m.group(2))))
+    if hit:
+        return hit[1]["name"], hit[1], f"{hit[0]}:{hit[1]['name']}"
+    return m.group(1), None, None
+
+
+def _site_kind(member: dict) -> str:
+    if member.get("kind") == "constructor":
+        return "constructor"
+    mods = [_ref_name(m.get("modifierName")) for m in member.get("modifiers", [])]
+    if any(m in ("initializer", "reinitializer", "onlyInitializing") for m in mods) or \
+            (member.get("name") or "").startswith("initialize"):
+        return "initializer"
+    if member.get("visibility") in ("public", "external"):
+        return "setter"
+    return "internal"
+
+
+def detect_links(node: dict, group: str, index: dict, functions: dict[int, Function]) -> list[dict]:
+    """State variables of ``node`` that hold another contract, and how the contract uses them.
+
+    A variable counts when its declared type is a contract or interface, or when it is an ``address`` that
+    the code converts to one (``IPriceOracle(oracle).price()``). For each one the walk records the
+    functions whose parameter is assigned to it, a ``new X(...)`` that creates it, and every external
+    function called on it with the function that calls it.
+    """
+    state = {m["id"]: m for m in node["nodes"]
+             if isinstance(m, dict) and m.get("nodeType") == "VariableDeclaration"
+             and m.get("stateVariable", True) and not m.get("constant")}
+    links: dict[int, dict] = {}
+    addresses: dict[int, dict] = {}
+    for vid, var in state.items():
+        tid = (var.get("typeDescriptions") or {}).get("typeIdentifier") or ""
+        if tid.startswith("t_contract$_"):
+            name, dep, dep_fqn = _contract_of_tid(tid, group, index)
+            links[vid] = _new_link(var, name, dep, dep_fqn, "declared")
+        elif tid in ("t_address", "t_address_payable"):
+            addresses[vid] = var
+
+    sites: dict[int, list[dict]] = {}
+    created: dict[int, str] = {}
+    calls: dict[int, set[str]] = {}
+    used_in: dict[int, set[str]] = {}
+    for member in node["nodes"]:
+        nt = member.get("nodeType") if isinstance(member, dict) else None
+        if nt not in ("FunctionDefinition", "ModifierDefinition") or not member.get("body"):
+            continue
+        fn = functions.get(member.get("id"))
+        label = (fn.signature if fn and fn.kind == "function" else fn.kind) if fn else f"modifier {member.get('name')}"
+        params = {p["id"]: (i, p) for i, p in enumerate((member.get("parameters") or {}).get("parameters", []))}
+        for n in _walk(member["body"]):
+            t = n.get("nodeType")
+            if t == "FunctionCall" and n.get("kind") == "typeConversion" and n.get("arguments"):
+                ref = _ref(n["arguments"][0])
+                if ref in addresses and ref not in links:
+                    tid = ((n.get("expression") or {}).get("typeDescriptions") or {}).get("typeIdentifier")
+                    name, dep, dep_fqn = _contract_of_tid(tid, group, index)
+                    if name:
+                        links[ref] = _new_link(addresses[ref], name, dep, dep_fqn, "cast")
+            elif t == "MemberAccess":
+                ref = _ref(n.get("expression"))
+                ftid = (n.get("typeDescriptions") or {}).get("typeIdentifier") or ""
+                if ref in state and ftid.startswith("t_function_external"):
+                    calls.setdefault(ref, set()).add(n.get("memberName", ""))
+                    used_in.setdefault(ref, set()).add(label)
+            elif t == "Assignment":
+                ref = _ref(n.get("leftHandSide"))
+                if ref not in state:
+                    continue
+                rhs = _unwrap(n.get("rightHandSide"))
+                if isinstance(rhs, dict) and rhs.get("nodeType") == "Identifier" and rhs.get("referencedDeclaration") in params:
+                    i, p = params[rhs["referencedDeclaration"]]
+                    sites.setdefault(ref, []).append({
+                        "function": label, "kind": _site_kind(member), "param": p.get("name") or f"arg{i}", "index": i,
+                        "params": len(params), "modifiers": list(fn.modifiers) if fn else [],
+                    })
+                elif (isinstance(rhs, dict) and rhs.get("nodeType") == "FunctionCall"
+                      and (rhs.get("expression") or {}).get("nodeType") == "NewExpression"):
+                    tn = (rhs["expression"].get("typeName") or {})
+                    created[ref] = _ref_name(tn.get("pathNode") or tn) or ""
+
+    out = []
+    for vid, link in links.items():
+        link["set_in"] = sorted(sites.get(vid, []), key=lambda s: (s["kind"] != "constructor", s["function"]))
+        link["created"] = created.get(vid)
+        link["calls"] = sorted(calls.get(vid, set()))
+        link["used_in"] = sorted(used_in.get(vid, set()))
+        out.append(link)
+    ctor = next((f for f in functions.values() if f.kind == "constructor"), None)
+    for link in out:
+        # Set through an internal helper, or not at all in this unit: a constructor parameter of the same
+        # contract type is the best evidence left.
+        if ctor and not link["created"] and all(s["kind"] == "internal" for s in link["set_in"]):
+            same = [i for i, p in enumerate(ctor.params) if link["type_id"] and p.type_id == link["type_id"]]
+            if len(same) == 1:
+                p = ctor.params[same[0]]
+                link["set_in"].insert(0, {"function": "constructor", "kind": "constructor", "param": p.name,
+                                          "index": same[0], "params": len(ctor.params), "modifiers": [], "inferred": True})
+    return sorted(out, key=lambda x: x["line"])
+
+
+def _new_link(var: dict, type_name: str, dep: dict | None, dep_fqn: str | None, how: str) -> dict:
+    visibility = var.get("visibility", "internal")
+    tid = (var.get("typeDescriptions") or {}).get("typeIdentifier")
+    return {
+        "var": var["name"], "type": type_name, "type_fqn": dep_fqn, "type_id": tid if how == "declared" else None,
+        "declared_as": ast_type(var), "how": how,
+        "type_kind": ("abstract contract" if dep and dep.get("abstract") else dep["contractKind"]) if dep else None,
+        "role": link_role(type_name, var["name"]), "visibility": visibility,
+        "mutability": var.get("mutability") or "mutable",
+        "getter": f"{var['name']}()" if visibility == "public" else None,
+        "line": 0, "_src": var.get("src"),
+    }
+
+
+def build_ecosystem(contracts: list[Contract], config: dict | None = None) -> dict:
+    """Resolve every link of every project contract and group linked contracts into clusters.
+
+    A link resolves to a project contract when its type is that (deployable) contract, or an interface /
+    abstract contract in exactly one deployable project contract's C3 lineage (``[ecosystem] bind`` picks
+    when there are several). Token links get a mock unless bound, hook links are left to Preset 04.
+    """
+    cfg = (config or {}).get("ecosystem", {})
+    bind = {str(k): str(v) for k, v in (cfg.get("bind") or {}).items()}
+    by_fqn = {c.fqn: c for c in contracts}
+    members = [c for c in contracts if not c.external and not c.test_helper and c.kind == "contract"]
+    names = {c.name for c in members}
+    edges: list[dict] = []
+    for c in members:
+        own = [(l, None) for l in c.links]
+        for f in c.linearized_bases[1:]:
+            parent = by_fqn.get(f)
+            if parent is not None:
+                own += [(l, parent.name) for l in parent.links]
+        seen: set[str] = set()
+        for link, inherited in own:
+            if link["var"] in seen:
+                continue
+            seen.add(link["var"])
+            edges.append(_resolve(c, link, inherited, members, names, bind))
+
+    adj: dict[str, set[str]] = {n: set() for n in names}
+    for e in edges:
+        if e["status"] in ("member", "created"):
+            adj[e["from"]].add(e["to"])
+            adj[e["to"]].add(e["from"])
+    clusters, seen_nodes = [], set()
+    for start in sorted(names):
+        if start in seen_nodes or not adj[start]:
+            continue
+        comp, stack = set(), [start]
+        while stack:
+            n = stack.pop()
+            if n not in comp:
+                comp.add(n)
+                stack.extend(adj[n] - comp)
+        seen_nodes |= comp
+        clusters.append(_cluster(sorted(comp), edges))
+    return {
+        "links": sum(len(c.links) for c in contracts if not c.external),
+        "edges": edges,
+        "clusters": clusters,
+    }
+
+
+def _resolve(c: Contract, link: dict, inherited: str | None, members: list[Contract], names: set[str],
+             bind: dict[str, str]) -> dict:
+    sites = link.get("set_in") or []
+    deploy = next((s for s in sites if s["kind"] in ("constructor", "initializer")), None)
+    setter = next((s for s in sites if s["kind"] == "setter" and s["params"] == 1), None)
+    if link.get("created"):
+        via = "created"
+    elif deploy:
+        via = deploy["kind"]
+    elif setter:
+        via = "setter"
+    else:
+        via = "unknown"
+    site = deploy or setter
+    edge = {
+        "from": c.name, "var": link["var"], "type": link["type"], "role": link["role"], "via": via,
+        "param": site["param"] if site else None, "index": site["index"] if site else None,
+        "function": site["function"] if site else None, "getter": link.get("getter"),
+        "calls": link.get("calls", []), "used_in": link.get("used_in", []), "inherited_from": inherited,
+        "to": None, "status": "unresolved", "candidates": [],
+    }
+    chosen = bind.get(f"{c.name}.{link['var']}") or bind.get(link["type"])
+    if link.get("created"):
+        chosen = chosen or link["created"]
+    if chosen:
+        if chosen in names and chosen != c.name:
+            edge.update(to=chosen, status="created" if via == "created" else "member", candidates=[chosen])
+        elif chosen.lower() == "mock":
+            edge["status"] = "mock"
+        return edge
+    if link["role"] == "hook":
+        edge["status"] = "hook"
+        return edge
+    concrete = link.get("type_kind") == "contract" and link["type"] in names
+    if concrete and link["type"] != c.name:
+        edge.update(to=link["type"], status="member", candidates=[link["type"]])
+        return edge
+    if link["role"] == "token":
+        edge["status"] = "mock"
+        return edge
+    cands = sorted(m.name for m in members if m is not c and (
+        (link.get("type_fqn") and link["type_fqn"] in m.linearized_bases[1:])
+        or (not link.get("type_fqn") and (link["type"] in m.interfaces or link["type"] in m.inherits))))
+    edge["candidates"] = cands
+    if cands:
+        edge.update(to=cands[0], status="member")
+    return edge
+
+
+def _cluster(comp: list[str], edges: list[dict]) -> dict:
+    inner = [e for e in edges if e["from"] in comp and e["to"] in comp and e["status"] in ("member", "created")]
+    # Deploy order: a contract whose constructor / initializer takes another one's address comes after it.
+    needs = {n: {e["to"] for e in inner if e["from"] == n and e["via"] in ("constructor", "initializer")} for n in comp}
+    order, done, cycles = [], set(), []
+    pending = list(comp)
+    while pending:
+        ready = [n for n in pending if needs[n] <= done]
+        if not ready:
+            cycles.append(sorted(pending))
+            order.extend(sorted(pending))
+            break
+        for n in sorted(ready):
+            order.append(n)
+            done.add(n)
+            pending.remove(n)
+    incoming = {n: sum(1 for e in inner if e["to"] == n) for n in comp}
+    roots = [n for n in order if incoming[n] == 0]
+    if len(roots) == 1:
+        name = roots[0]
+    else:
+        name = max(order, key=lambda n: (incoming[n], -order.index(n)))
+    return {
+        "name": name,
+        "members": order,
+        "roots": roots,
+        "cycles": cycles,
+        "matrix": {"order": order,
+                   "rows": [[1 if any(e["from"] == a and e["to"] == b for e in inner) else 0 for b in order] for a in order]},
+    }
+
+
+
 def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list[str],
                        rules=CLASSIFICATION_RULES) -> list[Contract]:
     """Walk validated SourceUnits into ``Contract`` records (targets plus everything they import)."""
@@ -569,6 +892,7 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
                 return transient_storage.constant_value(_lookup(decl_id), _lookup)
 
             transient_ops: list[dict] = []
+            fn_by_id: dict[int, Function] = {}
             for member in node["nodes"]:
                 nt = member.get("nodeType")
                 if nt in ("FunctionDefinition", "ModifierDefinition") and member.get("body"):
@@ -578,6 +902,7 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
                                                             lambda src, _s=source: _line(_s, src))
                 if nt == "FunctionDefinition":
                     fn = _function(member, source, rules)
+                    fn_by_id[member["id"]] = fn
                     if fn.kind == "constructor":
                         c.constructor = fn
                     else:
@@ -592,6 +917,9 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
                         c.accounting_getters.append(var["name"])
             c.accounting_getters = sorted(set(c.accounting_getters))
             c.transient = transient_storage.summarize(transient_ops)
+            c.links = detect_links(node, group, index, fn_by_id)
+            for link in c.links:
+                link["line"] = _line(source, link.pop("_src") or "")
             contracts.append(c)
     return contracts
 
@@ -672,11 +1000,11 @@ def build_blueprint(root: Path, paths: list[str], config: dict | None = None, co
         out.write_text(json.dumps({"sources": raw.get("sources", {})}, sort_keys=True) + "\n")
     contracts = contracts_from_ast(result, root, paths, rules)
     remaps = compiler.load_remappings(root)
-    return _finish_blueprint(root, paths, remaps, contracts, result)
+    return _finish_blueprint(root, paths, remaps, contracts, result, config)
 
 
 def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts: list[Contract],
-                      result: "compiler.CompileResult") -> dict:
+                      result: "compiler.CompileResult", config: dict | None = None) -> dict:
     for c in contracts:
         cats: dict[str, list[str]] = {}
         for fn in c.functions:
@@ -689,6 +1017,7 @@ def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts
             c.hooks = {"callbacks": sorted({cb["name"] for fn in fns for cb in fn.callbacks}), "call_sites": sites}
 
     contracts.sort(key=lambda c: (c.external, c.file, c.line))
+    ecosystem = build_ecosystem(contracts, config)
     targets = [c for c in contracts if not c.external and not c.test_helper]
     target_files = {c.file for c in contracts if not c.external}
     summary = {
@@ -702,6 +1031,8 @@ def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts
         "stake_lock_functions": sum(len(c.categories.get("stake_lock", [])) for c in targets),
         "hook_contracts": sum(1 for c in targets if c.hooks),
         "transient_contracts": sum(1 for c in targets if c.transient),
+        "linked_contracts": sum(1 for c in targets if c.links),
+        "ecosystems": len(ecosystem["clusters"]),
     }
     warnings = [d.as_dict() for d in result.diagnostics if d.file in target_files]
     return {
@@ -716,6 +1047,7 @@ def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts
         "diagnostics": warnings,
         "unresolved_imports": [],
         "contracts": [_contract_to_dict(c) for c in contracts],
+        "ecosystem": ecosystem,
     }
 
 
@@ -801,7 +1133,8 @@ def main(argv: list[str] | None = None) -> int:
         s = blueprint["summary"]
         print(
             f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{describe_backend(blueprint)}] "
-            f"-> {out} [deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}]",
+            f"-> {out} [deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}"
+            f" ecosystems={s['ecosystems']}]",
             file=sys.stderr,
         )
     return 0

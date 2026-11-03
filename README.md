@@ -24,6 +24,7 @@ src/
   flashloan-reward/    module 03
   transient-vault/     module 05
   cli/                 FoundryGuard (foundryguard.py, compiler.py, parser.py, injector.py, ai_generator.py, reporter.py, reporting.py)
+                       parser.py also builds the cross-contract dependency matrix, injector.py the ecosystem suites
     blueprints/        invariant presets (hook_reentrancy.py, transient_storage.py)
 test/                  module tests
 tests/foundryguard/    FoundryGuard unit tests and fixtures
@@ -47,7 +48,7 @@ To reuse a pattern, copy the closest handler and test, point the handler at your
 
 ## FoundryGuard
 
-FoundryGuard compiles your Solidity, finds the functions that move value in the compiler's AST, and writes a `Handler.sol` and an `Invariant.t.sol` per contract. The generated `setUp` deploys and funds what it needs. It needs Python 3.9+ (3.9 and 3.10 also need `tomli`, which `pip install .` installs) and a Solidity compiler: solc, solcjs or Foundry.
+FoundryGuard compiles your Solidity, finds the functions that move value in the compiler's AST, and writes a `Handler.sol` and an `Invariant.t.sol` per contract. Contracts that depend on each other (a vault and its oracle, a vault and its strategy) get one suite for the whole group instead. The generated `setUp` deploys, wires and funds what it needs. It needs Python 3.9+ (3.9 and 3.10 also need `tomli`, which `pip install .` installs) and a Solidity compiler: solc, solcjs or Foundry.
 
 ```sh
 pipx install git+https://github.com/Rey-LLM/foundry-invariant-vault-patterns.git
@@ -60,7 +61,7 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | :-- | :-- |
 | `foundryguard init` | writes a commented `foundryguard.toml` |
 | `foundryguard scan` | Solidity to a `foundryguard.json` blueprint |
-| `foundryguard gen` | blueprint to `test/foundryguard/<Contract>/` suites |
+| `foundryguard gen` | blueprint to `test/foundryguard/<Contract>/` and `test/foundryguard/<Name>Ecosystem/` suites |
 | `foundryguard run [--test]` | `scan` and `gen`; with `--test` also `forge test` and the report |
 | `foundryguard check` | exits 1 when generated suites are missing or stale |
 | `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md`, plus CI Markdown and SARIF |
@@ -142,6 +143,39 @@ A contract cannot read another contract's transient storage, so the suite deploy
 
 `tests/foundryguard/fixtures/transient` has `TransientStaking` and `LeakyTransientStaking`. CI requires the leaky one to fail this invariant and the fixed one to pass everything.
 
+### Cross-contract ecosystems
+
+Many DeFi bugs need two contracts to get out of step: a vault that is fine until its oracle moves, a strategy that reports assets the vault already paid out. A suite that deploys one contract with a placeholder address for everything else cannot reach them. So the scan also maps how your contracts point at each other, and the generator deploys linked contracts together.
+
+What the parser records, per contract, from the AST (`links` in the blueprint):
+
+- every state variable whose type is a contract or interface (`IPriceOracle public oracle`, `IERC20 immutable asset`), and every `address` variable the code casts to one (`IPriceOracle(oracle).price()`);
+- where it is set: a constructor or initializer parameter, a setter such as `setStrategy(address)`, or `new X()` in the constructor. A link set through an internal helper falls back to the constructor parameter of the same type;
+- which external functions are called on it, and from which functions.
+
+Each link is then resolved (`ecosystem.edges`). A concrete project contract resolves to itself. An interface or abstract type resolves to the project contract that has it in its C3 lineage, matched by declaration, not by name. Token types get a mock ERC-20, as before. Hook types are left to Preset 04. When several contracts implement the interface, the first one is used and the report says so; choose with `[ecosystem.bind]`.
+
+Linked contracts form clusters (`ecosystem.clusters`). Each cluster has a deploy order (a contract comes after everything its constructor or initializer needs), its root contracts, any constructor cycle, and a dependency matrix:
+
+```text
+                  0 1 2
+PriceFeed         . . .   0
+LeakyOracleVault  x . .   1
+OracleVault       x . .   2
+```
+
+A row depends on a column. The generator writes one suite per cluster to `test/foundryguard/<Name>Ecosystem/`:
+
+- `setUp` deploys every member in order and passes each one the addresses of the members it needs. Members created with `new` are read back through their getter. Links set through a setter are wired after deployment. Token mocks are shared when the parameter names match, so a vault and its strategy hold the same asset.
+- One master handler drives the whole cluster: value flows on every member, other unrestricted state-changing calls, and admin-only calls on the members others depend on (price pushes, rate updates), made as the admin. Calls that change ownership, upgrade code or rewire a link are not fuzzed. `ecosystemSequence` runs two to four of these calls across members in one transaction.
+- Invariants hold across the cluster: `ecosystem_wiringIntact` (every public link still points at what `setUp` wired), `ecosystem_<Member>_tokenSolvency`, `ecosystem_<Member>_<unit>OutBoundedByIn`, `ecosystem_<Member>_actorBalancesBoundedByTotal`, `ecosystem_tokenConservation_<token>` (no token leaves the actors, members, handler and test), and `afterInvariant`.
+
+A contract whose constructor or initializer needs another member gets only the ecosystem suite, since on its own it would run against a placeholder. Members that stand alone keep their standalone suites and presets.
+
+`tests/foundryguard/fixtures/ecosystem` has a `PriceFeed` read by two vaults. `OracleVault` books deposits in tokens. `LeakyOracleVault` books them as value at the current price and pays back in tokens, so after a price drop it owes more than it holds. Deployed alone, neither vault shows a problem. CI requires the ecosystem suite to fail `invariant_ecosystem_LeakyOracleVault_tokenSolvency` and nothing else, and to pass once the leaky vault is excluded.
+
+`[ecosystem] enabled = false` or `gen --no-ecosystem` turns this off. `[targets] exclude` removes a contract from its cluster.
+
 ### AI fallback for custom contracts
 
 The presets only fire when the AST proves they apply. A contract with its own logic (an auction, a bonding curve, a vesting schedule) gets no suite and shows up as "no drivable deposit/withdraw/stake_lock functions". With `--ai`, those contracts go to `ai_generator.py` instead. It sends the contract's lineage, constructor, public and external function signatures, state variables and its source with comments stripped to a language model, and asks for a handler with bounded inputs and ghost variables plus invariants for that contract.
@@ -190,7 +224,16 @@ constructor_args = ["address(asset)", "\"Vault\"", "\"vTKN\""]
 setup = ["vm.warp(1 days);"]
 transient_slots = ["0x..."]     # Preset 05: extra slots to watch
 transient_ignore = ["0x..."]    # Preset 05: slots that may stay set for the whole transaction
+
+[ecosystem]
+setup = ["vm.warp(1 days);"]    # extra setUp lines for every ecosystem suite
+
+[ecosystem.bind]
+IPriceOracle = "ChainlinkAdapter"   # which contract fills a link, by interface
+"MyVault.oracle" = "TwapOracle"     # or by contract.variable; "mock" forces a mock token
 ```
+
+`constructor_args` under `[contracts.<Name>]` also apply when that contract is deployed inside an ecosystem.
 
 Settings live in the config, so regenerating with `--force` keeps them.
 
@@ -207,13 +250,15 @@ Settings live in the config, so regenerating with `--force` keeps them.
     sarif_file: foundryguard.sarif
 ```
 
-Broken invariants show up as code-scanning alerts on the failing `invariant_*` function. This repo's own workflow runs the Python tests on 3.9 and 3.13 with solc 0.8.24, fuzzes the fixture projects with forge, maps this repo's modules and runs module 05, and resolves OpenZeppelin and Solady parents through both the solc and forge drivers. Run the tests locally with `python3 -m unittest discover -s tests/foundryguard -v`. Tests that compile are skipped when no solc or solcjs is installed; the OpenZeppelin/Solady ones also need `npm install` in `tests/foundryguard/fixtures/libs`.
+Broken invariants show up as code-scanning alerts on the failing `invariant_*` function. This repo's own workflow runs the Python tests on 3.9 and 3.13 with solc 0.8.24, fuzzes the fixture projects with forge (including the ecosystem one), maps this repo's modules and runs module 05, and resolves OpenZeppelin and Solady parents through both the solc and forge drivers. Run the tests locally with `python3 -m unittest discover -s tests/foundryguard -v`. Tests that compile are skipped when no solc or solcjs is installed; the OpenZeppelin/Solady ones also need `npm install` in `tests/foundryguard/fixtures/libs`.
 
 ### Limitations
 
 - The suites are a starting point, not an audit. Add the protocol-specific invariants only you can state.
 - Functions with array, struct, `bytes` or `string` parameters are skipped. That includes a real v4 `PoolManager`.
-- Non-token contract arguments (oracles, routers) get `address(this)` with a note. Pass real mocks through `constructor_args`.
+- Non-token contract arguments (oracles, routers) are wired to a project contract that implements them. When none does, they get `address(this)` with a note. Pass real mocks through `constructor_args`.
+- Ecosystem suites only follow links stored in the contract's own state variables. An address passed per call, read from a registry, or cast in a child contract from a parent's `address` variable is not linked. Contracts whose constructors need each other are reported as a cycle and not generated.
+- Ecosystem suites do not run the single-contract presets (ERC-4626 previews, hooks, transient storage) on their members.
 - Presets assume no external yield. Relax `solvency` and the `*OutBoundedByIn` invariants for vaults that earn yield.
 - AI suites are not compiled or run by FoundryGuard before they are written. Run `forge build` and fix what the model got wrong.
 - Preset 05 sees `tstore` in the contract's own lineage only. Transient storage written through a library (OpenZeppelin `TransientSlot`, `ReentrancyGuardTransient`) or Solidity `transient` state variables is not detected yet; list those slots under `transient_slots`.

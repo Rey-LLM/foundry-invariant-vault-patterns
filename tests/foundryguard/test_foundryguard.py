@@ -982,3 +982,178 @@ class AIGeneratorTests(ProjectCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ECOSYSTEM_FIXTURE = FIXTURES / "ecosystem"
+ECOSYSTEM_AST_OUTPUT = FIXTURES / "ast" / "ecosystem-solc-output.json"
+FORGE_STD_STUB = FIXTURES / "forge-std-stub"
+
+
+class EcosystemTests(ProjectCase):
+    fixture = ECOSYSTEM_FIXTURE
+    ast_fixture = ECOSYSTEM_AST_OUTPUT
+
+    def test_links_from_declared_types_and_address_casts(self):
+        cs = contracts(self.scan())
+        links = {l["var"]: l for l in cs["OracleVault"]["links"]}
+        oracle = links["oracle"]
+        self.assertEqual((oracle["type"], oracle["how"], oracle["role"], oracle["type_kind"]),
+                         ("IPriceOracle", "declared", "oracle", "interface"))
+        self.assertEqual(oracle["type_fqn"], "src/IPriceOracle.sol:IPriceOracle")
+        self.assertEqual([(s["kind"], s["param"], s["index"]) for s in oracle["set_in"]], [("constructor", "oracle_", 1)])
+        self.assertEqual(oracle["calls"], ["price"])
+        self.assertEqual(oracle["used_in"], ["deposit(uint256)", "valueOf(address)"])
+        self.assertEqual(links["token"]["role"], "token")
+        self.assertEqual(links["token"]["calls"], ["transfer", "transferFrom"])
+        # `address public oracle` only becomes a link because the code casts it to IPriceOracle.
+        leaky = {l["var"]: l for l in cs["LeakyOracleVault"]["links"]}["oracle"]
+        self.assertEqual((leaky["type"], leaky["how"], leaky["declared_as"]), ("IPriceOracle", "cast", "address"))
+        self.assertEqual(leaky["used_in"], ["balanceOf(address)", "deposit(uint256)", "totalAssets()", "withdraw(uint256)"])
+        self.assertEqual(cs["PriceFeed"]["links"], [])
+
+    def test_dependency_matrix_and_deploy_order(self):
+        bp = self.scan()
+        eco = bp["ecosystem"]
+        self.assertEqual(bp["summary"]["ecosystems"], 1)
+        self.assertEqual(bp["summary"]["linked_contracts"], 2)
+        status = {(e["from"], e["var"]): (e["status"], e["to"], e["via"]) for e in eco["edges"]}
+        self.assertEqual(status[("OracleVault", "oracle")], ("member", "PriceFeed", "constructor"))
+        self.assertEqual(status[("LeakyOracleVault", "oracle")], ("member", "PriceFeed", "constructor"))
+        self.assertEqual(status[("OracleVault", "token")], ("mock", None, "constructor"))
+        (cl,) = eco["clusters"]
+        self.assertEqual(cl["name"], "PriceFeed")
+        self.assertEqual(cl["members"], ["PriceFeed", "LeakyOracleVault", "OracleVault"])
+        self.assertEqual(cl["roots"], ["LeakyOracleVault", "OracleVault"])
+        self.assertEqual(cl["matrix"]["rows"], [[0, 0, 0], [1, 0, 0], [1, 0, 0]])
+        self.assertEqual(cl["cycles"], [])
+
+    def test_master_handler_deploys_and_wires_every_member(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        # The vaults need PriceFeed to work, so they only get the ecosystem suite.
+        self.assertEqual(sorted(report), ["PriceFeedEcosystem"])
+        r = report["PriceFeedEcosystem"]
+        self.assertEqual(r["ecosystem"]["deploy_order"], ["PriceFeed", "LeakyOracleVault", "OracleVault"])
+        self.assertEqual(r["ecosystem"]["replaces"], ["LeakyOracleVault", "OracleVault"])
+        self.assertEqual(r["actions"], ["PriceFeed.keeper:setPrice(uint256)"])
+        self.assertEqual(len(r["flows"]), 4)
+        self.assertIn("invariant_ecosystem_wiringIntact", r["invariants"])
+        self.assertIn("invariant_ecosystem_LeakyOracleVault_tokenSolvency", r["invariants"])
+        self.assertIn("invariant_ecosystem_OracleVault_tokenSolvency", r["invariants"])
+        self.assertIn("invariant_ecosystem_tokenConservation_token", r["invariants"])
+        handler = self.read("PriceFeedEcosystem", "Handler.sol")
+        self.assertIn("contract PriceFeedEcosystemHandler is CommonBase, StdUtils {", handler)
+        self.assertIn("constructor(PriceFeed _priceFeed, LeakyOracleVault _leakyOracleVault, OracleVault _oracleVault, "
+                      "address[] memory _tokens, address _admin) {", handler)
+        self.assertIn("function priceFeed_setPrice(uint256 newPriceSeed) external {", handler)
+        self.assertIn("vm.prank(admin);\n        try priceFeed.setPrice(newPrice_) {", handler)
+        self.assertIn("uint256 amount_max = leakyOracleVault.balanceOf(actor);", handler)
+        self.assertIn('ghost_in["OracleVault:assets"] += amount_;', handler)
+        self.assertIn("try this.priceFeed_setPrice(_seed(s, 0)) { } catch { }", handler)
+        inv = self.read("PriceFeedEcosystem", "Invariant.t.sol")
+        self.assertLess(inv.index("priceFeed = PriceFeed("), inv.index("leakyOracleVault = LeakyOracleVault("))
+        self.assertIn("address(priceFeed) /* address oracle_: PriceFeed */", inv)
+        self.assertIn("address(priceFeed) /* IPriceOracle oracle_: PriceFeed */", inv)
+        self.assertEqual(inv.count("address(token) /* IERC20 token_ */"), 2)  # one mock shared by both vaults
+        self.assertIn('assertEq(address(oracleVault.oracle()), address(priceFeed), "OracleVault.oracle no longer points at PriceFeed");', inv)
+        self.assertIn("leakyOracleVault.totalAssets(),", inv)
+        self.assertIn("PriceFeedEcosystemHandler.ecosystemSequence.selector", inv)
+        md = reporting.markdown_report(list(report.values()), self.scan())
+        self.assertIn("(ecosystem: PriceFeed, LeakyOracleVault, OracleVault)", md)
+        self.assertIn("LeakyOracleVault  x . .", md)
+
+    def test_regeneration_is_idempotent(self):
+        bp = self.scan()
+        self.gen(bp)
+        again = self.gen(bp)
+        self.assertFalse(injector.is_stale(again))
+
+    def test_config_disables_excludes_and_binds(self):
+        bp = self.scan()
+        off = {r["contract"]: r for r in self.gen(bp, config={"ecosystem": {"enabled": False}})}
+        self.assertEqual(sorted(off), ["LeakyOracleVault", "OracleVault"])  # back to standalone suites
+        self.assertTrue(any("placeholder address(this)" in n for n in off["OracleVault"]["setup_notes"]))
+        shutil.rmtree(self.root / "test")
+        r = self.gen(bp, config={"targets": {"exclude": ["LeakyOracleVault"]}})[0]
+        self.assertEqual(r["ecosystem"]["members"], ["PriceFeed", "OracleVault"])
+        self.assertEqual(r["ecosystem"]["matrix"]["rows"], [[0, 0], [1, 0]])
+        self.assertNotIn("leakyOracleVault", self.read("PriceFeedEcosystem", "Handler.sol"))
+        bound = fg_parser.build_blueprint(self.root, [], config={"ecosystem": {"bind": {"OracleVault.oracle": "mock"}}},
+                                          ast_path=str(self.ast_fixture))
+        status = {(e["from"], e["var"]): e["status"] for e in bound["ecosystem"]["edges"]}
+        self.assertEqual(status[("OracleVault", "oracle")], "mock")
+        self.assertEqual(bound["ecosystem"]["clusters"][0]["members"], ["PriceFeed", "LeakyOracleVault"])
+
+    def test_projects_without_links_are_unchanged(self):
+        root = self.tmp / "plain"
+        shutil.copytree(FIXTURE, root)
+        bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
+        self.assertEqual(bp["ecosystem"]["clusters"], [])
+        self.assertTrue(all(e["status"] == "mock" for e in bp["ecosystem"]["edges"]))
+        report = injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
+        self.assertFalse(any(r.get("ecosystem") for r in report))
+
+    @needs_solc
+    def test_generated_ecosystem_compiles(self):
+        self.gen(self.scan())
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        files = sorted(p.relative_to(self.root).as_posix() for p in (self.root / "test").rglob("*.sol"))
+        result = compiler.compile_with_solc(self.root, files, "auto")
+        self.assertIn("test/foundryguard/PriceFeedEcosystem/Invariant.t.sol", result.units)
+        self.assertEqual([d.as_dict() for d in result.diagnostics if d.severity == "error"], [])
+
+    @needs_solc
+    def test_setter_created_inferred_and_cycle_links(self):
+        (self.root / "src" / "Patterns.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.24;
+            interface IStrategy { function invest(uint256 amount) external; }
+            interface IRateModel { function rate() external view returns (uint256); }
+            contract Strategy is IStrategy {
+                function invest(uint256) external { }
+            }
+            contract Escrow { uint256 public held; }
+            contract RateA is IRateModel { function rate() external pure returns (uint256) { return 1; } }
+            contract RateB is IRateModel { function rate() external pure returns (uint256) { return 2; } }
+            contract Hub {
+                address public owner = msg.sender;
+                IStrategy public strategy;
+                Escrow public escrow;
+                IRateModel internal model;
+                modifier onlyOwner() { require(msg.sender == owner); _; }
+                constructor(IRateModel model_) {
+                    escrow = new Escrow();
+                    _setModel(model_);
+                }
+                function _setModel(IRateModel m) internal { model = m; }
+                function setStrategy(address s) external onlyOwner { strategy = IStrategy(s); }
+                function deposit(uint256 amount) external { strategy.invest(amount * model.rate()); }
+            }
+            contract Left { Right public right; constructor(Right r) { right = r; } }
+            contract Right { Left public left; constructor(Left l) { left = l; } }
+        """)
+        bp = self.compile(paths=["src/Patterns.sol"], config={"ecosystem": {"bind": {"IRateModel": "RateB"}}})
+        hub = {l["var"]: l for l in contracts(bp)["Hub"]["links"]}
+        self.assertEqual(hub["strategy"]["set_in"][0]["kind"], "setter")
+        self.assertEqual(hub["strategy"]["set_in"][0]["function"], "setStrategy(address)")
+        self.assertEqual(hub["escrow"]["created"], "Escrow")
+        self.assertTrue(hub["model"]["set_in"][0].get("inferred"))  # set through an internal helper
+        self.assertEqual(hub["strategy"]["calls"], ["invest"])
+        edges = {(e["from"], e["var"]): e for e in bp["ecosystem"]["edges"]}
+        self.assertEqual((edges[("Hub", "strategy")]["to"], edges[("Hub", "strategy")]["via"]), ("Strategy", "setter"))
+        self.assertEqual((edges[("Hub", "escrow")]["status"], edges[("Hub", "escrow")]["via"]), ("created", "created"))
+        self.assertEqual(edges[("Hub", "model")]["to"], "RateB")
+        clusters = {cl["name"]: cl for cl in bp["ecosystem"]["clusters"]}
+        self.assertEqual(clusters["Hub"]["members"], ["Escrow", "RateB", "Strategy", "Hub"])
+        cycle = next(cl for cl in clusters.values() if "Left" in cl["members"])
+        self.assertEqual(cycle["cycles"], [["Left", "Right"]])
+
+        report = {r["contract"]: r for r in self.gen(bp, only={"Hub", "Left"})}
+        self.assertIn("cycle", report["LeftEcosystem"]["blocked"][0])
+        inv = self.read("HubEcosystem", "Invariant.t.sol")
+        self.assertIn("escrow = Escrow(payable(address(hub.escrow())));", inv)
+        self.assertIn('abi.encodeWithSignature("setStrategy(address)", address(strategy))', inv)
+        self.assertIn("address(rateB) /* IRateModel model_: RateB */", inv)
+        self.assertLess(inv.index("strategy = Strategy("), inv.index("hub = Hub("))
+        shutil.copytree(FORGE_STD_STUB / "src", self.root / "lib" / "forge-std" / "src")
+        result = compiler.compile_with_solc(self.root, ["test/foundryguard/HubEcosystem/Invariant.t.sol"], "auto")
+        self.assertIn("test/foundryguard/HubEcosystem/Handler.sol", result.units)

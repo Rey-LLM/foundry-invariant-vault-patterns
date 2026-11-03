@@ -62,6 +62,15 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 # initializer_args = ["address(asset)", "address(this)"]
 # setup = ["vm.warp(1 days);"]
 
+[ecosystem]
+# Layer 07: contracts that hold other project contracts (an oracle, a strategy, a vault) get one
+# suite per cluster that deploys and wires all of them. On by default.
+# enabled = true
+# setup = ["vm.warp(1 days);"]              # extra setUp lines for every ecosystem suite
+# [ecosystem.bind]                          # which contract fills a link when several implement it
+# IPriceOracle = "ChainlinkAdapter"         # by interface
+# "MyVault.oracle" = "TwapOracle"           # or by contract.variable; "mock" forces a mock token
+
 [ai]
 # Contracts no preset matches can be sent to a language model (same as `--ai`).
 # The key comes from ANTHROPIC_API_KEY or OPENAI_API_KEY, never from this file.
@@ -85,7 +94,8 @@ def _scan(args) -> dict:
             out.write_text(payload)
     s = blueprint["summary"]
     print(f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{parser.describe_backend(blueprint)}] "
-          f"deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}",
+          f"deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']} "
+          f"ecosystems={s.get('ecosystems', 0)}",
           file=sys.stderr)
     return blueprint
 
