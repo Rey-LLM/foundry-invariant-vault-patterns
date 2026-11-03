@@ -141,8 +141,47 @@ jobs:
       - if: always()
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
 
+  transient-storage:
+    name: Preset 05 catches a transient slot left set between calls
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/transient
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
+      - run: forge build
+      - name: LeakyTransientStaking must fail the transient check, TransientStaking must pass
+        run: |
+          forge test --match-path "test/foundryguard/*" -vvv | tee forge-output.txt || true
+          forge test --match-path "test/foundryguard/*" --json > forge-results.json 2> forge-stderr.txt || true
+          cat forge-stderr.txt >> forge-results.json
+          python3 ../../../../src/cli/foundryguard.py report forge-results.json > /dev/null
+          python3 ../../../../src/cli/reporter.py forge-output.txt -o report-from-stdout.md
+          grep -q "invariant_transient_slotsClearedBetweenCalls" report-from-stdout.md
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "../../../../src/cli")
+          import reporter
+          run = reporter.load("forge-results.json")
+          failed = {t.contract for t in run.failures}
+          print("failed suites:", sorted(failed))
+          names = {t.name for t in run.failures if t.contract == "LeakyTransientStakingGuardInvariantTest"}
+          assert "LeakyTransientStakingGuardInvariantTest" in failed, "Preset 05 did not catch the leaked transient slot"
+          assert "invariant_transient_slotsClearedBetweenCalls()" in names, f"wrong invariant reported: {names}"
+          assert not failed - {"LeakyTransientStakingGuardInvariantTest"}, f"false positive on the fixed contract: {failed}"
+          print("LeakyTransientStaking failures:", sorted(names))
+          PY
+      - if: always()
+        run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
   patterns:
-    name: AST parser maps the repo patterns (ERC-4626, TWAP, Staking)
+    name: AST parser maps the repo patterns (ERC-4626, TWAP, Staking, Transient)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,10 +217,15 @@ jobs:
           assert oracle["updatePrice"]["mutability"] == "nonpayable" and oracle["consult"]["mutability"] == "view"
           assert oracle["_checkBounds"]["mutability"] == "pure"
           assert cs["Handler"]["test_helper"], "src/erc4626-inflation/Handler.sol imports forge-std"
+          tr = cs["TransientStaking"]["transient"]
+          assert len(tr["tstore_slots"]) == 2 and "modifier nonReentrant" in tr["sites"], tr
+          assert cs["LeakyTransientStaking"]["linearized_bases"][1] == "src/transient-vault/TransientStaking.sol:TransientStaking"
           print("mapped:", sorted(cs))
           PY
       - name: Generated and hand-written suites compile together
         run: forge build
+      - name: Module 05 hand-written suite (transient storage)
+        run: forge test --match-path "test/transient-vault/*" -vv
 
   libraries:
     name: OpenZeppelin and Solady parents from the AST

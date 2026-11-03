@@ -29,6 +29,10 @@ Invariant presets are emitted only when the blueprint proves they apply:
 * hooks (Preset 04, ``blueprints/hook_reentrancy.py``): contracts that call external hooks mid-flow
   (Uniswap v4 style) get probe actors that check view consistency, the reentrancy lock and
   re-entry into ``nonReentrant`` flows while the callback is running
+* transient storage (Preset 05, ``blueprints/transient_storage.py``): contracts that ``tstore`` in
+  inline assembly are deployed as a ``<Contract>TransientHarness`` that can read its own transient
+  slots; the handler checks after every call, and in multi-call sequences inside one transaction,
+  that every slot is back to zero
 * ``afterInvariant``: fails a run in which every value-flow call reverted
 
 Usage::
@@ -50,10 +54,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 if __package__:
-    from .blueprints import hook_reentrancy
+    from .blueprints import hook_reentrancy, transient_storage
 else:  # executed as a plain script directory (python3 src/cli/injector.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from blueprints import hook_reentrancy  # type: ignore
+    from blueprints import hook_reentrancy, transient_storage  # type: ignore
 
 SUPPORTED_SCHEMA = "foundryguard.blueprint/v2"
 # v1 blueprints (0.3, name-based inheritance) are still read; v2 adds AST node identities.
@@ -110,6 +114,7 @@ class Target:
     lineage: list[str] = field(default_factory=list)
     settings: dict = field(default_factory=dict)  # [contracts.<Name>] config block
     hooks: "hook_reentrancy.HookPlan | None" = None  # Preset 04 plan when the target calls out to hooks
+    transient: "transient_storage.TransientPlan | None" = None  # Preset 05 plan when the target uses tstore
 
     @property
     def name(self) -> str:
@@ -291,8 +296,10 @@ def build_targets(blueprint: dict, only: set[str] | None, config: dict | None = 
             log.info("skip %s: plain ERC-20 token (mint/burn only); add it to [targets] include to fuzz it", c["name"])
             continue
         if t.flows:
-            t.hooks = hook_reentrancy.analyze(c["name"], functions, t.flows, linearize(c["name"], index, contract=c) or [c],
-                                              blueprint["contracts"])
+            lineage = linearize(c["name"], index, contract=c) or [c]
+            t.hooks = hook_reentrancy.analyze(c["name"], functions, t.flows, lineage, blueprint["contracts"])
+            if t.settings.get("transient", True) is not False:
+                t.transient = transient_storage.analyze(c["name"], lineage, t.settings)
             for w in t.warnings:
                 log.warning("%s: %s", c["name"], w)
             targets.append(t)
@@ -459,6 +466,7 @@ class SetupPlan:
     notes: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     hook_params: int = 0  # constructor / initializer parameters wired to the hook probe
+    harness: dict | None = None  # Preset 05: {"name", "params", "args", "payable", "symbols"}
 
 
 def _plan_args(params: list[dict], plan: SetupPlan, overrides: list[str] | None, where: str,
@@ -512,7 +520,40 @@ def plan_setup(t: Target) -> SetupPlan:
     if t.hooks:
         plan.notes.extend(hook_reentrancy.wiring_notes(t.hooks, plan.hook_params, t.flows))
         plan.notes.extend(t.hooks.notes)
+    if t.transient:
+        plan.notes.extend(t.transient.notes)
+        if t.transient.slots:
+            plan.harness = plan_harness(t)
     return plan
+
+
+# typeIdentifier prefixes of user-defined types; their names are imported from the target's own file.
+USER_TYPE_IDS = ("t_contract$_", "t_enum$_", "t_userDefinedValueType$_", "t_struct$_")
+
+
+def plan_harness(t: Target) -> dict:
+    """Preset 05: the constructor of ``<Contract>TransientHarness``, forwarding the target's own.
+
+    Parameter types are written as solc reports them. User-defined types (``IERC20``, ``Lib.Kind``) are
+    imported from the file that declares the target, where they are already in scope.
+    """
+    ctor = t.contract.get("constructor")
+    params, args, symbols = [], [], []
+    for i, p in enumerate(ctor["params"] if ctor else []):
+        name = f"{sol_ident(p['name'].strip('_')) or 'arg'}{i}"
+        ptype, tid = p["type"], p.get("type_id") or ""
+        if tid.startswith("t_address_payable") and ptype == "address":
+            ptype = "address payable"
+        base = re.sub(r"(\[\d*\])+$", "", ptype)
+        if tid.startswith(USER_TYPE_IDS) or (USER_TYPE_RE.match(base.split(".")[0]) and not is_elementary(base)):
+            sym = base.split(".")[0]
+            if sym != t.name and sym not in symbols:
+                symbols.append(sym)
+        dynamic = ptype in ("string", "bytes") or ptype.endswith("]") or tid.startswith("t_struct$_")
+        params.append(f"{ptype}{' memory' if dynamic else ''} {name}")
+        args.append(name)
+    return {"name": transient_storage.harness_name(t.name), "params": params, "args": args,
+            "payable": bool(ctor and ctor.get("mutability") == "payable"), "symbols": symbols}
 
 
 # --------------------------------------------------------------------------- #
@@ -659,6 +700,8 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
     reward_tokens = [tk for tk in plan.tokens if tk.role == "reward"]
     meta = {"preview_checks": False, "units": set(), "directions": set(), "actors": actors}
     hooks = t.hooks
+    harness = plan.harness
+    seq_wrappers: list[tuple[str, list[str]]] = []  # (handler function, its parameter declarations)
 
     for fn in t.flows:
         hname = handler_fn_name(fn, used)
@@ -717,6 +760,10 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
             body.append("uint256[] memory rewardBefore_ = _rewardBalances(actor);")
             on_success.append("_recordRewards(actor, rewardBefore_);")
 
+        if harness:
+            on_success.append("_transientCheck();")
+        seq_wrappers.append((hname, decls))
+
         on_revert = [f"ghost_reverts[{_q(hname)}]++;"]
         if hooks:
             if fn["signature"] in hooks.guarded_flows:
@@ -767,8 +814,18 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
     probe = hook_reentrancy.probe_name(c["name"]) if hooks else None
     hook_helpers = hook_reentrancy.render_handler_helpers(c["name"]) if hooks else ""
     probe_src = hook_reentrancy.render_probe(c["name"], hooks) if hooks else ""
+    hook_syms = [sym for sym, _ in (hooks.imports if hooks else []) if sym != c["name"]]
     probe_imports = "".join(f'import {{ {sym} }} from "{import_path(dest or Path("."), root or Path("."), f)}";\n'
                             for sym, f in (hooks.imports if hooks else []) if sym != c["name"]) if hooks else ""
+    target_syms = [c["name"]] + [s for s in (harness["symbols"] if harness else []) if s not in hook_syms]
+    transient_state = transient_helpers = harness_src = slot_init = ""
+    if harness:
+        selectors.append("transientSequence")
+        transient_state = transient_storage.render_handler_state(c["name"], t.transient)
+        slot_init = transient_storage.render_slot_init(t.transient)
+        transient_helpers = (transient_storage.render_sequence(seq_wrappers) + "\n"
+                             + transient_storage.render_handler_helpers(c["name"], t.transient))
+        harness_src = transient_storage.render_harness(c["name"], harness["params"], harness["args"], harness["payable"])
     if hooks:
         ctor_sig = f"{c['name']} _target, address[] memory _tokens, address[] memory _rewardTokens, address[] memory _probes"
         actor_loop = "_probes.length"
@@ -793,7 +850,7 @@ pragma solidity {pragma_for(c)};
 
 import {{ CommonBase }} from "forge-std/Base.sol";
 import {{ StdUtils }} from "forge-std/StdUtils.sol";
-import {{ {c['name']} }} from "{import_rel}";
+import {{ {', '.join(target_syms)} }} from "{import_rel}";
 import {{ FoundryGuardMockERC20, IFoundryGuardERC20 }} from "{support_rel}";
 {probe_imports}
 /// @title {c['name']}GuardHandler
@@ -823,7 +880,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     uint256 public ghost_successfulFlows;
     /// Actions skipped because the actor had nothing to take out.
     uint256 public ghost_skipped;
-{erc_ghosts}{probes_decl}
+{erc_ghosts}{probes_decl}{transient_state}
     /// @param _tokens every mock token the target uses: each actor gets INITIAL_BALANCE and approves the target.
     /// @param _rewardTokens the subset paid out as rewards (balance deltas feed ghost_rewardsPaid).{actor_doc}
     constructor({ctor_sig}) {{
@@ -839,7 +896,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
                 FoundryGuardMockERC20(_tokens[j]).approve(address(_target), type(uint256).max);
             }}
         }}
-{units_init}
+{units_init}{slot_init}
     }}
 
     function actorCount() external view returns (uint256) {{
@@ -851,7 +908,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     }}
 
 {chr(10).join(chr(10).join([w, '']) for w in wrappers).rstrip()}
-
+{transient_helpers.rstrip(chr(10)) + chr(10) if harness else ''}
     /// @notice Advances time so time-weighted rewards and lock expiries are exercised.
     function warp(uint256 dtSeed) external {{
         vm.warp(block.timestamp + bound(dtSeed, 1, 7 days));
@@ -862,7 +919,7 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
         return actors[bound(seed, 0, actors.length - 1)];
     }}
 {reward_helpers}{hook_helpers}}}
-{probe_src}"""
+{probe_src}{harness_src}"""
     return src, selectors + ["warp"], meta
 
 
@@ -893,11 +950,15 @@ def render_invariant(t: Target, plan: SetupPlan, import_rel: str, support_rel: s
     for note in plan.notes:
         lines.append(f"// FOUNDRYGUARD: {note}")
 
+    deployed = plan.harness["name"] if plan.harness else name
+    if plan.harness:
+        lines.append(f"// Preset 05: {deployed} is {name} plus a view that reads its transient storage.")
+
     def deploy_expr(args: list[tuple[str, str]]) -> str:
         if not args:
-            return f"address(new {name}())"
+            return f"address(new {deployed}())"
         return ("_deploy(abi.encodePacked(\n"
-                f"            type({name}).creationCode,\n"
+                f"            type({deployed}).creationCode,\n"
                 "            abi.encode(\n"
                 f"{_encode_args(args, '                ')}\n"
                 "            )\n"
@@ -1031,6 +1092,10 @@ def render_invariant(t: Target, plan: SetupPlan, import_rel: str, support_rel: s
     for fname, doc, body in (hook_reentrancy.invariants(name, hooks) if hooks else []):
         add(fname, doc, body)
 
+    if plan.harness:
+        for fname, doc, body in transient_storage.invariants(name, t.transient):
+            add(fname, doc, body)
+
     for tk in rewards:
         add(f"invariant_rewardsBoundedByFunding_{tk.var}",
             f"/// @notice Actors never receive more {tk.var} than was funded.",
@@ -1079,7 +1144,7 @@ pragma solidity {pragma_for(c)};
 
 import {{ Test }} from "forge-std/Test.sol";
 import {{ {name} }} from "{import_rel}";
-import {{ {hname}{', ' + probe if hooks else ''} }} from "./Handler.sol";
+import {{ {', '.join([hname] + ([probe] if hooks else []) + ([plan.harness['name']] if plan.harness else []))} }} from "./Handler.sol";
 import {{ {', '.join(support_syms)} }} from "{support_rel}";
 
 /// @title {name}GuardInvariantTest
@@ -1159,6 +1224,7 @@ def inject(blueprint: dict, root: Path, out_dir: Path, only: set[str] | None, ac
             "upgradeable": plan.init_fn is not None,
             "erc4626": t.is_erc4626,
             "hooks": t.hooks.summary() if t.hooks else None,
+            "transient": t.transient.summary() if t.transient else None,
             "support": support_status,
         }
         if plan.blockers:

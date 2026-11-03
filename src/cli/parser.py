@@ -18,6 +18,10 @@ its nodes:
 * function bodies are walked for external hook callbacks (Uniswap v4
   ``beforeSwap`` / ``afterSwap``, ``unlockCallback`` on ``msg.sender``,
   ``*Callback``, ``onFlashLoan``) for Preset 04 (``blueprints/hook_reentrancy.py``).
+* function and modifier bodies are walked for ``InlineAssembly`` blocks, and the
+  Yul inside them for ``tstore`` / ``tload`` calls (``YulFunctionCall`` nodes),
+  with the slot resolved through ``externalReferences`` to the Solidity constant
+  it names, for Preset 05 (``blueprints/transient_storage.py``).
 
 Every public / external state-changing function is then classified into the
 value-flow categories FoundryGuard writes invariants for: ``deposit``,
@@ -54,16 +58,16 @@ from typing import Iterable
 
 if __package__:
     from . import compiler
-    from .blueprints import hook_reentrancy
+    from .blueprints import hook_reentrancy, transient_storage
     from .compiler import Diagnostic, SolidityError
 else:  # executed as a plain script directory (python3 src/cli/parser.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import compiler  # type: ignore
-    from blueprints import hook_reentrancy  # type: ignore
+    from blueprints import hook_reentrancy, transient_storage  # type: ignore
     from compiler import Diagnostic, SolidityError  # type: ignore
 
 SCHEMA = "foundryguard.blueprint/v2"
-TOOL_VERSION = "0.4.0"
+TOOL_VERSION = "0.5.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -165,6 +169,7 @@ class Contract:
     external: bool = False
     test_helper: bool = False
     hooks: dict = field(default_factory=dict)  # {"callbacks": [...], "call_sites": [...]} when it calls hooks
+    transient: dict = field(default_factory=dict)  # tstore / tload ops in its inline assembly (Preset 05)
     fqn: str = ""  # "<file>:<Name>", unique in the project
     abstract: bool = False
     origin: str = "project"  # project | openzeppelin | solady | solmate | forge-std | uniswap | dependency ...
@@ -498,6 +503,17 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
     def fqn(unit_name: str, node: dict) -> str:
         return f"{unit_name}:{node['name']}"
 
+    # (group, node id) -> constant VariableDeclaration, file level or in a contract. Inline assembly can only
+    # name constants that are plain numbers, so these are enough to resolve tstore / tload slots.
+    constants: dict[tuple[str, int], dict] = {}
+    for name, unit in units.items():
+        group = result.groups.get(name, "")
+        for node in unit["nodes"]:
+            members = node.get("nodes", []) if node.get("nodeType") == "ContractDefinition" else [node]
+            for m in members:
+                if isinstance(m, dict) and m.get("nodeType") == "VariableDeclaration" and m.get("constant"):
+                    constants[(group, m["id"])] = m
+
     # Emit targets and the units they reach through imports (dependencies stay context, not targets).
     targets = sorted(n for n in units if _is_target_path(n, paths, root))
     by_path = {n: n for n in units}
@@ -546,8 +562,20 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
                 origin=origin_of(name, external), bases=bases, linearized_bases=lineage, interfaces=interfaces,
                 fully_implemented=bool(node.get("fullyImplemented", True)),
             )
+            def lookup(decl_id, _g=group):
+                return constants.get((_g, decl_id))
+
+            def resolve(decl_id, _lookup=lookup):
+                return transient_storage.constant_value(_lookup(decl_id), _lookup)
+
+            transient_ops: list[dict] = []
             for member in node["nodes"]:
                 nt = member.get("nodeType")
+                if nt in ("FunctionDefinition", "ModifierDefinition") and member.get("body"):
+                    kind = "modifier" if nt == "ModifierDefinition" else (member.get("kind") or "function")
+                    site = f"{kind} {member.get('name') or kind}"
+                    transient_ops += transient_storage.scan(member["body"], resolve, site,
+                                                            lambda src, _s=source: _line(_s, src))
                 if nt == "FunctionDefinition":
                     fn = _function(member, source, rules)
                     if fn.kind == "constructor":
@@ -563,6 +591,7 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
                     if var["visibility"] == "public" and var["name"] in ACCOUNTING_GETTERS:
                         c.accounting_getters.append(var["name"])
             c.accounting_getters = sorted(set(c.accounting_getters))
+            c.transient = transient_storage.summarize(transient_ops)
             contracts.append(c)
     return contracts
 
@@ -672,6 +701,7 @@ def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts
         "withdraw_functions": sum(len(c.categories.get("withdraw", [])) for c in targets),
         "stake_lock_functions": sum(len(c.categories.get("stake_lock", [])) for c in targets),
         "hook_contracts": sum(1 for c in targets if c.hooks),
+        "transient_contracts": sum(1 for c in targets if c.transient),
     }
     warnings = [d.as_dict() for d in result.diagnostics if d.file in target_files]
     return {

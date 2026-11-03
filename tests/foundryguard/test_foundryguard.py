@@ -22,16 +22,18 @@ import injector  # noqa: E402
 import parser as fg_parser  # noqa: E402
 import reporter  # noqa: E402
 import reporting  # noqa: E402
-from blueprints import hook_reentrancy  # noqa: E402
+from blueprints import hook_reentrancy, transient_storage  # noqa: E402
 
 logging.disable(logging.CRITICAL)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FIXTURE = FIXTURES / "project"
 HOOKS_FIXTURE = FIXTURES / "hooks"
+TRANSIENT_FIXTURE = FIXTURES / "transient"
 LIBS_FIXTURE = FIXTURES / "libs"
 AST_OUTPUT = FIXTURES / "ast" / "solc-output.json"
 HOOKS_AST_OUTPUT = FIXTURES / "ast" / "hooks-solc-output.json"
+TRANSIENT_AST_OUTPUT = FIXTURES / "ast" / "transient-solc-output.json"
 FORGE_STDOUT = FIXTURES / "forge" / "leaky-stdout.txt"
 FORGE_JSON = FIXTURES / "forge" / "leaky-results.json"
 FORGE1_STDOUT = FIXTURES / "forge" / "hooks-stdout-forge1.txt"
@@ -590,6 +592,133 @@ class HookPresetTests(ProjectCase):
         bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
         injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
         self.assertNotIn("HookProbe", (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text())
+
+
+LOCK_SLOT = "0xb5b3158153d0aaada99ce72b624e94e7a176c6db390b7f301526554778835892"
+ENTRY_SLOT = "0x42921539d5967844d1f3f10ed40f47d09e34318dd2aa14b0efc78898cdbcf2ba"
+
+
+class TransientPresetTests(ProjectCase):
+    fixture = TRANSIENT_FIXTURE
+    ast_fixture = TRANSIENT_AST_OUTPUT
+
+    def test_detects_tstore_and_tload_in_functions_and_modifiers(self):
+        bp = self.scan()
+        cs = contracts(bp)
+        tr = cs["TransientStaking"]["transient"]
+        self.assertEqual(tr["tstore_slots"], sorted([LOCK_SLOT, ENTRY_SLOT]))
+        self.assertEqual(tr["tload_slots"], sorted([LOCK_SLOT, ENTRY_SLOT]))
+        self.assertEqual(tr["sites"], ["function _accrue", "function _endEntry", "function stake", "modifier nonReentrant"])
+        self.assertEqual(tr["dynamic"], [])
+        lock = [o for o in tr["ops"] if o["site"] == "modifier nonReentrant"]
+        self.assertEqual([(o["op"], o["slot"], o["expr"]) for o in lock],
+                         [("tload", LOCK_SLOT, "LOCK_SLOT"), ("tstore", LOCK_SLOT, "LOCK_SLOT"), ("tstore", LOCK_SLOT, "LOCK_SLOT")])
+        self.assertTrue(all(o["line"] > 0 for o in tr["ops"]))
+        # The leaky child writes nothing itself; its parent's slots reach it through the lineage.
+        self.assertEqual(cs["LeakyTransientStaking"]["transient"], {})
+        self.assertEqual(bp["summary"]["transient_contracts"], 1)
+
+    def test_fixed_and_leaky_get_the_between_calls_check(self):
+        report = {r["contract"]: r for r in self.gen(self.scan())}
+        for name in ("TransientStaking", "LeakyTransientStaking"):
+            r = report[name]
+            self.assertIn("invariant_transient_slotsClearedBetweenCalls", r["invariants"])
+            self.assertEqual(r["transient"]["slots"], sorted([LOCK_SLOT, ENTRY_SLOT]))
+            self.assertEqual(r["setup_notes"], [])
+        handler = self.read("LeakyTransientStaking", "Handler.sol")
+        self.assertIn("contract LeakyTransientStakingTransientHarness is LeakyTransientStaking {", handler)
+        self.assertIn("constructor(IERC20Minimal token0) LeakyTransientStaking(token0) { }", handler)
+        self.assertIn('import { LeakyTransientStaking, IERC20Minimal } from "../../../src/TransientStaking.sol";', handler)
+        self.assertIn(f"transientSlots.push({LOCK_SLOT});", handler)
+        self.assertIn("function transientSequence(uint256 seed) external {", handler)
+        self.assertIn("try this.stake(_seed(s, 0), _seed(s, 1)) { } catch { }", handler)
+        self.assertIn("try this.claimPoints(_seed(s, 0)) { } catch { }", handler)
+        # The check runs after every successful flow, inside the same transaction.
+        self.assertEqual(handler.count("_transientCheck();"), 3)
+        inv = self.read("LeakyTransientStaking", "Invariant.t.sol")
+        self.assertIn("type(LeakyTransientStakingTransientHarness).creationCode", inv)
+        self.assertIn("LeakyTransientStakingGuardHandler.transientSequence.selector", inv)
+        self.assertIn("LeakyTransientStakingTransientHarness } from \"./Handler.sol\";", inv)
+        self.assertIn("assertEq(handler.ghost_transientLeaks(), 0,", inv)
+
+    def test_config_ignores_extends_or_disables_slots(self):
+        cfg = {"contracts": {"TransientStaking": {"transient_ignore": [ENTRY_SLOT], "transient_slots": ["0x01"]},
+                             "LeakyTransientStaking": {"transient": False}}}
+        report = {r["contract"]: r for r in self.gen(self.scan(), config=cfg)}
+        self.assertEqual(report["TransientStaking"]["transient"]["slots"], ["0x" + "0" * 63 + "1", LOCK_SLOT])
+        self.assertEqual(report["TransientStaking"]["transient"]["ignored"], [ENTRY_SLOT])
+        self.assertIsNone(report["LeakyTransientStaking"]["transient"])
+        self.assertNotIn("invariant_transient_slotsClearedBetweenCalls", report["LeakyTransientStaking"]["invariants"])
+        self.assertNotIn("TransientHarness", self.read("LeakyTransientStaking", "Handler.sol"))
+
+    def test_slot_folding_and_parsing(self):
+        self.assertEqual(transient_storage.parse_number("0x1_0"), 16)
+        self.assertEqual(transient_storage.parse_number("1e18"), 10 ** 18)
+        self.assertEqual(transient_storage.parse_number("2.5e1"), 25)
+        self.assertIsNone(transient_storage.parse_number("\"abc\""))
+        lit = lambda v: {"nodeType": "YulLiteral", "kind": "number", "value": v}
+        call = lambda f, *a: {"nodeType": "YulFunctionCall", "functionName": {"name": f}, "arguments": list(a)}
+        scope = transient_storage._Scope({}, lambda _id: None)
+        self.assertEqual(transient_storage._eval(call("add", lit("0x10"), lit("1")), scope), 17)
+        self.assertEqual(transient_storage._eval(call("sub", lit("0"), lit("1")), scope), (1 << 256) - 1)
+        self.assertIsNone(transient_storage._eval(call("add", lit("1"), call("caller")), scope))
+        self.assertEqual(transient_storage.yul_text(call("add", lit("1"), call("caller"))), "add(1, caller())")
+
+    @needs_solc
+    def test_slot_resolution_patterns(self):
+        (self.root / "src" / "Slots.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.24;
+            uint256 constant FILE_SLOT = 0xaa;
+            contract Base {
+                uint256 internal constant BASE = 0x100;
+                uint256 internal constant DERIVED = BASE;
+                uint256 internal constant ONE_ETHER = 1 ether;
+            }
+            contract Slots is Base {
+                function run(uint256 a, bool flag) external {
+                    assembly {
+                        tstore(FILE_SLOT, a)
+                        let s := 0x99
+                        tstore(s, a)
+                        tstore(add(BASE, 1), a)
+                        tstore(DERIVED, a)
+                        tstore(ONE_ETHER, a)
+                        tstore(add(BASE, caller()), a)
+                        let t := 0x77
+                        if flag { t := a }
+                        tstore(t, 1)
+                        function clear(slot) { tstore(slot, 0) }
+                        clear(0x55)
+                    }
+                }
+            }
+            contract ReadOnly {
+                function peek() external view returns (uint256 v) {
+                    assembly { v := tload(0x1) }
+                }
+            }
+        """)
+        cs = contracts(self.compile(paths=["src/Slots.sol"]))
+        tr = cs["Slots"]["transient"]
+        hexes = lambda *vals: sorted(transient_storage.slot_hex(v) for v in vals)
+        self.assertEqual(tr["tstore_slots"], hexes(0xaa, 0x99, 0x101, 0x100, 10 ** 18))
+        self.assertEqual(tr["dynamic"], ["tstore(add(BASE, caller())) in function run", "tstore(slot) in function run",
+                                         "tstore(t) in function run"])
+        self.assertEqual(cs["ReadOnly"]["transient"]["tload_slots"], hexes(1))
+        self.assertIsNone(transient_storage.analyze("ReadOnly", [cs["ReadOnly"]]))
+        plan = transient_storage.analyze("Slots", [cs["Slots"], cs["Base"]])
+        self.assertEqual(len(plan.slots), 5)
+        self.assertIn("transient_slots", plan.notes[0])
+
+    def test_projects_without_transient_storage_are_unchanged(self):
+        root = self.tmp / "plain"
+        shutil.copytree(FIXTURE, root)
+        bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
+        report = injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
+        self.assertTrue(all(r["transient"] is None for r in report))
+        handler = (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text()
+        self.assertNotIn("transient", handler.lower())
 
 
 class ReporterTests(unittest.TestCase):
