@@ -75,7 +75,7 @@ def _scan(args) -> dict:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(payload)
     s = blueprint["summary"]
-    print(f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{blueprint['backend']}] "
+    print(f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{parser.describe_backend(blueprint)}] "
           f"deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}",
           file=sys.stderr)
     return blueprint

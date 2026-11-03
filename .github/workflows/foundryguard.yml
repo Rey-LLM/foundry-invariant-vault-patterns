@@ -12,11 +12,24 @@ jobs:
     strategy:
       matrix:
         python: ["3.9", "3.13"]
+    env:
+      # The parser needs a compiler; with these set, compile tests fail instead of being skipped.
+      FOUNDRYGUARD_REQUIRE_SOLC: "1"
+      FOUNDRYGUARD_REQUIRE_LIBS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install solc 0.8.24
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL -o "$HOME/.local/bin/solc" https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+          chmod +x "$HOME/.local/bin/solc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: solc --version
+      - name: Install OpenZeppelin and Solady for the lineage fixture
+        run: npm install --prefix tests/foundryguard/fixtures/libs --no-audit --no-fund --no-package-lock
       - run: pip install .
       - run: python -m unittest discover -s tests/foundryguard -v
 
@@ -36,8 +49,8 @@ jobs:
         run: |
           forge install foundry-rs/forge-std --no-git
           forge install OpenZeppelin/openzeppelin-contracts@v5.0.2 --no-git
-      - name: Generate suites (AST backend)
-        run: python3 ../../../../src/cli/foundryguard.py run --backend ast --report-md "$GITHUB_STEP_SUMMARY"
+      - name: Generate suites (solc AST through forge build)
+        run: python3 ../../../../src/cli/foundryguard.py run --compiler forge --report-md "$GITHUB_STEP_SUMMARY"
       - name: Compile generated suites
         run: forge build
       - name: Run generated invariants
@@ -62,7 +75,7 @@ jobs:
           python-version: "3.13"
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge install foundry-rs/forge-std --no-git
-      - run: python3 ../../../../src/cli/foundryguard.py run --backend ast
+      - run: python3 ../../../../src/cli/foundryguard.py run
       - name: The planted bug must be reported
         run: |
           forge test --match-path "test/foundryguard/*" -vv || true
@@ -100,7 +113,7 @@ jobs:
           python-version: "3.13"
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge install foundry-rs/forge-std --no-git
-      - run: python3 ../../../../src/cli/foundryguard.py run --backend ast
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge
       - run: forge build
       - name: HookedVault must fail, GuardedHookVault and UnlockPool must pass
         run: |
@@ -125,3 +138,74 @@ jobs:
           PY
       - if: always()
         run: cat FoundryGuard_Report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  patterns:
+    name: AST parser maps the repo patterns (ERC-4626, TWAP, Staking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install solc 0.8.24
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL -o "$HOME/.local/bin/solc" https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+          chmod +x "$HOME/.local/bin/solc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Solidity dependencies
+        run: |
+          forge install foundry-rs/forge-std --no-git
+          forge install OpenZeppelin/openzeppelin-contracts@v5.0.2 --no-git
+      - name: Scan and generate with the native solc driver
+        run: python3 src/cli/foundryguard.py run --compiler solc -o foundryguard.json
+      - name: Every pattern is mapped from the AST
+        run: |
+          python3 - <<'PY'
+          import json
+          bp = json.load(open("foundryguard.json"))
+          assert bp["compiler"]["driver"] == "solc", bp["compiler"]
+          cs = {c["name"]: c for c in bp["contracts"] if not c["external"]}
+          vault = cs["MockERC4626"]
+          assert [f.split(":")[1] for f in vault["linearized_bases"][:3]] == ["MockERC4626", "ERC4626", "IERC4626"], vault["linearized_bases"]
+          assert "IERC4626" in vault["interfaces"]
+          assert cs["FloorWithdrawERC4626"]["linearized_bases"][1] == "src/erc4626-inflation/MockERC4626.sol:MockERC4626"
+          assert cs["StakingPool"]["categories"] == {"stake_lock": ["stake(uint256)", "unstake(uint256)", "claim()"]}
+          oracle = {f["name"]: f for f in cs["PriceOracleModel"]["functions"]}
+          assert oracle["updatePrice"]["mutability"] == "nonpayable" and oracle["consult"]["mutability"] == "view"
+          assert oracle["_checkBounds"]["mutability"] == "pure"
+          assert cs["Handler"]["test_helper"], "src/erc4626-inflation/Handler.sol imports forge-std"
+          print("mapped:", sorted(cs))
+          PY
+      - name: Generated and hand-written suites compile together
+        run: forge build
+
+  libraries:
+    name: OpenZeppelin and Solady parents from the AST
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/foundryguard/fixtures/libs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: npm install --no-audit --no-fund --no-package-lock
+      - run: forge install foundry-rs/forge-std --no-git
+      - run: python3 ../../../../src/cli/foundryguard.py run --compiler forge -o foundryguard.json
+      - name: Lineage resolved by fqn through forge's AST
+        run: |
+          python3 - <<'PY'
+          import json
+          bp = json.load(open("foundryguard.json"))
+          cs = {c["name"]: c for c in bp["contracts"] if not c["external"]}
+          assert cs["SoladyShare"]["bases"][0]["fqn"].endswith("solady/src/tokens/ERC20.sol:ERC20"), cs["SoladyShare"]["bases"]
+          assert cs["OZShare"]["bases"][0]["fqn"].endswith("openzeppelin/contracts/token/ERC20/ERC20.sol:ERC20"), cs["OZShare"]["bases"]
+          assert [f.split(":")[1] for f in cs["SoladyVault"]["linearized_bases"]] == ["SoladyVault", "Ownable", "ERC4626", "ERC20"]
+          print("ok")
+          PY
+      - name: Generated suites compile
+        run: forge build

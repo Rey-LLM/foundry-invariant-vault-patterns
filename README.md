@@ -19,7 +19,7 @@ src/
   erc4626-inflation/   module 01
   twap-validation/     module 02
   flashloan-reward/    module 03
-  cli/                 FoundryGuard (foundryguard.py, parser.py, ast_backend.py, injector.py, reporter.py, reporting.py)
+  cli/                 FoundryGuard (foundryguard.py, compiler.py, parser.py, injector.py, reporter.py, reporting.py)
     blueprints/        invariant presets (hook_reentrancy.py)
 test/                  module tests
 tests/foundryguard/    FoundryGuard unit tests and fixtures
@@ -43,7 +43,7 @@ To reuse a pattern, copy the closest handler and test, point the handler at your
 
 ## FoundryGuard
 
-FoundryGuard reads your Solidity, finds the functions that move value, and writes a `Handler.sol` and an `Invariant.t.sol` per contract. The generated `setUp` deploys and funds what it needs. It needs Python 3.9+ (3.9 and 3.10 also need `tomli`, which `pip install .` installs).
+FoundryGuard compiles your Solidity, finds the functions that move value in the compiler's AST, and writes a `Handler.sol` and an `Invariant.t.sol` per contract. The generated `setUp` deploys and funds what it needs. It needs Python 3.9+ (3.9 and 3.10 also need `tomli`, which `pip install .` installs) and a Solidity compiler: solc, solcjs or Foundry.
 
 ```sh
 pipx install git+https://github.com/Rey-LLM/foundry-invariant-vault-patterns.git
@@ -63,7 +63,21 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 
 ### Scanning
 
-The default backend reads the solc AST from `forge build --ast` (or existing Foundry, Hardhat or `solc --standard-json` output). Without a compiler it falls back to a regex parser that follows imports and remappings. Library contracts are only used to resolve inheritance. If a parent contract is missing, FoundryGuard warns instead of silently dropping its functions.
+The scan never reads Solidity text. It asks solc for the compact JSON AST and works on the nodes, so formatting, comments, overloads and imports are resolved by the compiler.
+
+Compiler drivers (`--compiler`, default `auto`, tried in this order):
+
+| Driver | Where it comes from |
+| :-- | :-- |
+| `solc` | `--solc PATH` or `$FOUNDRYGUARD_SOLC`, the Foundry (svm) and solc-select caches, `solc` on `PATH` |
+| `solcjs` | `npm install -g solc` |
+| `forge` | `forge build --ast --build-info` |
+
+The solc drivers use Standard JSON with the remappings from `remappings.txt`, `foundry.toml` and `forge remappings`, and `node_modules` as an include path, so Foundry and Hardhat layouts both work. They compile twice: a parse-only pass first, so a syntax error or a missing import stops the scan at once with `file:line:col`, then the full analysis for the typed AST. Any compiler error stops the scan. The version pinned in `foundry.toml` (`solc_version`) is used first; otherwise the newest installed compiler that accepts the pragmas.
+
+`--ast PATH` reads an AST built elsewhere (forge `out/`, a build-info file, or Standard JSON output), and `--save-ast PATH` keeps the one FoundryGuard compiled. Before the walk the tree is validated: a node that lacks a field the parser needs, a legacy (pre-compact) AST or an AST without type analysis is rejected with the node path.
+
+From the AST the blueprint (`foundryguard.blueprint/v2`) records, per contract: the solc C3 linearization by fully qualified name (`src/Vault.sol:Vault`), so parents from OpenZeppelin, Solady or Solmate are matched by declaration, not by name, and two different `ERC20` parents stay apart; the interfaces in the lineage; where each dependency comes from; every function with its exact `stateMutability`, modifiers, overrides and selector, and every parameter with its canonical type, `typeIdentifier` and data location; and every state variable with its visibility, constant or immutable flag and, for public ones, the getter solc generates (mapping keys become parameters). The injector uses the lineage to collect inherited functions and still reads v1 blueprints.
 
 Functions are classified by name:
 
@@ -145,7 +159,7 @@ Settings live in the config, so regenerating with `--force` keeps them.
     sarif_file: foundryguard.sarif
 ```
 
-Broken invariants show up as code-scanning alerts on the failing `invariant_*` function. This repo's own workflow runs the Python tests on 3.9 and 3.13 and fuzzes the fixture projects with forge. Run the tests locally with `python3 -m unittest discover -s tests/foundryguard -v`.
+Broken invariants show up as code-scanning alerts on the failing `invariant_*` function. This repo's own workflow runs the Python tests on 3.9 and 3.13 with solc 0.8.24, fuzzes the fixture projects with forge, maps this repo's three modules, and resolves OpenZeppelin and Solady parents through both the solc and forge drivers. Run the tests locally with `python3 -m unittest discover -s tests/foundryguard -v`. Tests that compile are skipped when no solc or solcjs is installed; the OpenZeppelin/Solady ones also need `npm install` in `tests/foundryguard/fixtures/libs`.
 
 ### Limitations
 

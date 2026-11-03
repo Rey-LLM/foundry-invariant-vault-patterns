@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""FoundryGuard parser: scan Solidity sources and emit a structural JSON blueprint.
+"""FoundryGuard parser: compile the project with solc and map its AST into a JSON blueprint.
 
-The parser walks standard Foundry/Hardhat source directories, strips comments,
-splits every file into its contract / abstract contract / interface / library
-blocks, and extracts each function signature (parameters, visibility, state
-mutability, modifiers and return values). Every function is then classified
-against the value-flow categories FoundryGuard generates invariants for:
+Nothing here reads Solidity text. ``compiler.py`` asks solc (native, solcjs or
+through forge) for the compact JSON AST; this module validates the tree and walks
+its nodes:
 
-* ``deposit``   - value entering the system (deposit, mint, supply, ...)
-* ``withdraw``  - value leaving the system (withdraw, redeem, exit, ...)
-* ``stake_lock`` - staking and time-lock flows (stake, unstake, lock, claim, ...)
+* ``ContractDefinition``: kind, abstract flag, direct bases and the full C3
+  linearization (``linearizedBaseContracts``), resolved by node id to the exact
+  declaration, so a parent from OpenZeppelin, Solady or Solmate is known by file
+  and origin, not guessed from its name. Interfaces in the lineage are listed.
+* ``FunctionDefinition``: kind, visibility, ``stateMutability`` exactly as solc
+  reports it, modifiers, virtual / override (with the overridden bases), selector,
+  and every parameter with its canonical type, ``typeIdentifier`` and data location.
+* ``VariableDeclaration`` (state variables): type, visibility, constant / immutable,
+  and for public ones the getter solc generates (mapping keys and array indexes
+  become parameters), with its selector.
+* function bodies are walked for external hook callbacks (Uniswap v4
+  ``beforeSwap`` / ``afterSwap``, ``unlockCallback`` on ``msg.sender``,
+  ``*Callback``, ``onFlashLoan``) for Preset 04 (``blueprints/hook_reentrancy.py``).
 
-Function bodies are also scanned for external hook callbacks (Uniswap v4 ``beforeSwap`` /
-``afterSwap`` style hooks, ``unlockCallback`` on ``msg.sender``, ``*Callback``, ``onFlashLoan``); a
-contract that makes them is flagged with ``hooks`` so the injector adds the Preset 04
-read-reentrancy checks (``blueprints/hook_reentrancy.py``).
+Every public / external state-changing function is then classified into the
+value-flow categories FoundryGuard writes invariants for: ``deposit``,
+``withdraw`` and ``stake_lock`` (stake, unstake, lock, claim ...).
 
-Imports are followed (using ``foundry.toml`` / ``remappings.txt`` remappings) so
-that functions inherited from parent contracts in libraries such as
-OpenZeppelin can be resolved by the injector, without making those library
-contracts test targets themselves.
+Before the walk, ``validate_unit`` checks the tree: a node that misses a field
+the walker relies on, a legacy (pre compact) AST, or an AST produced without type
+analysis stops the scan with the node path. Compiler errors (syntax, missing
+imports, type errors) stop it earlier, in ``compiler.py``.
 
 Usage::
 
-    python3 src/cli/parser.py                     # scan ./src (or ./contracts)
-    python3 src/cli/parser.py src contracts -o foundryguard.json
-    python3 src/cli/parser.py --root path/to/project --no-follow-imports
+    python3 src/cli/parser.py                         # compile ./src (or ./contracts)
+    python3 src/cli/parser.py src -o foundryguard.json
+    python3 src/cli/parser.py --solc /usr/bin/solc    # pick the compiler
+    python3 src/cli/parser.py --ast out/              # read an AST built elsewhere (forge build --ast)
 
-The output is a deterministic JSON document (``schema: foundryguard.blueprint/v1``)
+The output is a deterministic JSON document (``schema: foundryguard.blueprint/v2``)
 consumed by ``injector.py``.
 """
 
@@ -38,19 +46,24 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 if __package__:
+    from . import compiler
     from .blueprints import hook_reentrancy
+    from .compiler import Diagnostic, SolidityError
 else:  # executed as a plain script directory (python3 src/cli/parser.py)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import compiler  # type: ignore
     from blueprints import hook_reentrancy  # type: ignore
+    from compiler import Diagnostic, SolidityError  # type: ignore
 
-SCHEMA = "foundryguard.blueprint/v1"
-TOOL_VERSION = "0.3.0"
+SCHEMA = "foundryguard.blueprint/v2"
+TOOL_VERSION = "0.4.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -60,7 +73,7 @@ DEFAULT_SOURCE_DIRS = ("src", "contracts")
 EXCLUDED_DIRS = {"lib", "node_modules", "out", "cache", "artifacts", "broadcast", ".git", "test", "tests", "script"}
 
 # --------------------------------------------------------------------------- #
-# Classification rules
+# Classification rules (function names; the syntax itself comes from the AST)
 # --------------------------------------------------------------------------- #
 
 # (category, direction, compiled name pattern). Order matters: first match wins,
@@ -83,10 +96,18 @@ ACCOUNTING_GETTERS = {
     "balanceOf", "stakedOf", "lockedOf", "sharesOf", "earned",
 }
 
-VISIBILITIES = {"public", "external", "internal", "private"}
-MUTABILITIES = {"pure", "view", "payable", "nonpayable"}
-DATA_LOCATIONS = {"memory", "storage", "calldata"}
-HEADER_KEYWORDS = VISIBILITIES | MUTABILITIES | {"virtual"}
+# Where a dependency comes from, by a segment of its source unit path.
+ORIGINS = (
+    ("openzeppelin-contracts-upgradeable", "openzeppelin-upgradeable"),
+    ("@openzeppelin/contracts-upgradeable", "openzeppelin-upgradeable"),
+    ("openzeppelin", "openzeppelin"),
+    ("solady", "solady"),
+    ("solmate", "solmate"),
+    ("forge-std", "forge-std"),
+    ("v4-core", "uniswap-v4"),
+    ("v4-periphery", "uniswap-v4"),
+    ("uniswap", "uniswap"),
+)
 
 # --------------------------------------------------------------------------- #
 # Data model
@@ -98,6 +119,7 @@ class Param:
     type: str
     name: str
     location: str | None = None
+    type_id: str | None = None  # solc typeIdentifier, e.g. t_uint256, t_contract$_IERC20_$29
 
     @property
     def canonical(self) -> str:
@@ -112,12 +134,14 @@ class Function:
     params: list[Param]
     returns: list[Param]
     visibility: str
-    mutability: str
+    mutability: str  # pure | view | nonpayable | payable, from the AST
     modifiers: list[str]
     virtual: bool
     override: bool
     has_body: bool
     line: int
+    selector: str | None = None  # 4-byte selector solc computed (public / external only)
+    overrides: list[str] = field(default_factory=list)  # bases named in override(A, B)
     category: str | None = None
     direction: str | None = None
     amount_param: str | None = None
@@ -132,15 +156,22 @@ class Contract:
     file: str
     line: int
     pragma: str | None
-    inherits: list[str]
+    inherits: list[str]  # direct bases, in declaration order
     functions: list[Function] = field(default_factory=list)
     constructor: Function | None = None
     accounting_getters: list[str] = field(default_factory=list)
-    state_vars: list[dict] = field(default_factory=list)  # public state variables: {name, type}
+    state_vars: list[dict] = field(default_factory=list)  # {name, type, type_id, visibility, mutability, getter}
     categories: dict[str, list[str]] = field(default_factory=dict)
     external: bool = False
     test_helper: bool = False
     hooks: dict = field(default_factory=dict)  # {"callbacks": [...], "call_sites": [...]} when it calls hooks
+    fqn: str = ""  # "<file>:<Name>", unique in the project
+    abstract: bool = False
+    origin: str = "project"  # project | openzeppelin | solady | solmate | forge-std | uniswap | dependency ...
+    bases: list[dict] = field(default_factory=list)  # direct bases {name, fqn}
+    linearized_bases: list[str] = field(default_factory=list)  # C3 order (self first), as fqns
+    interfaces: list[str] = field(default_factory=list)  # interface names anywhere in the lineage
+    fully_implemented: bool = True
 
     @property
     def is_deployable(self) -> bool:
@@ -148,192 +179,147 @@ class Contract:
 
 
 # --------------------------------------------------------------------------- #
-# Lexing helpers
+# AST validation
 # --------------------------------------------------------------------------- #
 
-
-def strip_comments(source: str) -> str:
-    """Remove // and /* */ comments while keeping string literals and line numbers intact."""
-    out: list[str] = []
-    i, n = 0, len(source)
-    while i < n:
-        c = source[i]
-        nxt = source[i + 1] if i + 1 < n else ""
-        if c in "\"'":
-            # Copy the string literal verbatim, honouring escapes.
-            j = i + 1
-            while j < n and source[j] != c:
-                j += 2 if source[j] == "\\" else 1
-            out.append(source[i : j + 1])
-            i = j + 1
-        elif c == "/" and nxt == "/":
-            j = source.find("\n", i)
-            i = n if j == -1 else j
-        elif c == "/" and nxt == "*":
-            j = source.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            # Preserve newlines so reported line numbers stay accurate.
-            out.append("\n" * source.count("\n", i, j))
-            i = j
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
+# Fields the walker reads, per node type. A node without them is malformed.
+NODE_FIELDS: dict[str, tuple[str, ...]] = {
+    "SourceUnit": ("id", "absolutePath", "nodes"),
+    "PragmaDirective": ("literals",),
+    "ImportDirective": ("file", "absolutePath"),
+    "ContractDefinition": ("id", "name", "contractKind", "baseContracts", "linearizedBaseContracts", "nodes", "src"),
+    "InheritanceSpecifier": ("baseName",),
+    "FunctionDefinition": ("id", "kind", "name", "parameters", "returnParameters", "stateMutability",
+                           "visibility", "implemented", "modifiers", "src"),
+    "ModifierInvocation": ("modifierName",),
+    "ParameterList": ("parameters",),
+    "VariableDeclaration": ("name", "typeDescriptions", "src"),
+}
 
 
-def mask_strings(text: str) -> str:
-    """Blank out string-literal contents (keeping the quotes) so structural regexes ignore them."""
-    out: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c:
-                j += 2 if text[j] == "\\" else 1
-            inner = text[i + 1 : min(j, n)]
-            out.append(c + re.sub(r"[^\n]", " ", inner) + (c if j < n else ""))
-            i = j + 1
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
+class ASTValidationError(SolidityError):
+    pass
 
 
-def match_bracket(text: str, start: int, open_ch: str = "(", close_ch: str = ")") -> int:
-    """Return the index of the bracket closing the one at ``start`` (skipping strings)."""
-    depth = 0
-    i, n = start, len(text)
-    while i < n:
-        c = text[i]
-        if c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c:
-                j += 2 if text[j] == "\\" else 1
-            i = j + 1
+def _check_src(src, path: str, problems: list[str]) -> None:
+    parts = src.split(":") if isinstance(src, str) else []
+    if len(parts) != 3 or not all(p.lstrip("-").isdigit() for p in parts):
+        problems.append(f"{path}: bad src {src!r} (expected start:length:file)")
+
+
+def validate_unit(unit: dict, name: str = "") -> None:
+    """Raise ``ASTValidationError`` if the SourceUnit cannot be trusted for the walk."""
+    problems: list[str] = []
+    label = name or str(unit.get("absolutePath") or "<unit>")
+    if not isinstance(unit, dict) or unit.get("nodeType") != "SourceUnit":
+        if isinstance(unit, dict) and unit.get("name") == "SourceUnit":
+            raise ASTValidationError(f"{label}: legacy solc AST (`--ast-json`, solc < 0.8)",
+                                     hint="produce the compact AST: `solc --ast-compact-json` or Standard JSON")
+        raise ASTValidationError(f"{label}: not a SourceUnit node")
+
+    def need(node: dict, path: str) -> bool:
+        nt = node.get("nodeType")
+        missing = [k for k in NODE_FIELDS.get(nt, ()) if k not in node]
+        if missing:
+            problems.append(f"{path}: {nt} without {', '.join(missing)}")
+            return False
+        if "src" in node:
+            _check_src(node["src"], path, problems)
+        return True
+
+    def var(node: dict, path: str) -> None:
+        if not isinstance(node, dict) or node.get("nodeType") != "VariableDeclaration":
+            problems.append(f"{path}: expected VariableDeclaration, got {node.get('nodeType') if isinstance(node, dict) else type(node).__name__}")
+            return
+        if need(node, path) and not (node.get("typeDescriptions") or {}).get("typeString"):
+            problems.append(f"{path}: no typeDescriptions.typeString (AST produced without type analysis)")
+
+    def plist(node, path: str) -> None:
+        if not isinstance(node, dict) or node.get("nodeType") != "ParameterList":
+            problems.append(f"{path}: expected ParameterList")
+            return
+        if need(node, path):
+            for i, p in enumerate(node["parameters"]):
+                var(p, f"{path}.parameters[{i}]")
+
+    need(unit, label)
+    for i, node in enumerate(unit.get("nodes") or []):
+        if not isinstance(node, dict) or "nodeType" not in node:
+            problems.append(f"{label}.nodes[{i}]: not an AST node")
             continue
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    raise ValueError(f"unbalanced '{open_ch}' at offset {start}")
+        nt = node["nodeType"]
+        path = f"{label}.nodes[{i}]<{nt}{(' ' + str(node.get('name'))) if node.get('name') else ''}>"
+        if nt in ("PragmaDirective", "ImportDirective"):
+            need(node, path)
+        elif nt == "ContractDefinition":
+            if not need(node, path):
+                continue
+            for j, base in enumerate(node["baseContracts"]):
+                if need(base, f"{path}.baseContracts[{j}]") and "referencedDeclaration" not in (base["baseName"] or {}):
+                    problems.append(f"{path}.baseContracts[{j}]: base without referencedDeclaration (unresolved)")
+            for j, member in enumerate(node["nodes"]):
+                mt = member.get("nodeType") if isinstance(member, dict) else None
+                mpath = f"{path}.nodes[{j}]<{mt} {member.get('name', '') if isinstance(member, dict) else ''}>"
+                if mt == "FunctionDefinition":
+                    if need(member, mpath):
+                        plist(member["parameters"], f"{mpath}.parameters")
+                        plist(member["returnParameters"], f"{mpath}.returnParameters")
+                        for k, m in enumerate(member["modifiers"]):
+                            need(m, f"{mpath}.modifiers[{k}]")
+                elif mt == "VariableDeclaration":
+                    var(member, mpath)
+                elif mt is None:
+                    problems.append(f"{mpath}: not an AST node")
+        if len(problems) > 20:
+            break
+    if problems:
+        raise ASTValidationError(f"{label}: {len(problems)} invalid AST node(s)",
+                                 [Diagnostic("error", "ASTValidationError", p, file=label) for p in problems[:20]])
 
 
-def split_top_level(text: str, sep: str = ",") -> list[str]:
-    """Split on ``sep`` ignoring separators nested inside (), [] or {}."""
-    parts, depth, cur = [], 0, []
-    for c in text:
-        if c in "([{":
-            depth += 1
-        elif c in ")]}":
-            depth -= 1
-        if c == sep and depth == 0:
-            parts.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(c)
-    tail = "".join(cur).strip()
-    if tail:
-        parts.append(tail)
-    return parts
+# --------------------------------------------------------------------------- #
+# Node helpers
+# --------------------------------------------------------------------------- #
+
+_DROP_WORDS = {"memory", "calldata", "storage", "pointer", "ref", "slice",
+               "contract", "struct", "enum", "library", "interface"}
 
 
-def line_of(text: str, offset: int) -> int:
-    return text.count("\n", 0, offset) + 1
-
-
-def normalize_type(raw: str) -> str:
-    """Canonicalise elementary type aliases (uint -> uint256, etc.)."""
-    t = re.sub(r"\s+", " ", raw.strip())
-    t = re.sub(r"\baddress payable\b", "address", t)
-    t = re.sub(r"\buint\b(?!\d)", "uint256", t)
-    t = re.sub(r"\bint\b(?!\d)", "int256", t)
-    t = re.sub(r"\bbyte\b", "bytes1", t)
-    return t.replace(" [", "[")
-
-
-def parse_params(text: str) -> list[Param]:
-    params: list[Param] = []
-    for idx, chunk in enumerate(split_top_level(text)):
-        if not chunk:
+def normalize_type(type_string: str) -> str:
+    """solc typeString -> the type as written in a signature (``contract IERC20`` -> ``IERC20``)."""
+    words = [w for w in type_string.replace("(", "( ").replace(")", " )").split() if w not in _DROP_WORDS]
+    out: list[str] = []
+    for w in words:
+        if w == "payable" and out and out[-1] == "address":
             continue
-        chunk = re.sub(r"\baddress\s+payable\b", "address", chunk)
-        tokens = chunk.split()
-        location = None
-        name = ""
-        if tokens and tokens[-1] not in DATA_LOCATIONS and len(tokens) > 1 and re.fullmatch(r"[A-Za-z_$][\w$]*", tokens[-1]):
-            name = tokens.pop()
-        if tokens and tokens[-1] in DATA_LOCATIONS:
-            location = tokens.pop()
-        tokens = [t for t in tokens if t not in {"indexed"}]
-        ptype = normalize_type(" ".join(tokens))
-        params.append(Param(type=ptype, name=name or f"arg{idx}", location=location))
-    return params
+        out.append(w)
+    return " ".join(out).replace("( ", "(").replace(" )", ")")
 
 
-# --------------------------------------------------------------------------- #
-# Extraction
-# --------------------------------------------------------------------------- #
-
-PRAGMA_RE = re.compile(r"pragma\s+solidity\s+([^;]+);")
-IMPORT_RE = re.compile(r"""import\s+(?:[^'"]*?\bfrom\s+)?["']([^"']+)["']\s*;""")
-CONTRACT_RE = re.compile(r"\b(abstract\s+contract|contract|interface|library)\s+([A-Za-z_$][\w$]*)\s*(?:is\s+([^{]+))?\{")
-FUNC_RE = re.compile(r"\b(function\s+([A-Za-z_$][\w$]*)|constructor|fallback|receive)\s*\(")
+def ast_type(node: dict) -> str:
+    return normalize_type((node.get("typeDescriptions") or {}).get("typeString") or "")
 
 
-def parse_inheritance(text: str | None) -> list[str]:
-    if not text:
-        return []
-    parents = []
-    for chunk in split_top_level(text):
-        m = re.match(r"([A-Za-z_$][\w$.]*)", chunk.strip())
-        if m:
-            parents.append(m.group(1).split(".")[-1])
-    return parents
+def _line(source: bytes | None, src: str) -> int:
+    if not source or not src:
+        return 0
+    start = int(src.split(":")[0])
+    return source[:start].count(b"\n") + 1 if start >= 0 else 0
 
 
-def parse_header(header: str, kind: str, in_interface: bool) -> dict:
-    """Parse the text between a function's parameter list and its body/semicolon."""
-    returns: list[Param] = []
-    m = re.search(r"\breturns\s*\(", header)
-    if m:
-        open_idx = m.end() - 1
-        close_idx = match_bracket(header, open_idx)
-        returns = parse_params(header[open_idx + 1 : close_idx])
-        header = header[: m.start()] + " " + header[close_idx + 1 :]
+def _params(node: dict | None) -> list[Param]:
+    out = []
+    for i, p in enumerate((node or {}).get("parameters", [])):
+        loc = p.get("storageLocation")
+        out.append(Param(type=ast_type(p), name=p.get("name") or f"arg{i}",
+                         location=loc if loc in ("memory", "calldata", "storage") else None,
+                         type_id=(p.get("typeDescriptions") or {}).get("typeIdentifier")))
+    return out
 
-    override = bool(re.search(r"\boverride\b", header))
-    header = re.sub(r"\boverride\s*(\([^)]*\))?", " ", header)
 
-    visibility = None
-    mutability = "nonpayable"
-    virtual = False
-    modifiers: list[str] = []
-    for tok in re.finditer(r"([A-Za-z_$][\w$.]*)\s*(\((?:[^()]|\([^()]*\))*\))?", header):
-        word = tok.group(1)
-        if word in VISIBILITIES:
-            visibility = word
-        elif word in MUTABILITIES:
-            mutability = word
-        elif word == "virtual":
-            virtual = True
-        else:
-            modifiers.append(word)
-
-    if visibility is None:
-        if kind in {"fallback", "receive"} or in_interface:
-            visibility = "external"
-        elif kind == "constructor":
-            visibility = "public"
-        else:
-            visibility = "public"  # pre-0.5 default; modern solc requires it explicitly
-    if kind == "receive":
-        mutability = "payable"
-    return dict(returns=returns, visibility=visibility, mutability=mutability,
-                virtual=virtual, override=override, modifiers=modifiers)
+def _ref_name(node: dict | None) -> str:
+    node = node or {}
+    return (node.get("name") or node.get("namePath") or "").split(".")[-1]
 
 
 def build_rules(config: dict | None) -> tuple[tuple[str, str, re.Pattern[str]], ...]:
@@ -368,6 +354,10 @@ def build_rules(config: dict | None) -> tuple[tuple[str, str, re.Pattern[str]], 
     return tuple(rules) + CLASSIFICATION_RULES
 
 
+def _is_uint(p: Param) -> bool:
+    return (p.type_id or "").startswith("t_uint") or (p.type.startswith("uint") and p.type[4:].isdigit()) or p.type == "uint"
+
+
 def classify(fn: Function, rules: tuple[tuple[str, str, re.Pattern[str]], ...] = CLASSIFICATION_RULES) -> None:
     """Attach category/direction/amount metadata for value-flow functions."""
     if fn.kind != "function" or fn.visibility not in {"public", "external"} or fn.mutability in {"view", "pure"}:
@@ -382,122 +372,199 @@ def classify(fn: Function, rules: tuple[tuple[str, str, re.Pattern[str]], ...] =
             break
     else:
         return
-    for p in fn.params:
-        if re.fullmatch(r"uint\d*", p.type) and AMOUNT_PARAM.match(p.name):
-            fn.amount_param = p.name
-            break
-    else:
-        uints = [p for p in fn.params if re.fullmatch(r"uint\d*", p.type)]
-        if len(uints) == 1:
-            fn.amount_param = uints[0].name
+    uints = [p for p in fn.params if _is_uint(p)]
+    named = next((p for p in uints if AMOUNT_PARAM.match(p.name)), None)
+    if named:
+        fn.amount_param = named.name
+    elif len(uints) == 1:
+        fn.amount_param = uints[0].name
     if fn.amount_param:
         fn.unit = "shares" if SHARE_PARAM.search(fn.amount_param) else "assets"
     elif fn.mutability == "payable" and fn.direction == "in":
         fn.amount_param, fn.unit = "msg.value", "native"
 
 
-def extract_contracts(source: str, rel_path: str, rules=CLASSIFICATION_RULES) -> tuple[list[Contract], list[str]]:
-    stripped = strip_comments(source)
-    imports = IMPORT_RE.findall(stripped)
-    text = mask_strings(stripped)
-    pragma_m = PRAGMA_RE.search(text)
-    pragma = pragma_m.group(1).strip() if pragma_m else None
-    # Files that import forge-std are fixtures/handlers living under src/, not protocol code.
-    test_helper = any(i.startswith(("forge-std/", "ds-test/")) for i in imports)
+# --------------------------------------------------------------------------- #
+# Walk
+# --------------------------------------------------------------------------- #
+
+
+def _function(node: dict, source: bytes | None, rules) -> Function:
+    kind = node["kind"]
+    name = node.get("name") or kind
+    params = _params(node["parameters"])
+    mods = [_ref_name(m.get("modifierName")) for m in node["modifiers"]
+            if m.get("kind", "modifierInvocation") == "modifierInvocation"]
+    overrides = node.get("overrides")
+    fn = Function(
+        name=name, kind=kind, signature=f"{name}({','.join(p.type for p in params)})", params=params,
+        returns=_params(node["returnParameters"]), visibility=node["visibility"],
+        mutability=node["stateMutability"], modifiers=[m for m in mods if m],
+        virtual=bool(node.get("virtual")), override=overrides is not None,
+        has_body=bool(node["implemented"]), line=_line(source, node["src"]),
+        selector=node.get("functionSelector"),
+        overrides=[_ref_name(o) for o in (overrides or {}).get("overrides", [])],
+        callbacks=hook_reentrancy.detect_callbacks_ast(node.get("body")),
+    )
+    classify(fn, rules)
+    return fn
+
+
+def _getter(var: dict) -> dict:
+    """The external getter solc generates for a public state variable."""
+    params: list[str] = []
+    t = var.get("typeName")
+    while isinstance(t, dict) and t.get("nodeType") in ("Mapping", "ArrayTypeName"):
+        if t["nodeType"] == "Mapping":
+            params.append(ast_type(t["keyType"]))
+            t = t["valueType"]
+        else:
+            params.append("uint256")
+            t = t["baseType"]
+    ret = ast_type(t) if isinstance(t, dict) else ast_type(var)
+    name = var["name"]
+    return {"signature": f"{name}({','.join(params)})", "selector": var.get("functionSelector"),
+            "params": params, "returns": [ret]}
+
+
+def _state_var(var: dict) -> dict:
+    mutability = var.get("mutability") or ("constant" if var.get("constant") else "mutable")
+    out = {"name": var["name"], "type": ast_type(var),
+           "type_id": (var.get("typeDescriptions") or {}).get("typeIdentifier"),
+           "visibility": var.get("visibility", "internal"), "mutability": mutability}
+    if out["visibility"] == "public":
+        out["getter"] = _getter(var)
+    return out
+
+
+def _pragma(unit: dict) -> str | None:
+    for node in unit.get("nodes", []):
+        if node.get("nodeType") == "PragmaDirective" and node["literals"][:1] == ["solidity"]:
+            text = ""
+            for t in node["literals"][1:]:
+                if t[:1] in "^~<>=|" and text and text[-1] not in "^~<>=| ":
+                    text += " "
+                text += t
+            return text
+    return None
+
+
+def _is_target_path(path: str, paths: list[str], root: Path) -> bool:
+    if path.endswith((".t.sol", ".s.sol")):
+        return False
+    bases = list(paths) or [d for d in DEFAULT_SOURCE_DIRS if (root / d).is_dir()]
+    for b in bases:
+        b = b.rstrip("/")
+        if path == b or path.startswith(b + "/"):
+            inner = Path(path[len(b) + 1:]).parts[:-1] if path != b else ()
+            return not any(part in EXCLUDED_DIRS for part in inner)
+    return False
+
+
+def origin_of(path: str, external: bool) -> str:
+    if not external:
+        return "project"
+    low = path.lower()
+    for key, label in ORIGINS:
+        if key in low:
+            return label
+    return "dependency" if low.startswith(("lib/", "node_modules/", "@")) else "project"
+
+
+def _imports_test_lib(unit: dict) -> bool:
+    for node in unit.get("nodes", []):
+        if node.get("nodeType") == "ImportDirective":
+            for p in (node.get("file", ""), node.get("absolutePath", "")):
+                if p.startswith(("forge-std/", "ds-test/")) or "/forge-std/" in p or "/ds-test/" in p:
+                    return True
+    return False
+
+
+def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list[str],
+                       rules=CLASSIFICATION_RULES) -> list[Contract]:
+    """Walk validated SourceUnits into ``Contract`` records (targets plus everything they import)."""
+    units = result.units
+    for name, unit in units.items():
+        validate_unit(unit, name)
+
+    # (group, node id) -> (unit name, ContractDefinition); ids are only unique within one compile job.
+    index: dict[tuple[str, int], tuple[str, dict]] = {}
+    for name, unit in units.items():
+        group = result.groups.get(name, "")
+        for node in unit["nodes"]:
+            if node.get("nodeType") == "ContractDefinition":
+                index[(group, node["id"])] = (name, node)
+
+    def fqn(unit_name: str, node: dict) -> str:
+        return f"{unit_name}:{node['name']}"
+
+    # Emit targets and the units they reach through imports (dependencies stay context, not targets).
+    targets = sorted(n for n in units if _is_target_path(n, paths, root))
+    by_path = {n: n for n in units}
+    keep: set[str] = set()
+    queue = list(targets)
+    while queue:
+        n = queue.pop()
+        if n in keep:
+            continue
+        keep.add(n)
+        for node in units[n]["nodes"]:
+            if node.get("nodeType") == "ImportDirective" and node["absolutePath"] in by_path:
+                queue.append(node["absolutePath"])
 
     contracts: list[Contract] = []
-    for m in CONTRACT_RE.finditer(text):
-        kind = re.sub(r"\s+", " ", m.group(1))
-        body_open = m.end() - 1
-        try:
-            body_close = match_bracket(text, body_open, "{", "}")
-        except ValueError:
-            log.warning("%s: unbalanced braces in %s, skipping", rel_path, m.group(2))
-            continue
-        contract = Contract(
-            name=m.group(2), kind=kind, file=rel_path, line=line_of(text, m.start()),
-            pragma=pragma, inherits=parse_inheritance(m.group(3)), test_helper=test_helper,
-        )
-        body = text[body_open + 1 : body_close]
-        body_offset = body_open + 1
-        pos = 0
-        while True:
-            fm = FUNC_RE.search(body, pos)
-            if not fm:
-                break
-            if fm.group(2):
-                fkind, fname = "function", fm.group(2)
-            else:
-                fkind = fm.group(1)
-                fname = fkind
-            p_open = fm.end() - 1
-            try:
-                p_close = match_bracket(body, p_open)
-            except ValueError:
-                log.warning("%s: cannot parse parameters of %s.%s, skipping", rel_path, contract.name, fname)
-                pos = fm.end()
+    for name in sorted(keep):
+        unit = units[name]
+        group = result.groups.get(name, "")
+        source = compiler.read_source(root, name)
+        pragma = _pragma(unit)
+        external = not _is_target_path(name, paths, root)
+        test_helper = _imports_test_lib(unit)
+        for node in unit["nodes"]:
+            if node.get("nodeType") != "ContractDefinition":
                 continue
-            params = parse_params(body[p_open + 1 : p_close])
-            # Header runs to the first top-level '{' or ';'.
-            j, depth = p_close + 1, 0
-            while j < len(body):
-                ch = body[j]
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                elif depth == 0 and ch in "{;":
-                    break
-                j += 1
-            header = parse_header(body[p_close + 1 : j], fkind, kind == "interface")
-            has_body = j < len(body) and body[j] == "{"
-            signature = f"{fname}({','.join(p.type for p in params)})"
-            fn = Function(
-                name=fname, kind=fkind, signature=signature, params=params,
-                line=line_of(text, body_offset + fm.start()), has_body=has_body, **header,
+            ck = node["contractKind"]
+            lineage: list[str] = []
+            interfaces: list[str] = []
+            for base_id in node["linearizedBaseContracts"]:
+                hit = index.get((group, base_id))
+                if hit is None:
+                    raise ASTValidationError(f"{name}: {node['name']} inherits node {base_id}, which is not in the AST",
+                                             hint="the AST is incomplete; rebuild it with every source of the project")
+                lineage.append(fqn(*hit))
+                if hit[1]["contractKind"] == "interface" and hit[1] is not node:
+                    interfaces.append(hit[1]["name"])
+            bases = []
+            for b in node["baseContracts"]:
+                hit = index.get((group, b["baseName"]["referencedDeclaration"]))
+                bases.append({"name": hit[1]["name"] if hit else _ref_name(b["baseName"]),
+                              "fqn": fqn(*hit) if hit else None})
+            c = Contract(
+                name=node["name"], kind="abstract contract" if (ck == "contract" and node.get("abstract")) else ck,
+                file=name, line=_line(source, node["src"]), pragma=pragma, inherits=[b["name"] for b in bases],
+                external=external, test_helper=test_helper, fqn=fqn(name, node), abstract=bool(node.get("abstract")),
+                origin=origin_of(name, external), bases=bases, linearized_bases=lineage, interfaces=interfaces,
+                fully_implemented=bool(node.get("fullyImplemented", True)),
             )
-            classify(fn, rules)
-            if fkind == "constructor":
-                contract.constructor = fn
-            else:
-                contract.functions.append(fn)
-            try:
-                body_end = match_bracket(body, j, "{", "}") if has_body else j
-            except ValueError:
-                log.warning("%s: unbalanced body in %s.%s", rel_path, contract.name, fname)
-                break
-            if has_body:
-                fn.callbacks = hook_reentrancy.detect_callbacks(body[j + 1 : body_end])
-            pos = body_end + 1
-
-        # Public state variables expose implicit getters (e.g. `uint256 public totalStaked`).
-        for vm_ in re.finditer(
-            r"^\s*(mapping\s*\(.+?\)|[A-Za-z_$][\w$.\[\]]*)\s+(?:(?:public|immutable|constant|override)\s+)*public\s+(?:(?:immutable|constant|override)\s+)*([A-Za-z_$][\w$]*)\s*[;=]",
-            _strip_nested_blocks(body), re.M,
-        ):
-            contract.state_vars.append({"name": vm_.group(2), "type": normalize_type(vm_.group(1))})
-            if vm_.group(2) in ACCOUNTING_GETTERS:
-                contract.accounting_getters.append(vm_.group(2))
-        for fn in contract.functions:
-            if fn.name in ACCOUNTING_GETTERS and fn.mutability in {"view", "pure"} and fn.visibility in {"public", "external"}:
-                contract.accounting_getters.append(fn.name)
-        contract.accounting_getters = sorted(set(contract.accounting_getters))
-        contracts.append(contract)
-    return contracts, imports
-
-
-def _strip_nested_blocks(body: str) -> str:
-    """Return the contract body with every nested {...} block blanked out."""
-    out, depth = [], 0
-    for c in body:
-        if c == "{":
-            depth += 1
-            continue
-        if c == "}":
-            depth -= 1
-            continue
-        out.append(c if depth == 0 else ("\n" if c == "\n" else " "))
-    return "".join(out)
+            for member in node["nodes"]:
+                nt = member.get("nodeType")
+                if nt == "FunctionDefinition":
+                    fn = _function(member, source, rules)
+                    if fn.kind == "constructor":
+                        c.constructor = fn
+                    else:
+                        c.functions.append(fn)
+                        if (fn.name in ACCOUNTING_GETTERS and fn.mutability in ("view", "pure")
+                                and fn.visibility in ("public", "external")):
+                            c.accounting_getters.append(fn.name)
+                elif nt == "VariableDeclaration" and member.get("stateVariable", True):
+                    var = _state_var(member)
+                    c.state_vars.append(var)
+                    if var["visibility"] == "public" and var["name"] in ACCOUNTING_GETTERS:
+                        c.accounting_getters.append(var["name"])
+            c.accounting_getters = sorted(set(c.accounting_getters))
+            contracts.append(c)
+    return contracts
 
 
 # --------------------------------------------------------------------------- #
@@ -505,45 +572,8 @@ def _strip_nested_blocks(body: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def load_remappings(root: Path) -> list[tuple[str, str]]:
-    """Read remappings from remappings.txt and foundry.toml ([profile.default])."""
-    remaps: list[tuple[str, str]] = []
-    txt = root / "remappings.txt"
-    if txt.is_file():
-        for line in txt.read_text().splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = line.split("=", 1)
-                remaps.append((k.split(":")[-1], v))
-    toml = root / "foundry.toml"
-    if toml.is_file():
-        m = re.search(r"remappings\s*=\s*\[(.*?)\]", toml.read_text(), re.S)
-        if m:
-            for entry in re.findall(r"""["']([^"']+)["']""", m.group(1)):
-                if "=" in entry:
-                    k, v = entry.split("=", 1)
-                    remaps.append((k.split(":")[-1], v))
-    # Longest prefix first, as solc does.
-    return sorted(remaps, key=lambda kv: len(kv[0]), reverse=True)
-
-
-def resolve_import(root: Path, importer: Path, path: str, remaps: list[tuple[str, str]]) -> Path | None:
-    if path.startswith("."):
-        cand = (importer.parent / path).resolve()
-        return cand if cand.is_file() else None
-    for prefix, target in remaps:
-        if path.startswith(prefix):
-            cand = (root / (target + path[len(prefix):])).resolve()
-            if cand.is_file():
-                return cand
-    for base in (root, root / "lib", root / "node_modules"):
-        cand = (base / path).resolve()
-        if cand.is_file():
-            return cand
-    return None
-
-
 def discover_sources(root: Path, paths: Iterable[str]) -> list[Path]:
+    paths = list(paths)
     targets = [root / p for p in paths] if paths else [root / d for d in DEFAULT_SOURCE_DIRS if (root / d).is_dir()]
     if not targets:
         raise SystemExit(f"foundryguard: no source directory found under {root} (looked for {', '.join(DEFAULT_SOURCE_DIRS)})")
@@ -559,6 +589,8 @@ def discover_sources(root: Path, paths: Iterable[str]) -> list[Path]:
             for f in filenames:
                 if f.endswith(".sol") and not f.endswith((".t.sol", ".s.sol")):
                     files.add((Path(dirpath) / f).resolve())
+    if not files:
+        raise SystemExit(f"foundryguard: no .sol files under {', '.join(str(t) for t in targets)}")
     return sorted(files)
 
 
@@ -569,74 +601,53 @@ def rel(root: Path, p: Path) -> str:
         return p.as_posix()
 
 
-def build_blueprint(root: Path, paths: list[str], follow_imports: bool = True, backend: str = "auto",
-                    config: dict | None = None, build_dir: str = "out", run_build: bool = True) -> dict:
-    """Scan the project and return the blueprint dict.
+def get_ast(root: Path, paths: list[str], compiler_kind: str = "auto", solc: str | None = None,
+            ast_path: str | None = None, build_dir: str = "out", run_build: bool = True) -> "compiler.CompileResult":
+    """Compile (or load) the project's AST with the requested driver."""
+    if ast_path:
+        p = Path(ast_path)
+        return compiler.read_prebuilt(p if p.is_absolute() else root / p)
+    if not run_build:
+        p = Path(build_dir)
+        return compiler.read_prebuilt(p if p.is_absolute() else root / p)
+    if compiler_kind == "forge":
+        return compiler.compile_with_forge(root, build_dir)
+    files = [rel(root, f) for f in discover_sources(root, paths)]
+    if compiler_kind in ("solc", "solcjs") or solc:
+        return compiler.compile_with_solc(root, files, compiler_kind, solc)
+    # auto: a local solc / solcjs first, forge when that is all there is.
+    found = compiler.discover_compilers("auto")
+    if found:
+        try:
+            return compiler.compile_with_solc(root, files, "auto")
+        except SolidityError as exc:
+            if not (exc.headline.startswith("no installed compiler satisfies") and shutil.which("forge")):
+                raise
+            log.info("falling back to forge build: %s", exc.headline)
+    if shutil.which("forge"):
+        return compiler.compile_with_forge(root, build_dir)
+    raise SolidityError("no Solidity compiler found",
+                        hint="install solc or Foundry, `npm install -g solc`, or pass --solc PATH / --ast PATH")
 
-    ``backend``: ``regex`` (no compiler needed), ``ast`` (solc AST from forge build output, error if
-    missing) or ``auto`` (AST when available, regex otherwise).
-    """
+
+def build_blueprint(root: Path, paths: list[str], config: dict | None = None, compiler_kind: str = "auto",
+                    solc: str | None = None, ast_path: str | None = None, build_dir: str = "out",
+                    run_build: bool = True, save_ast: str | None = None) -> dict:
+    """Compile the project and return the blueprint dict."""
     root = root.resolve()
     rules = build_rules(config)
-    if backend in ("auto", "ast"):
-        try:
-            from_ast = _ast_backend()
-        except ImportError:  # pragma: no cover - module ships with the package
-            from_ast = None
-        if from_ast is not None:
-            result = from_ast.build_from_ast(root, paths, rules=rules, build_dir=build_dir,
-                                             run_build=run_build, required=(backend == "ast"))
-            if result is not None:
-                contracts, files_scanned, unresolved = result
-                return _finish_blueprint(root, paths, load_remappings(root), contracts, files_scanned,
-                                         unresolved, "ast")
-        if backend == "ast":
-            raise SystemExit("foundryguard: --backend ast requested but no solc AST was found (run `forge build --ast`)")
-    remaps = load_remappings(root)
-    queue = [(p, False) for p in discover_sources(root, paths)]
-    seen: set[Path] = set()
-    contracts: list[Contract] = []
-    unresolved: set[str] = set()
-    files_scanned = 0
-
-    while queue:
-        path, external = queue.pop(0)
-        if path in seen:
-            continue
-        seen.add(path)
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            log.warning("cannot read %s: %s", path, exc)
-            continue
-        files_scanned += 1
-        found, imports = extract_contracts(source, rel(root, path), rules)
-        for c in found:
-            c.external = external
-        contracts.extend(found)
-        log.debug("%s: %d contract(s)", rel(root, path), len(found))
-        if follow_imports:
-            for imp in imports:
-                resolved = resolve_import(root, path, imp, remaps)
-                if resolved is None:
-                    unresolved.add(imp)
-                elif resolved not in seen:
-                    queue.append((resolved, external or not _is_under(resolved, root, paths)))
-
-    return _finish_blueprint(root, paths, remaps, contracts, files_scanned, unresolved, "regex")
+    result = get_ast(root, paths, compiler_kind, solc, ast_path, build_dir, run_build)
+    if save_ast:
+        out = Path(save_ast) if Path(save_ast).is_absolute() else root / save_ast
+        raw = result.raw or {"sources": {n: {"ast": u} for n, u in result.units.items()}}
+        out.write_text(json.dumps({"sources": raw.get("sources", {})}, sort_keys=True) + "\n")
+    contracts = contracts_from_ast(result, root, paths, rules)
+    remaps = compiler.load_remappings(root)
+    return _finish_blueprint(root, paths, remaps, contracts, result)
 
 
-def _ast_backend():
-    if __package__:
-        from . import ast_backend  # type: ignore
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import ast_backend  # type: ignore
-    return ast_backend
-
-
-def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Contract], files_scanned: int,
-                      unresolved: set[str], backend: str) -> dict:
+def _finish_blueprint(root: Path, paths: list[str], remaps: list[str], contracts: list[Contract],
+                      result: "compiler.CompileResult") -> dict:
     for c in contracts:
         cats: dict[str, list[str]] = {}
         for fn in c.functions:
@@ -650,8 +661,10 @@ def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Cont
 
     contracts.sort(key=lambda c: (c.external, c.file, c.line))
     targets = [c for c in contracts if not c.external and not c.test_helper]
+    target_files = {c.file for c in contracts if not c.external}
     summary = {
-        "files_scanned": files_scanned,
+        "files_scanned": len(target_files),
+        "source_units": len(result.units),
         "contracts": len(targets),
         "external_contracts": sum(1 for c in contracts if c.external),
         "test_helpers": sum(1 for c in contracts if c.test_helper and not c.external),
@@ -660,32 +673,31 @@ def _finish_blueprint(root: Path, paths: list[str], remaps, contracts: list[Cont
         "stake_lock_functions": sum(len(c.categories.get("stake_lock", [])) for c in targets),
         "hook_contracts": sum(1 for c in targets if c.hooks),
     }
+    warnings = [d.as_dict() for d in result.diagnostics if d.file in target_files]
     return {
         "schema": SCHEMA,
         "tool": {"name": "foundryguard", "version": TOOL_VERSION},
-        "backend": backend,
+        "backend": "ast",
+        "compiler": {"driver": result.driver, "version": result.version},
         "root": root.as_posix(),
         "source_paths": list(paths) or [d for d in DEFAULT_SOURCE_DIRS if (root / d).is_dir()],
-        "remappings": [f"{k}={v}" for k, v in remaps],
+        "remappings": remaps,
         "summary": summary,
-        "unresolved_imports": sorted(unresolved),
+        "diagnostics": warnings,
+        "unresolved_imports": [],
         "contracts": [_contract_to_dict(c) for c in contracts],
     }
-
-
-def _is_under(path: Path, root: Path, paths: list[str]) -> bool:
-    bases = [root / p for p in paths] if paths else [root / d for d in DEFAULT_SOURCE_DIRS]
-    for b in bases:
-        b = b.resolve()
-        if path == b or b in path.parents:
-            return not any(part in EXCLUDED_DIRS for part in path.relative_to(b).parts[:-1])
-    return False
 
 
 def _contract_to_dict(c: Contract) -> dict:
     d = asdict(c)
     d["deployable"] = c.is_deployable and not c.test_helper
     return d
+
+
+def describe_backend(blueprint: dict) -> str:
+    comp = blueprint.get("compiler") or {}
+    return "ast/" + " ".join(x for x in (comp.get("driver"), comp.get("version")) if x)
 
 
 # --------------------------------------------------------------------------- #
@@ -702,17 +714,7 @@ def load_config(root: Path, path: str | None = None) -> dict:
         if path:
             raise SystemExit(f"foundryguard: config not found: {cfg_path}")
         return {}
-    try:
-        import tomllib  # Python 3.11+
-    except ModuleNotFoundError:  # pragma: no cover
-        try:
-            import tomli as tomllib  # type: ignore
-        except ModuleNotFoundError:
-            raise SystemExit("foundryguard: reading foundryguard.toml needs Python 3.11+ or `pip install tomli`")
-    try:
-        return tomllib.loads(cfg_path.read_text())
-    except tomllib.TOMLDecodeError as exc:
-        raise SystemExit(f"foundryguard: {cfg_path} is not valid TOML: {exc}")
+    return compiler._toml(cfg_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -724,25 +726,32 @@ def add_scan_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("paths", nargs="*", help="source dirs or .sol files, relative to --root (default: src/ or contracts/)")
     ap.add_argument("--root", default=".", help="project root containing foundry.toml (default: .)")
     ap.add_argument("--config", help=f"config file (default: <root>/{CONFIG_FILE} if present)")
-    ap.add_argument("--backend", choices=("auto", "ast", "regex"), default="auto",
-                    help="auto: solc AST from forge build output when available, else regex (default: auto)")
+    ap.add_argument("--compiler", choices=compiler.COMPILERS, default="auto",
+                    help="auto: native solc (svm / solc-select cache, PATH), then solcjs, then forge (default: auto)")
+    ap.add_argument("--solc", help=f"solc or solcjs binary to use (also ${compiler.ENV_SOLC})")
+    ap.add_argument("--ast", dest="ast_path", help="read an existing AST instead of compiling: forge out/ dir, "
+                    "build-info file or saved Standard JSON output")
+    ap.add_argument("--save-ast", help="also write the compiler's AST (Standard JSON sources) to this file")
     ap.add_argument("--build-dir", default="out", help="forge build output dir, relative to root (default: out)")
-    ap.add_argument("--no-build", action="store_true", help="never run `forge build --ast`; only read existing output")
-    ap.add_argument("--no-follow-imports", action="store_true", help="regex backend: do not parse imported files")
+    ap.add_argument("--no-build", action="store_true", help="do not compile; read the AST from --build-dir")
+    ap.add_argument("--backend", choices=("ast", "auto", "regex"), default="ast", help=argparse.SUPPRESS)
 
 
 def scan_from_args(args: argparse.Namespace) -> dict:
+    if getattr(args, "backend", "ast") == "regex":
+        raise SystemExit("foundryguard: the regex backend was removed in 0.4; the parser reads the solc AST only")
     root = Path(args.root)
     config = load_config(root.resolve(), args.config)
     paths = args.paths or list(config.get("scan", {}).get("paths", []))
-    return build_blueprint(root, paths, follow_imports=not args.no_follow_imports, backend=args.backend,
-                           config=config, build_dir=args.build_dir, run_build=not args.no_build)
+    return build_blueprint(root, paths, config=config, compiler_kind=args.compiler, solc=args.solc,
+                           ast_path=args.ast_path, build_dir=args.build_dir, run_build=not args.no_build,
+                           save_ast=args.save_ast)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="foundryguard-parse",
-        description="Scan Solidity sources and map deposit / withdraw / staking-lock functions into a JSON blueprint.",
+        description="Compile Solidity sources and map deposit / withdraw / staking-lock functions from the solc AST.",
     )
     add_scan_args(ap)
     ap.add_argument("-o", "--output", default="foundryguard.json", help="blueprint path, or '-' for stdout (default: foundryguard.json)")
@@ -761,8 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(payload)
         s = blueprint["summary"]
         print(
-            f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{blueprint['backend']}] -> {out} "
-            f"[deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}]",
+            f"foundryguard: {s['contracts']} contract(s) in {s['files_scanned']} file(s) [{describe_backend(blueprint)}] "
+            f"-> {out} [deposit={s['deposit_functions']} withdraw={s['withdraw_functions']} stake_lock={s['stake_lock_functions']}]",
             file=sys.stderr,
         )
     return 0

@@ -5,3 +5,7 @@ cache/
 build/
 *.egg-info/
 lib/
+
+# FoundryGuard lineage fixture dependencies (npm install)
+tests/foundryguard/fixtures/libs/node_modules/
+tests/foundryguard/fixtures/libs/package-lock.json

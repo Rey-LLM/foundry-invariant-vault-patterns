@@ -12,8 +12,8 @@ its own state may be half-updated. Two things can go wrong:
 
 This module does three jobs for the parser and the injector:
 
-1. ``detect_callbacks`` / ``detect_callbacks_ast`` find hook call sites in function bodies
-   (regex backend and solc AST backend).
+1. ``detect_callbacks_ast`` finds hook call sites in solc AST function bodies (``FunctionCall`` on a
+   ``MemberAccess``, through ``IHooks(h).x`` type conversions and ``{gas: ...}`` call options).
 2. ``analyze`` decides whether a target gets the preset and how to wire it: which views to snapshot,
    which lock getter to check, which flows claim to be ``nonReentrant``, how the hook address reaches
    the contract (constructor / initializer parameter, setter, or ``msg.sender`` callbacks).
@@ -47,13 +47,6 @@ GENERIC_HOOK_NAME = re.compile(r"^(before|after)[A-Z]\w*$")
 HOOKISH = re.compile(r"hook|callback", re.I)
 NOT_RECEIVERS = {"super", "this", "abi", "msg", "block", "tx", "type", "bytes", "string"}
 
-# `IHooks(hooks).beforeSwap(`, `key.hooks.afterSwap(`, `IUnlockCallback(msg.sender).unlockCallback{gas: g}(`.
-CALL_RE = re.compile(
-    r"(?:\b(?P<cast>[A-Z]\w*)\s*\(\s*(?P<inner>[A-Za-z_]\w*(?:\s*\.\s*\w+)*)\s*\)"
-    r"|(?P<recv>\b[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*?))"
-    r"\s*\.\s*(?P<name>[A-Za-z_]\w*)\s*(?:\{[^{}]*\})?\s*\("
-)
-
 
 def is_callback_name(name: str) -> bool:
     """True for hook / callback entry points (``unlockCallback``, ``beforeSwap``, ``onFlashLoan`` ...)."""
@@ -81,17 +74,6 @@ def _dedupe(found: list[dict]) -> list[dict]:
     return out
 
 
-def detect_callbacks(body: str) -> list[dict]:
-    """Hook call sites in a comment-stripped, string-masked function body (regex backend)."""
-    found = []
-    for m in CALL_RE.finditer(body):
-        receiver = m.group("inner") if m.group("cast") else m.group("recv")
-        cb = classify_call(m.group("name"), receiver, m.group("cast"))
-        if cb:
-            found.append(cb)
-    return _dedupe(found)
-
-
 def _expr_text(node: dict | None) -> str | None:
     if not isinstance(node, dict):
         return None
@@ -105,7 +87,7 @@ def _expr_text(node: dict | None) -> str | None:
 
 
 def detect_callbacks_ast(body: dict | None) -> list[dict]:
-    """Hook call sites in a solc AST function body (AST backend)."""
+    """Hook call sites in a solc AST function body."""
     found: list[dict] = []
     stack = [body] if body else []
     while stack:
@@ -238,7 +220,7 @@ def analyze(target_name: str, functions: list[dict], flows: list[dict], lineage:
 
     state_vars = []
     for c in lineage:
-        state_vars.extend(c.get("state_vars", []))
+        state_vars.extend(v for v in c.get("state_vars", []) if v.get("visibility", "public") == "public")
 
     # Views a third party would read mid-callback.
     views: dict[str, str] = {}

@@ -21,7 +21,9 @@ def markdown_report(report: list[dict], blueprint: dict | None = None) -> str:
     out = ["# FoundryGuard report", ""]
     if blueprint:
         s = blueprint.get("summary", {})
-        out.append(f"Scanned {s.get('files_scanned', 0)} file(s) with the `{blueprint.get('backend', 'regex')}` backend: "
+        comp = blueprint.get("compiler") or {}
+        how = " ".join(x for x in (comp.get("driver"), comp.get("version")) if x) or blueprint.get("backend", "ast")
+        out.append(f"Scanned {s.get('files_scanned', 0)} file(s) from the solc AST ({how}): "
                    f"{s.get('contracts', 0)} contract(s), {s.get('deposit_functions', 0)} deposit, "
                    f"{s.get('withdraw_functions', 0)} withdraw, {s.get('stake_lock_functions', 0)} stake/lock function(s).")
         out.append("")

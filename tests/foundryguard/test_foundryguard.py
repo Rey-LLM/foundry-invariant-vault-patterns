@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src" / "cli"))
 
+import compiler  # noqa: E402
 import foundryguard  # noqa: E402
 import injector  # noqa: E402
 import parser as fg_parser  # noqa: E402
@@ -27,6 +29,7 @@ logging.disable(logging.CRITICAL)
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FIXTURE = FIXTURES / "project"
 HOOKS_FIXTURE = FIXTURES / "hooks"
+LIBS_FIXTURE = FIXTURES / "libs"
 AST_OUTPUT = FIXTURES / "ast" / "solc-output.json"
 HOOKS_AST_OUTPUT = FIXTURES / "ast" / "hooks-solc-output.json"
 FORGE_STDOUT = FIXTURES / "forge" / "leaky-stdout.txt"
@@ -34,12 +37,29 @@ FORGE_JSON = FIXTURES / "forge" / "leaky-results.json"
 FORGE1_STDOUT = FIXTURES / "forge" / "hooks-stdout-forge1.txt"
 
 
+# Tests that compile need solc or solcjs. CI sets FOUNDRYGUARD_REQUIRE_SOLC=1 so they can never be skipped there.
+REQUIRE_SOLC = os.environ.get("FOUNDRYGUARD_REQUIRE_SOLC") == "1"
+HAVE_SOLC = REQUIRE_SOLC or bool(compiler.discover_compilers())
+needs_solc = unittest.skipUnless(HAVE_SOLC, "no solc / solcjs on this machine (set FOUNDRYGUARD_REQUIRE_SOLC=1 to fail instead)")
+REQUIRE_LIBS = os.environ.get("FOUNDRYGUARD_REQUIRE_LIBS") == "1"
+HAVE_LIBS = REQUIRE_LIBS or (HAVE_SOLC and (LIBS_FIXTURE / "node_modules" / "solady").is_dir()
+                             and (LIBS_FIXTURE / "node_modules" / "@openzeppelin" / "contracts").is_dir())
+needs_libs = unittest.skipUnless(HAVE_LIBS, "run `npm install` in tests/foundryguard/fixtures/libs first")
+
+
 def contracts(blueprint: dict) -> dict[str, dict]:
     return {c["name"]: c for c in blueprint["contracts"] if not c["external"]}
 
 
+def without_ozvault(root: Path) -> Path:
+    """The committed AST fixture has no OpenZeppelin sources, so OZVault is compiled only in the forge CI job."""
+    (root / "src" / "OZVault.sol").unlink(missing_ok=True)
+    return root
+
+
 class ProjectCase(unittest.TestCase):
     fixture = FIXTURE
+    ast_fixture = AST_OUTPUT
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="foundryguard-"))
@@ -49,8 +69,13 @@ class ProjectCase(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def scan(self, backend: str = "regex", config: dict | None = None) -> dict:
-        return fg_parser.build_blueprint(self.root, [], backend=backend, config=config, run_build=False)
+    def scan(self, config: dict | None = None) -> dict:
+        """Blueprint from the committed solc AST of the fixture (no compiler needed)."""
+        return fg_parser.build_blueprint(self.root, [], config=config, ast_path=str(self.ast_fixture))
+
+    def compile(self, root: Path | None = None, paths: list[str] | None = None, **kw) -> dict:
+        """Blueprint from a fresh compile of the fixture."""
+        return fg_parser.build_blueprint(root or self.root, paths or [], **kw)
 
     def gen(self, blueprint: dict, config: dict | None = None, **kw) -> list[dict]:
         out = self.root / "test" / "foundryguard"
@@ -82,21 +107,116 @@ class ParserTests(ProjectCase):
         self.assertNotIn("unstake", flows)
         self.assertEqual(flows["getReward"], ("stake_lock", "reward"))
 
-    def test_ast_backend_matches_regex(self):
-        shutil.copy(AST_OUTPUT, self.root / "solc-output.json")
-        ast = contracts(fg_parser.build_blueprint(self.root, [], backend="ast", build_dir="solc-output.json", run_build=False))
-        rgx = contracts(self.scan())
-        rgx.pop("OZVault")  # not part of the committed AST fixture
-        self.assertEqual(sorted(ast), sorted(rgx))
-        for name in ast:
-            for key in ("kind", "inherits", "categories", "accounting_getters", "pragma", "line"):
-                self.assertEqual(ast[name][key], rgx[name][key], f"{name}.{key}")
-            self.assertEqual(sorted(f["signature"] for f in ast[name]["functions"]),
-                             sorted(f["signature"] for f in rgx[name]["functions"]), name)
+    def test_public_getters_and_state_var_details(self):
+        cs = contracts(self.scan())
+        stakedOf = next(v for v in cs["RewardStaking"]["state_vars"] if v["name"] == "stakedOf")
+        self.assertEqual(stakedOf["visibility"], "public")
+        self.assertEqual(stakedOf["getter"]["signature"], "stakedOf(address)")
+        self.assertEqual(stakedOf["getter"]["returns"], ["uint256"])
+        self.assertTrue(stakedOf["type_id"].startswith("t_mapping$_t_address_$_t_uint256"))
 
-    def test_ast_required_but_missing(self):
-        with self.assertRaises(SystemExit):
-            fg_parser.build_blueprint(self.root, [], backend="ast", build_dir="nowhere", run_build=False)
+    def test_exact_signatures_selectors_and_types(self):
+        cs = contracts(self.scan())
+        fns = {f["signature"]: f for f in cs["SimpleVault"]["functions"]}
+        self.assertEqual(fns["deposit(uint256)"]["selector"], "b6b55f25")
+        self.assertEqual(fns["withdraw(uint256)"]["selector"], "2e1a7d4d")
+        self.assertEqual(fns["deposit(uint256)"]["params"][0]["type_id"], "t_uint256")
+        self.assertEqual(fns["deposit(uint256)"]["mutability"], "nonpayable")
+        ctor = cs["SimpleVault"]["constructor"]["params"][0]
+        self.assertEqual(ctor["type"], "IERC20")
+        self.assertTrue(ctor["type_id"].startswith("t_contract$_IERC20_$"))
+        sv = cs["SimpleVault"]
+        self.assertEqual((sv["fqn"], sv["origin"], sv["linearized_bases"]),
+                         ("src/SimpleVault.sol:SimpleVault", "project", ["src/SimpleVault.sol:SimpleVault"]))
+        bp = self.scan()
+        self.assertEqual((bp["schema"], bp["backend"]), (fg_parser.SCHEMA, "ast"))
+
+    def test_prebuilt_ast_missing(self):
+        with self.assertRaises(compiler.SolidityError):
+            fg_parser.build_blueprint(self.root, [], ast_path=str(self.root / "nowhere"))
+        with self.assertRaises(compiler.SolidityError):
+            fg_parser.build_blueprint(self.root, [], build_dir="nowhere", run_build=False)
+
+    def _broken_ast(self, mutate) -> Path:
+        data = json.loads(self.ast_fixture.read_text())
+        mutate(data)
+        path = self.tmp / "broken-ast.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    @staticmethod
+    def _contract_node(data: dict, unit: str, name: str) -> dict:
+        return next(n for n in data["sources"][unit]["ast"]["nodes"]
+                    if n.get("nodeType") == "ContractDefinition" and n["name"] == name)
+
+    def test_validation_flags_malformed_nodes(self):
+        def drop_mutability(data):
+            fn = next(n for n in self._contract_node(data, "src/SimpleVault.sol", "SimpleVault")["nodes"]
+                      if n.get("nodeType") == "FunctionDefinition" and n["name"] == "deposit")
+            del fn["stateMutability"]
+
+        with self.assertRaises(fg_parser.ASTValidationError) as ctx:
+            fg_parser.build_blueprint(self.root, [], ast_path=str(self._broken_ast(drop_mutability)))
+        self.assertIn("FunctionDefinition without stateMutability", str(ctx.exception))
+        self.assertIn("SimpleVault", ctx.exception.diagnostics[0].message)
+
+        def untyped(data):
+            fn = next(n for n in self._contract_node(data, "src/SimpleVault.sol", "SimpleVault")["nodes"]
+                      if n.get("nodeType") == "FunctionDefinition" and n["name"] == "deposit")
+            fn["parameters"]["parameters"][0]["typeDescriptions"] = {}
+
+        with self.assertRaises(fg_parser.ASTValidationError) as ctx:
+            fg_parser.build_blueprint(self.root, [], ast_path=str(self._broken_ast(untyped)))
+        self.assertIn("without type analysis", str(ctx.exception))
+
+        def bad_src(data):
+            self._contract_node(data, "src/Token.sol", "Token")["src"] = "garbage"
+
+        with self.assertRaises(fg_parser.ASTValidationError) as ctx:
+            fg_parser.build_blueprint(self.root, [], ast_path=str(self._broken_ast(bad_src)))
+        self.assertIn("bad src 'garbage'", str(ctx.exception))
+
+        def dangling_base(data):
+            self._contract_node(data, "src/Token.sol", "Token")["linearizedBaseContracts"].append(999999)
+
+        with self.assertRaises(fg_parser.ASTValidationError) as ctx:
+            fg_parser.build_blueprint(self.root, [], ast_path=str(self._broken_ast(dangling_base)))
+        self.assertIn("999999", str(ctx.exception))
+
+    def test_legacy_ast_rejected(self):
+        legacy = self.tmp / "legacy.json"
+        legacy.write_text(json.dumps({"sources": {"src/A.sol": {"ast": {"name": "SourceUnit", "children": []}}}}))
+        with self.assertRaises(compiler.SolidityError) as ctx:
+            fg_parser.build_blueprint(self.root, [], ast_path=str(legacy))
+        self.assertIn("legacy solc AST", str(ctx.exception))
+
+    def test_regex_backend_removed(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            foundryguard.main(["scan", "--root", str(self.root), "--backend", "regex"])
+        self.assertIn("removed", str(ctx.exception.code))
+
+    def test_pragma_ranges(self):
+        sat = compiler.satisfies
+        self.assertTrue(sat("0.8.24", "^0.8.20"))
+        self.assertFalse(sat("0.9.0", "^0.8.20"))
+        self.assertTrue(sat("0.8.24", ">=0.8.0 <0.9.0"))
+        self.assertFalse(sat("0.8.24", ">=0.8.25"))
+        self.assertTrue(sat("0.8.24", "0.8.24"))
+        self.assertTrue(sat("0.7.6", "^0.6.0 || ^0.7.0"))
+        self.assertTrue(sat("0.8.9", "~0.8.1"))
+        self.assertTrue(sat("0.8.10", "0.8.4 - 0.8.12"))
+        self.assertEqual(compiler.parse_version("0.8.24+commit.e11b9ed9"), (0, 8, 24))
+
+    def test_remappings_keep_context_and_infer_libs(self):
+        (self.root / "remappings.txt").write_text("ctx:@x/=lib/x/\n")
+        (self.root / "lib" / "solady" / "src").mkdir(parents=True)
+        (self.root / "lib" / "openzeppelin-contracts" / "contracts").mkdir(parents=True)
+        remaps = compiler.load_remappings(self.root)
+        self.assertIn("ctx:@x/=lib/x/", remaps)
+        self.assertIn("solady/=lib/solady/src/", remaps)
+        # foundry.toml's explicit entry wins over the inferred one for the same prefix.
+        self.assertEqual([r for r in remaps if r.startswith("@openzeppelin/contracts/=")],
+                         ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"])
 
     def test_load_config(self):
         (self.root / "foundryguard.toml").write_text('[generate]\nactors = 3\n')
@@ -217,8 +337,23 @@ class InjectorTests(ProjectCase):
         (self.root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").write_text("// edited\n")
         self.assertTrue(injector.is_stale(self.gen(bp, force=True, dry_run=True)))
 
+    def test_v1_blueprint_still_generates_the_same_suites(self):
+        bp = self.scan()
+        v2 = self.gen(bp, force=True, dry_run=True)
+        self.gen(bp)
+        v1 = json.loads(json.dumps(bp))
+        v1["schema"] = "foundryguard.blueprint/v1"
+        for c in v1["contracts"]:
+            for key in ("fqn", "linearized_bases", "bases", "interfaces", "origin"):
+                c.pop(key, None)
+            for v in c["state_vars"]:
+                v.pop("getter", None)
+        again = self.gen(v1, force=True, dry_run=True)
+        self.assertFalse(injector.is_stale(again))
+        self.assertEqual([r["contract"] for r in v2], [r["contract"] for r in again])
+
     def test_cli_run_and_check(self):
-        args = ["--root", str(self.root), "--backend", "regex", "--no-build"]
+        args = ["--root", str(self.root), "--ast", str(self.ast_fixture)]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(foundryguard.main(["check", *args]), 1)  # nothing generated yet
             self.assertEqual(foundryguard.main(["run", *args, "--report-md", str(self.tmp / "r.md"),
@@ -231,6 +366,114 @@ class InjectorTests(ProjectCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(foundryguard.main(["init", "--root", str(self.root)]), 0)
         self.assertIsInstance(fg_parser.load_config(self.root), dict)
+
+
+@needs_solc
+class CompilerTests(ProjectCase):
+    """Live compiles with the local solc / solcjs (always run in CI)."""
+
+    def test_live_compile_matches_committed_ast(self):
+        for fixture, ast in ((FIXTURE, AST_OUTPUT), (HOOKS_FIXTURE, HOOKS_AST_OUTPUT)):
+            root = self.tmp / f"live-{fixture.name}"
+            shutil.copytree(fixture, root)
+            live = self.compile(without_ozvault(root))
+            committed = fg_parser.build_blueprint(root, [], ast_path=str(ast))
+            self.assertEqual(live["compiler"]["driver"] in ("solc", "solcjs"), True)
+            self.assertEqual(live["contracts"], committed["contracts"],
+                             f"{ast.name} is stale: regenerate it with `foundryguard scan --save-ast`")
+
+    def test_syntax_error_stops_in_the_parse_pass(self):
+        without_ozvault(self.root)
+        (self.root / "src" / "Broken.sol").write_text(
+            "pragma solidity ^0.8.20;\ncontract Broken {\n    function deposit(uint256 amount) external {\n"
+            "        uint256 x = amount\n    }\n}\n")
+        (self.root / "src" / "Typo.sol").write_text(
+            "pragma solidity ^0.8.20;\ncontract Typo { function f() external { undefinedThing(); } }\n")
+        with self.assertRaises(compiler.SolidityError) as ctx:
+            self.compile()
+        err = ctx.exception
+        self.assertIn("syntax error", err.headline)
+        self.assertEqual([(d.type, d.file, d.line) for d in err.diagnostics], [("ParserError", "src/Broken.sol", 5)])
+        # Once the syntax is fixed, the full analysis reports the type-level error with its position.
+        (self.root / "src" / "Broken.sol").unlink()
+        with self.assertRaises(compiler.SolidityError) as ctx:
+            self.compile()
+        self.assertEqual([(d.type, d.file, d.line) for d in ctx.exception.diagnostics],
+                         [("DeclarationError", "src/Typo.sol", 2)])
+
+    def test_missing_dependency_is_an_error_with_a_hint(self):
+        with self.assertRaises(compiler.SolidityError) as ctx:
+            self.compile()
+        err = ctx.exception
+        self.assertTrue(err.diagnostics and all(d.file == "src/OZVault.sol" for d in err.diagnostics))
+        self.assertIn("not found", err.diagnostics[0].message)
+        self.assertIn("forge install", err.hint)
+
+    def test_save_ast_round_trip(self):
+        without_ozvault(self.root)
+        saved = self.tmp / "saved.json"
+        live = self.compile(save_ast=str(saved))
+        again = fg_parser.build_blueprint(self.root, [], ast_path=str(saved))
+        self.assertEqual(live["contracts"], again["contracts"])
+        self.assertEqual(again["compiler"]["driver"], "prebuilt")
+
+    def test_explicit_compiler_must_exist(self):
+        with self.assertRaises(SystemExit):
+            self.compile(solc=str(self.tmp / "no-such-solc"))
+
+
+@needs_libs
+class LibraryLineageTests(ProjectCase):
+    """OpenZeppelin (node_modules) and Solady (remapped) parents resolved from the AST."""
+
+    fixture = LIBS_FIXTURE
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bp = self.compile()
+        self.cs = contracts(self.bp)
+
+    def test_solady_vault_lineage_and_inherited_flows(self):
+        v = self.cs["SoladyVault"]
+        self.assertEqual(v["linearized_bases"], [
+            "src/SoladyVault.sol:SoladyVault", "node_modules/solady/src/auth/Ownable.sol:Ownable",
+            "node_modules/solady/src/tokens/ERC4626.sol:ERC4626", "node_modules/solady/src/tokens/ERC20.sol:ERC20"])
+        by_fqn = {c["fqn"]: c for c in self.bp["contracts"]}
+        self.assertEqual({by_fqn[f]["origin"] for f in v["linearized_bases"][1:]}, {"solady"})
+        self.assertEqual(v["categories"], {})  # every flow is inherited
+        report = {r["contract"]: r for r in self.gen(self.bp)}["SoladyVault"]
+        self.assertEqual(sorted(report["flows"]), ["deposit:deposit(uint256,address)", "deposit:mint(uint256,address)",
+                                                   "withdraw:redeem(uint256,address,address)",
+                                                   "withdraw:withdraw(uint256,address,address)"])
+        self.assertIn("invariant_erc4626_previewsHonoured", report["invariants"])
+
+    def test_openzeppelin_staking_modifiers_mutability_and_getters(self):
+        s = self.cs["OZStaking"]
+        self.assertEqual([f.split(":")[1] for f in s["linearized_bases"]], ["OZStaking", "ReentrancyGuard", "Ownable", "Context"])
+        self.assertTrue(s["linearized_bases"][1].startswith("@openzeppelin/contracts/"))
+        fns = {f["name"]: f for f in s["functions"]}
+        self.assertEqual(fns["stake"]["modifiers"], ["nonReentrant"])
+        self.assertEqual((fns["sweep"]["mutability"], fns["sweep"]["modifiers"]), ("payable", ["onlyOwner"]))
+        getters = {v["name"]: v.get("getter") for v in s["state_vars"]}
+        self.assertEqual(getters["lockedUntil"]["signature"], "lockedUntil(address,uint256)")
+        self.assertEqual(getters["lockedUntil"]["returns"], ["uint64"])
+        self.assertIsNone(getters["MAX_LOCK"])
+        consts = {v["name"]: v["mutability"] for v in s["state_vars"]}
+        self.assertEqual((consts["MAX_LOCK"], consts["stakingToken"]), ("constant", "immutable"))
+        report = {r["contract"]: r for r in self.gen(self.bp)}["OZStaking"]
+        self.assertIn("invariant_actorBalancesBoundedByTotal", report["invariants"])
+
+    def test_same_named_parents_are_told_apart(self):
+        solady, oz = self.cs["SoladyShare"], self.cs["OZShare"]
+        self.assertEqual(solady["inherits"], ["ERC20"])
+        self.assertEqual(oz["inherits"], ["ERC20"])
+        self.assertEqual(solady["bases"][0]["fqn"], "node_modules/solady/src/tokens/ERC20.sol:ERC20")
+        self.assertEqual(oz["bases"][0]["fqn"], "@openzeppelin/contracts/token/ERC20/ERC20.sol:ERC20")
+        self.assertEqual(oz["interfaces"], ["IERC20Errors", "IERC20Metadata", "IERC20"])
+        self.assertEqual(solady["interfaces"], [])
+        # Both are plain mint-only tokens, recognised through the lineage, so neither is fuzzed.
+        targets = {r["contract"] for r in self.gen(self.bp)}
+        self.assertEqual(targets, {"SoladyVault", "OZStaking"})
 
 
 class ReportingTests(unittest.TestCase):
@@ -264,6 +507,7 @@ class ReportingTests(unittest.TestCase):
 
 class HookPresetTests(ProjectCase):
     fixture = HOOKS_FIXTURE
+    ast_fixture = HOOKS_AST_OUTPUT
 
     def test_detects_hook_callbacks(self):
         cs = contracts(self.scan())
@@ -273,24 +517,38 @@ class HookPresetTests(ProjectCase):
         # Callback entry points are not value flows.
         self.assertEqual(cs["IUnlockCallback"]["categories"], {})
 
+    @needs_solc
     def test_callback_detection_patterns(self):
-        body = """
-            key.hooks.beforeSwap(msg.sender, key, params, hookData);
-            bytes memory r = IUnlockCallback(msg.sender).unlockCallback(data);
-            IVaultHooks(hookAddr).afterDeposit{gas: 50000}(msg.sender, amount);
-            token.transferFrom(msg.sender, address(this), amount);
-            oracle.beforeUpdate();
-            ICallee(msg.sender).uniswapV3SwapCallback(a0, a1, data);
-        """
-        found = {(c["name"], c["receiver"]) for c in hook_reentrancy.detect_callbacks(body)}
+        (self.root / "src" / "Caller.sol").write_text("""
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.20;
+            interface IHooks { function beforeSwap(address, uint256) external; }
+            interface IUnlockCallback { function unlockCallback(bytes calldata) external returns (bytes memory); }
+            interface IVaultHooksLike { function afterDeposit(address, uint256) external; }
+            interface IOracle { function beforeUpdate() external; }
+            interface ICallee { function uniswapV3SwapCallback(int256, int256, bytes calldata) external; }
+            interface IToken { function transferFrom(address, address, uint256) external returns (bool); }
+            contract Caller {
+                struct PoolKey { IHooks hooks; }
+                IToken token;
+                IOracle oracle;
+                address hookAddr;
+                function run(PoolKey calldata key, uint256 amount, bytes calldata data) external {
+                    key.hooks.beforeSwap(msg.sender, amount);
+                    bytes memory r = IUnlockCallback(msg.sender).unlockCallback(data);
+                    IVaultHooksLike(hookAddr).afterDeposit{gas: 50000}(msg.sender, amount);
+                    token.transferFrom(msg.sender, address(this), amount);
+                    oracle.beforeUpdate();
+                    ICallee(msg.sender).uniswapV3SwapCallback(0, 0, data);
+                    r;
+                }
+            }
+        """)
+        caller = contracts(self.compile(paths=["src/Caller.sol"]))["Caller"]
+        run = next(f for f in caller["functions"] if f["name"] == "run")
+        found = {(c["name"], c["receiver"]) for c in run["callbacks"]}
         self.assertEqual(found, {("beforeSwap", "key.hooks"), ("unlockCallback", "msg.sender"),
                                  ("afterDeposit", "hookAddr"), ("uniswapV3SwapCallback", "msg.sender")})
-
-    def test_ast_backend_detects_the_same_hooks(self):
-        shutil.copy(HOOKS_AST_OUTPUT, self.root / "ast.json")
-        ast = contracts(fg_parser.build_blueprint(self.root, [], backend="ast", build_dir="ast.json", run_build=False))
-        rgx = contracts(self.scan())
-        self.assertEqual({k: v["hooks"] for k, v in ast.items()}, {k: v["hooks"] for k, v in rgx.items()})
 
     def test_buggy_vault_gets_read_consistency_check(self):
         report = {r["contract"]: r for r in self.gen(self.scan())}
@@ -329,7 +587,7 @@ class HookPresetTests(ProjectCase):
     def test_projects_without_hooks_are_unchanged(self):
         root = self.tmp / "plain"
         shutil.copytree(FIXTURE, root)
-        bp = fg_parser.build_blueprint(root, [], backend="regex", run_build=False)
+        bp = fg_parser.build_blueprint(root, [], ast_path=str(AST_OUTPUT))
         injector.inject(bp, root, root / "test" / "foundryguard", None, 4, "1e24", False, False, None)
         self.assertNotIn("HookProbe", (root / "test" / "foundryguard" / "SimpleVault" / "Handler.sol").read_text())
 
