@@ -109,7 +109,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.16 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.17 (passive single-page check)"
 CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
 FINDINGS_LOG = "foundryguard-findings.log"
@@ -1818,6 +1818,35 @@ def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
     return out
 
 
+def check_dynamic(rel: str, raw: str, lang: str) -> list[Finding]:
+    """Layer 17: line rules merged at runtime by intel_sync (empty unless a sync or the cache activated them)."""
+    rules = signatures.DYNAMIC_RULES
+    if not rules:
+        return []
+    rules = [r for r in rules if lang in r.langs and (not r.needs or r.needs.search(raw))
+             and not (r.unless and r.unless.search(raw))]
+    if not rules:
+        return []
+    lines = raw.splitlines()
+    if lang == "sol":
+        clean = strip_comments(raw).splitlines()
+    elif lang == PY:
+        clean = [_PY_COMMENT.sub(r"\1", ln) for ln in lines]
+    elif lang in (JS, PHP):
+        clean = strip_comments(raw, blank_strings=False, templates=True).splitlines()
+    else:
+        clean = lines
+    out: list[Finding] = []
+    for r in rules:
+        sig = r.sig
+        search = r.pattern.search
+        for i, ln in enumerate(lines if r.raw_lines else clean, 1):
+            if len(ln) <= LINE_MAX and search(ln):
+                out.append(Finding(sig.rule, sig.severity, "L17", sig.title, rel, i, snippet(lines, i), sig.mitigation,
+                                   signature=sig.id, fix=sig.fix or None))
+    return out
+
+
 FORM_RE = re.compile(r"<form\b[^>]*>", re.I)
 
 
@@ -2098,13 +2127,13 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
             sol_sources.append((rel, raw))
             kinds.add("solidity")
             f, contracts = check_solidity(rel, raw, presets)
-            findings += f
+            findings += f + check_dynamic(rel, raw, "sol")
             sol_contracts[rel] = contracts
         else:
             lang = _lang(p.name)
             if lang:
                 kinds.add("web")
-                findings += check_text(rel, raw, lang)
+                findings += check_text(rel, raw, lang) + check_dynamic(rel, raw, lang)
     if not files:
         notes.append("no .sol/.py/.js/.ts/.html/.php files found (test, lib and node_modules dirs are skipped)")
     bridge = None
@@ -2438,6 +2467,20 @@ def signature_section(findings: list[Finding]) -> list[str]:
                        f'<td class="n">{hits[sig.id]}</td><td class="loc">{where}</td>'
                        f'<td><pre class="fix">{_h(sig.fix)}</pre></td></tr>')
         out.append("</table></div>")
+    dyn = {}
+    for f in findings:
+        if f.signature and f.signature.startswith("FGX-"):
+            dyn.setdefault(f.signature, []).append(f)
+    if dyn:
+        out.append('<h3>Dynamic signatures (threat intel sync)</h3><div class="scroll"><table class="sigmatch">'
+                   '<tr><th>ID</th><th>Rule</th><th class="n">Hits</th><th>Where</th><th>Mitigation</th></tr>')
+        for sid, fs in sorted(dyn.items()):
+            f0 = fs[0]
+            where = "<br>".join(_h(f.location) for f in fs[:6]) + (f"<br>and {len(fs) - 6} more" if len(fs) > 6 else "")
+            out.append(f'<tr><td><span class="sig">{_h(sid)}</span><br><span class="sev {f0.severity}">{f0.severity}'
+                       f'</span></td><td>{_h(f0.rule)}<br><span class="muted">{_h(f0.title)}</span></td>'
+                       f'<td class="n">{len(fs)}</td><td class="loc">{where}</td><td>{_h(f0.mitigation)}</td></tr>')
+        out.append("</table></div>")
     for title, sigs in ((f"Contract surface, {_id_ranges(web3)}", web3), (f"Web surface, {_id_ranges(web2)}", web2)):
         n_hit = sum(1 for s in sigs if hits[s.id])
         out.append(f'<details class="sigdb"><summary>{_h(title)} ({n_hit} of {len(sigs)} matched)</summary>{SIG_HEAD}')
@@ -2607,6 +2650,18 @@ def cmd_score(args) -> int:
     except ValueError as exc:
         print(f"foundryguard: {exc}", file=sys.stderr)
         return 2
+    if not is_url(args.target):
+        try:
+            if __package__:
+                from . import intel_sync
+            else:
+                import intel_sync  # type: ignore
+            intel = intel_sync.use_cache_if_enabled(Path(args.target).expanduser(), args.config)
+            if intel:
+                print("foundryguard: " + intel.label(), file=sys.stderr)
+        except (ValueError, OSError) as exc:
+            print(f"foundryguard: {exc}", file=sys.stderr)
+            return 2
     try:
         result, page = simulate(args.target, presets, run_forge=args.fuzz, out_dir=args.out, ast_path=args.ast, config_path=args.config,
                                 progress=lambda m: print("foundryguard: " + m, file=sys.stderr))

@@ -27,9 +27,10 @@ from pathlib import Path
 from typing import Callable
 
 if __package__:
-    from . import scoring
+    from . import intel_sync, scoring
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import intel_sync  # type: ignore
     import scoring  # type: ignore
 
 TITLE = "FoundryGuard"
@@ -228,8 +229,13 @@ class App:
             row=0, column=0, sticky="w")
         ctk.CTkLabel(head, text="Static score, preset matrix, and invariant fuzzing when forge is installed.",
                      font=f["sub"], text_color=MUTED, anchor="w").grid(row=1, column=0, sticky="w")
+        self.intel_var = tk.StringVar(value=intel_sync.status().label())
+        self.intel_label = ctk.CTkLabel(head, textvariable=self.intel_var, font=f["mono"], text_color=FAINT,
+                                        anchor="w")
+        self.intel_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.intel_sync: intel_sync.BackgroundSync | None = None
         score_card = self._card(head)
-        score_card.grid(row=0, column=1, rowspan=2, sticky="e")
+        score_card.grid(row=0, column=1, rowspan=3, sticky="e")
         self.score_var = tk.StringVar(value="--/100")
         self.verdict_var = tk.StringVar(value="NOT RUN")
         self.score_label = ctk.CTkLabel(score_card, textvariable=self.score_var, font=f["score"], text_color=TEXT,
@@ -339,6 +345,33 @@ class App:
         if initial:  # an empty bar keeps its placeholder visible until clicked
             self.entry.focus_set()
         self.update_hint()
+
+    # -- Layer 17: threat intel sync -----------------------------------------
+    INTEL_POLL_MS = 200
+
+    def start_intel_sync(self, cfg: "intel_sync.IntelConfig | None" = None, fetch=None, cache=None) -> None:
+        """Fetch the dynamic signatures on a daemon thread; the window keeps running and the label updates
+        when the thread is done. A scan started before that runs on whatever is active at the time."""
+        try:
+            cfg = cfg or intel_sync.load_config(Path.cwd())
+        except (ValueError, OSError, SystemExit) as exc:
+            self.intel_var.set(f"Signatures: {len(intel_sync.signatures.SIGNATURES)} hardcoded (bad [intel] config)")
+            self.write(f"intel sync: {exc}\n")
+            return
+        if not cfg.enabled:
+            self.intel_var.set(intel_sync.SyncResult(source="off").label())
+            return
+        self.intel_var.set(f"Signatures: {len(intel_sync.signatures.SIGNATURES)} hardcoded, syncing threat intel...")
+        self.intel_sync = intel_sync.BackgroundSync(cfg, fetch, cache).start()
+        self.root.after(self.INTEL_POLL_MS, self.poll_intel)
+
+    def poll_intel(self) -> None:
+        res = self.intel_sync.poll() if self.intel_sync else None
+        if res is None:
+            self.root.after(self.INTEL_POLL_MS, self.poll_intel)
+            return
+        self.intel_var.set(res.label())
+        self.intel_label.configure(text_color=ACCENT if res.source == "network" else FAINT)
 
     # -- building blocks ----------------------------------------------------
     def _card(self, parent):
@@ -531,7 +564,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"foundryguard-gui: cannot open a window ({exc}). Use `foundryguard score TARGET` on headless machines.",
               file=sys.stderr)
         return 2
-    App(root, argv[0] if argv else "")
+    app = App(root, argv[0] if argv else "")
+    app.start_intel_sync()
     root.mainloop()
     return 0
 

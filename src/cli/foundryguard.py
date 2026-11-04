@@ -2,6 +2,7 @@
 """FoundryGuard: one command for scanning, generating, checking and reporting.
 
     foundryguard init                 write a commented foundryguard.toml into the project root
+    foundryguard intel sync|status    fetch or show the dynamic signatures (OSV, rule packs)
     foundryguard scan                 Solidity -> foundryguard.json blueprint
     foundryguard gen                  blueprint -> test/foundryguard/<Contract>/ suites
     foundryguard run [--test]         scan + gen (+ forge test on the generated suites + FoundryGuard_Report.md)
@@ -26,10 +27,11 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from . import healer, injector, parser, reporter, reporting, scoring, web_surface
+    from . import healer, injector, intel_sync, parser, reporter, reporting, scoring, web_surface
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import healer  # type: ignore
+    import intel_sync  # type: ignore
     import injector  # type: ignore
     import parser  # type: ignore
     import reporter  # type: ignore
@@ -55,6 +57,15 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 # "FG-02" = "MEDIUM"          # division before multiplication
 # "FG-08" = "off"             # unbounded loop over a storage array
 # "SOL-MUTABILITY" = "off"
+
+[intel]
+# Layer 17: extra signatures pulled from public feeds (OSV advisories, rule packs) and merged in memory.
+# The window syncs in a background thread at start-up; `foundryguard score` reads the last sync from the cache.
+auto_update_signatures = true
+# max_age_hours = 24
+# osv = true
+# packages = { npm = ["next"], pypi = ["django"] }   # watched on top of the built-in list
+# feeds = ["https://example.org/rules.json"]        # extra foundryguard-rules/1 packs
 
 [generate]
 # out = "test/foundryguard"
@@ -321,6 +332,10 @@ def build_cli() -> argparse.ArgumentParser:
     p = sub.add_parser("bridge", help="check where the backend signs, sends and trusts the chain (Layer 12)")
     web_surface.add_bridge_args(p)
     p.set_defaults(func=web_surface.cmd_bridge)
+
+    p = sub.add_parser("intel", help="sync or show the dynamic signatures from public feeds (Layer 17)")
+    intel_sync.add_intel_args(p)
+    p.set_defaults(func=intel_sync.cmd_intel)
 
     p = sub.add_parser("gui", help="open the desktop simulation window (same as foundryguard-gui)")
     p.add_argument("target", nargs="?", default="", help="path or URL to fill in")

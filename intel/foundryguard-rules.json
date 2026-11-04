@@ -1,0 +1,94 @@
+{
+  "format": "foundryguard-rules/1",
+  "name": "FoundryGuard community pack",
+  "description": "Line rules synced by FoundryGuard Layer 17. Each rule must match its test.hit line and not its test.miss line, or the client drops it.",
+  "rules": [
+    {
+      "id": "FGX-SWC-129",
+      "severity": "MEDIUM",
+      "ref": "SWC-129 / CWE-480",
+      "langs": [
+        "sol"
+      ],
+      "title": "Typo `=+` assigns instead of adding",
+      "mitigation": "`x =+ y` sets x to y. Use `x += y` when the intent is to add.",
+      "fix": "balance += amount;",
+      "pattern": "[\\w\\])]\\s*=\\+(?!\\+)",
+      "test": {
+        "hit": "balances[msg.sender] =+ amount;",
+        "miss": "balances[msg.sender] += amount;"
+      }
+    },
+    {
+      "id": "FGX-SWC-130",
+      "severity": "HIGH",
+      "ref": "SWC-130 / CVE-2021-42574",
+      "langs": [
+        "sol",
+        "py",
+        "js",
+        "php",
+        "html"
+      ],
+      "title": "Bidirectional control character in source (Trojan Source)",
+      "mitigation": "Remove Unicode bidi overrides (U+202A-U+202E, U+2066-U+2069); the code the compiler sees differs from what a reviewer reads.",
+      "fix": "// delete the invisible U+202E / U+2066..U+2069 characters",
+      "pattern": "[\u202a-\u202e\u2066-\u2069]",
+      "raw_lines": true,
+      "test": {
+        "hit": "uint a = 1; /* \u202e } \u2066 */",
+        "miss": "uint a = 1; /* plain */"
+      }
+    },
+    {
+      "id": "FGX-SWC-111",
+      "severity": "LOW",
+      "ref": "SWC-111 / CWE-477",
+      "langs": [
+        "sol"
+      ],
+      "title": "Deprecated Solidity built-in",
+      "mitigation": "Replace suicide, sha3, callcode, block.blockhash, msg.gas and throw with selfdestruct (or nothing), keccak256, delegatecall, blockhash, gasleft() and revert().",
+      "fix": "bytes32 h = keccak256(abi.encodePacked(x));\nrevert Unauthorized();",
+      "pattern": "\\b(?:suicide|sha3|callcode)\\s*\\(|\\bblock\\.blockhash\\s*\\(|\\bmsg\\.gas\\b|\\bthrow\\s*;",
+      "test": {
+        "hit": "if (msg.sender != owner) throw;",
+        "miss": "if (msg.sender != owner) revert Unauthorized();"
+      }
+    },
+    {
+      "id": "FGX-SWC-136",
+      "severity": "MEDIUM",
+      "ref": "SWC-136 / CWE-312",
+      "langs": [
+        "sol"
+      ],
+      "ignore_case": true,
+      "title": "Secret kept in a `private` state variable",
+      "mitigation": "`private` only hides a variable from other contracts; anyone can read the storage slot. Keep secrets off-chain or store a commitment (hash) instead.",
+      "fix": "bytes32 private passwordHash; // keccak256 of the secret, checked on reveal",
+      "pattern": "\\b(?:string|bytes\\d{0,2}|uint\\d{0,3})\\s+(?:private|internal)\\s+(?!\\w*(?:hash|commit|typehash))\\w*(?:password|passwd|secret|seed|mnemonic|privkey|private_?key)\\w*\\s*[;=]",
+      "test": {
+        "hit": "string private password;",
+        "miss": "bytes32 private passwordHash;"
+      }
+    },
+    {
+      "id": "FGX-CVE-2007-4559",
+      "severity": "HIGH",
+      "ref": "CVE-2007-4559 / CWE-22",
+      "langs": [
+        "py"
+      ],
+      "title": "tarfile.extractall without a filter (path traversal)",
+      "mitigation": "Archive members can hold `../` paths or links. Pass `filter=\"data\"` (Python 3.12+, backported to 3.8.17+) or check every member before extracting.",
+      "fix": "with tarfile.open(path) as tar:\n    tar.extractall(dest, filter=\"data\")",
+      "needs": "\\btarfile\\b",
+      "pattern": "\\.extractall\\s*\\((?![^)]*\\bfilter\\s*=)",
+      "test": {
+        "hit": "tar.extractall(dest)",
+        "miss": "tar.extractall(dest, filter=\"data\")"
+      }
+    }
+  ]
+}

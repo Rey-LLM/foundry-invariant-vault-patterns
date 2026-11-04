@@ -54,6 +54,8 @@ class Signature:
 
     @property
     def surface(self) -> str:
+        if not self.id[3:].isdigit():  # FGX-... dynamic rules from intel_sync
+            return "web3" if self.stack == SOL else "web2"
         n = int(self.id[3:])
         return "web3" if any(lo <= n <= hi for lo, hi in WEB3_RANGES) else "web2"
 
@@ -744,6 +746,18 @@ for _s in SIGNATURES:
         BY_RULE[_a] = _s
 
 
+# Layer 17: rules and advisories merged at runtime by intel_sync. Replaced as a whole by set_dynamic(), never
+# mutated in place, so a scan running on another thread reads a consistent set.
+DYNAMIC_RULES: tuple = ()  # intel_sync.RuleSpec
+DYNAMIC_ADVISORIES: dict[str, dict[str, list[tuple[str | None, str | None, str]]]] = {"npm": {}, "pypi": {}}
+
+
+def set_dynamic(rules: tuple, advisories: dict) -> None:
+    global DYNAMIC_RULES, DYNAMIC_ADVISORIES
+    DYNAMIC_ADVISORIES = {"npm": dict(advisories.get("npm", {})), "pypi": dict(advisories.get("pypi", {}))}
+    DYNAMIC_RULES = tuple(rules)
+
+
 def lookup(rule: str) -> Signature | None:
     return BY_RULE.get(rule)
 
@@ -783,7 +797,7 @@ def apply(findings: list, overrides: dict[str, str] | None = None) -> list:
             f.fix = sig.fix
             if f.rule == sig.rule and sig.fixed:
                 f.severity = sig.severity
-        want = overrides.get(f.rule)
+        want = overrides.get(f.rule) or (overrides.get(f.signature) if f.signature and f.signature[:4] == "FGX-" else None)
         if want == OFF:
             continue
         if want:
@@ -1054,10 +1068,21 @@ def _cmp(a: tuple[int, ...], b: tuple[int, ...]) -> int:
     return (a > b) - (a < b)
 
 
+def _entries(eco: str, name: str) -> list[tuple[str | None, str | None, str]]:
+    """The offline list first, then what intel_sync fetched (fixed is None when no release has the fix)."""
+    key = name.lower()
+    return ADVISORIES[eco].get(key, []) + DYNAMIC_ADVISORIES.get(eco, {}).get(key, [])
+
+
+def _fixed_text(fixed: str | None) -> str:
+    return f"fixed in {fixed}" if fixed else "no fixed release yet"
+
+
 def _advisory(eco: str, name: str, version: tuple[int, ...]) -> str | None:
-    for lo, fixed, text in ADVISORIES[eco].get(name.lower(), []):
-        if (lo is None or _cmp(version, _ver(lo)) >= 0) and _cmp(version, _ver(fixed)) < 0:
-            return f"{text}; fixed in {fixed}"
+    for lo, fixed, text in _entries(eco, name):
+        lo_v, fx_v = _ver(lo) if lo else None, _ver(fixed) if fixed else None
+        if (lo_v is None or _cmp(version, lo_v) >= 0) and (fx_v is None or _cmp(version, fx_v) < 0):
+            return f"{text}; {_fixed_text(fixed)}"
     return None
 
 
@@ -1113,10 +1138,11 @@ def check_manifest(name: str, raw: str) -> list[tuple[str, int, str]]:
                 rng = _range_ceiling(spec)
                 if not rng:
                     continue
-                for lo, fixed, text in ADVISORIES["npm"].get(dep.lower(), []):
-                    if _cmp(rng[1], _ver(fixed)) <= 0 and (lo is None or _cmp(rng[0], _ver(lo)) >= 0):
-                        out.append(("WEB-VULN-DEPENDENCY", _find_line(raw, f'"{dep}"'),
-                                    f"`{dep}@{spec}` cannot reach {fixed}: {text}"))
+                for lo, fixed, text in _entries("npm", dep):
+                    fx_v = _ver(fixed) if fixed else None
+                    if (fx_v is None or _cmp(rng[1], fx_v) <= 0) and (lo is None or _cmp(rng[0], _ver(lo) or ()) >= 0):
+                        reach = f"cannot reach {fixed}" if fixed else "has no fixed release"
+                        out.append(("WEB-VULN-DEPENDENCY", _find_line(raw, f'"{dep}"'), f"`{dep}@{spec}` {reach}: {text}"))
                         break
         return out
     if base == "package-lock.json":

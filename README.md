@@ -27,6 +27,7 @@ It is built for engineering teams assessing their own code: point it at a reposi
 - [Static analysis: contract model](#static-analysis-contract-model)
 - [Dynamic analysis: invariant suites](#dynamic-analysis-invariant-suites)
 - [Backend-to-contract bridge validation](#backend-to-contract-bridge-validation)
+- [Threat intel sync](#threat-intel-sync)
 - [Reporting](#reporting)
 - [Configuration](#configuration)
 - [CI integration](#ci-integration)
@@ -43,7 +44,8 @@ It is built for engineering teams assessing their own code: point it at a reposi
 | Web2 backend | Static | Injection (SQL, NoSQL, command, template, eval, headers, regex, prototype pollution), XSS, SSRF, XXE, deserialization, path traversal, IDOR on reads and writes, unauthenticated state routes, mass assignment, JWT issue and verify, session cookies and fixation, WebSocket handshakes, cache scoping, CSRF, rate limits, debug configuration |
 | Secrets and data exposure | Static | Hardcoded keys and secrets, key material written to logs or responses, signing keys shipped to the browser, tokens in `localStorage`, version banners |
 | HTTP surface | Passive | One GET per URL: CSP, HSTS, framing, nosniff, cookie flags, CORS, mixed content |
-| Supply chain | Static, offline | `package.json`, `package-lock.json` (transitive) and `requirements*.txt` against a bundled advisory list |
+| Supply chain | Static | `package.json`, `package-lock.json` (transitive) and `requirements*.txt` against a bundled advisory list, plus OSV ranges when the intel sync is on |
+| Threat intel sync | Network, optional | Extra line rules (SWC, CWE, CVE) and dependency advisories pulled from public feeds and merged in memory; every entry is checked before use |
 | Web2 to Web3 bridge | Static | Signing oracles, open relayers, EIP-712 typehash and domain drift, replay, unenforced deadlines, ABI drift, nonce races, reorg handling |
 | Self-healing build | Compile loop | Generated suites recompiled and repaired against the project's own compiler |
 
@@ -73,6 +75,7 @@ foundryguard-gui                      # desktop console
 | `foundryguard heal` | compiles the generated suites and fixes what the local compiler rejects |
 | `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md` and `foundryguard-report.html`, plus CI Markdown and SARIF |
 | `foundryguard score <path or URL>` | risk score from 1 to 100 with a deduction per file and line, written to `foundryguard-report.html` |
+| `foundryguard intel sync` / `status` | fetch the dynamic signatures now, or show what the cache holds |
 | `foundryguard bridge <path>` | the seam between backend and contracts: who can make the server key sign or send, and whether the contract enforces what the backend signs |
 | `foundryguard-gui [path or URL]` | desktop window that runs the score, the preset matrix and, with forge installed, the fuzzing (`foundryguard gui` does the same) |
 
@@ -485,6 +488,7 @@ foundryguard score https://app.example.com  # one passive GET; report in ~/found
 | LAUNCH SECURITY SIMULATION | Runs the static pass, the preset matrix and, when available, the dynamic pass |
 | Progress row | Progress bar, elapsed time and Stop; the run executes on a background thread so the window stays responsive |
 | Score card | Final score, coloured green, amber or red by band |
+| Signature counter | Under the title: `Signatures: 150 hardcoded + N dynamic verified`. The sync runs on its own thread at start-up, so the window is usable at once |
 | Log | Progress while running; at the end, every deduction ranked by severity with its signature id, file and line, points, the source line and the fix example (first 300; the report has all) |
 
 The layout is flat and dark: charcoal background, slate cards, white text and one muted green accent. On completion the HTML report opens in the browser with the score at the top, and `foundryguard-score.json` plus `foundryguard-findings.log` (the same per-deduction listing as the window log, as plain text) are written next to it.
@@ -734,6 +738,32 @@ foundryguard bridge . --fail-on CRITICAL --json
 
 Express, Fastify-style routers, Next.js route handlers, Flask and FastAPI routes are recognised. ethers, viem, web3.js, web3.py and eth-account cover the signing and sending side. Nothing is executed and nothing is sent anywhere.
 
+## Threat intel sync
+
+Layer 17 (`intel_sync.py`) adds detection data from public feeds without touching the built-in database. The 150 signatures stay as shipped; the extra rules and advisories live in memory and in a cache file (`~/.cache/foundryguard/intel.json`).
+
+| Feed | What it gives |
+| :-- | :-- |
+| [OSV](https://osv.dev) (`api.osv.dev`) | Vulnerable version ranges for the watched npm and PyPI packages (the built-in list plus `[intel] packages`). FG-90 then reports any pinned version inside a range, with the CVE or GHSA id |
+| Rule packs | JSON line rules tied to an SWC, CWE or CVE id. The default pack is [`intel/foundryguard-rules.json`](intel/foundryguard-rules.json) in this repo: SWC-129 (`=+` typo), SWC-130 / CVE-2021-42574 (bidi characters), SWC-111 (deprecated built-ins), SWC-136 (secrets in `private` state) and CVE-2007-4559 (`tarfile.extractall` without a filter) |
+
+What counts as verified: a feed must be https on an allowed host and under 2 MB, and can be pinned to a SHA-256. Each rule needs an `FGX-` id, a known severity, an SWC/CWE/CVE/GHSA reference and a pattern under 300 characters with no backreferences or nested repeats, and it must match its own `test.hit` line and not its `test.miss` line. Advisories need an id, a package and a numeric range. Anything that fails is dropped on its own; the cache is checked the same way when it is read back. Fetched data is parsed as JSON and compiled as a regex, nothing else.
+
+Order of fallback: network, then the last good cache, then the built-in 150 alone. A cache younger than `max_age_hours` is used without going to the network. Dynamic hits appear in the report under "Dynamic signatures" with layer L17 and can be tuned by id like any other rule (`"FGX-SWC-129" = "off"`).
+
+```toml
+[intel]
+auto_update_signatures = true     # the window syncs at start-up; `foundryguard score` reads the cache
+# max_age_hours = 24
+# osv = true
+# packages = { npm = ["next"], pypi = ["django"] }
+# feeds = ["https://example.org/rules.json"]   # extra packs; their hosts become allowed
+# [intel.pins]
+# "https://example.org/rules.json" = "<sha256>"
+```
+
+Without a `foundryguard.toml` the window syncs by default and the command line does not. `foundryguard intel sync` fetches on demand.
+
 ## Reporting
 
 | Output | Produced by | Contents |
@@ -814,7 +844,7 @@ To reuse a pattern, copy the closest handler and test, point the handler at your
 python3 -m unittest discover -s tests/foundryguard -v
 ```
 
-The suite holds 411 tests covering every layer, with weak and safe fixture pairs for the signatures, presets and bridge rules. Tests that compile Solidity are skipped without solc or solcjs (`npm install -g solc`); the OpenZeppelin and Solady resolution tests also need `npm install` in `tests/foundryguard/fixtures/libs`; the desktop console tests are skipped without a display. CI additionally fuzzes each fixture project with forge and requires every weak fixture to fail and every safe fixture to pass.
+The suite holds 441 tests covering every layer, with weak and safe fixture pairs for the signatures, presets and bridge rules. Tests that compile Solidity are skipped without solc or solcjs (`npm install -g solc`); the OpenZeppelin and Solady resolution tests also need `npm install` in `tests/foundryguard/fixtures/libs`; the desktop console tests are skipped without a display. CI additionally fuzzes each fixture project with forge and requires every weak fixture to fail and every safe fixture to pass.
 
 ### Engine performance
 
@@ -834,6 +864,7 @@ The scan reads each file once with a bounded read (no separate stat), walks fold
 - Preset 05 sees `tstore` in the contract's own lineage only. Transient storage written through a library (OpenZeppelin `TransientSlot`, `ReentrancyGuardTransient`) or Solidity `transient` state variables is not detected yet; list those slots under `transient_slots`.
 - Remote targets get one passive GET. Active injection testing against a running application is out of scope; use a dedicated DAST tool such as OWASP ZAP against your own staging environment and trace its hits back to code with the file and line findings here.
 - The 0.16 staking, NFT and API rules are pattern based like the rest: a lock check, ownership check or auth middleware done in another contract or file is invisible to them. Each deduction carries the line so a false hit is quick to dismiss or switch off in `foundryguard.toml`.
+- The intel sync only watches named packages; it does not send your manifests anywhere. Add the packages you care about under `[intel] packages`. OSV ranges marked `last_affected` (no fixed release, inclusive bound) are skipped.
 - There is no dedicated detector for personal data (PII) or email addresses in source or responses. Secret and key exposure is covered by FG-51 and FG-94 to FG-96.
 
 ## License
