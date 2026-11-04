@@ -22,10 +22,10 @@ What gets read:
   transactions, allocates nonces or trusts RPC answers, paired with the contract function that verifies
   the signature. Typehash and domain drift, replayable or never-expiring signatures, public signing routes
   and leaked keys land under layer L11.
-* The signature database (Layer 13, ``signatures.py``): fifteen named signatures (FG-01..FG-15), eight
-  Solidity and seven backend, each with a fixed severity, a CWE/SWC reference and a fix example. Matching
-  findings carry the signature id; ``foundryguard.toml`` ``[score]`` can retune severities, ignore paths
-  and limit how deep the walk goes.
+* The signature database (Layer 13, ``signatures.py``): 103 named signatures, FG-01..FG-50 for contracts and
+  FG-51..FG-103 for backend code, response headers, dependency manifests and the bridge, each with a fixed
+  severity, a CWE/SWC reference and a fix example. Matching findings carry the signature id;
+  ``foundryguard.toml`` ``[score]`` can retune severities, ignore paths and limit how deep the walk goes.
 * A URL: one passive GET of the page. The response headers and the HTML/inline scripts it returns are
   checked. Nothing else is requested and nothing is fuzzed against a remote host.
 
@@ -109,7 +109,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.14 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.15 (passive single-page check)"
 CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
 
@@ -514,6 +514,356 @@ def _local_calls(sf: _SolFile, fn: SolFunction) -> set[str]:
     return names
 
 
+# --------------------------------------------------------------------------- #
+# Solidity signatures added with the 103-signature database (FG-10, 15, 17, 21-25, 27, 29, 35-44, 47, 48)
+# --------------------------------------------------------------------------- #
+
+TWAP_CALL = re.compile(r"\b(consult|observe|getTwap\w*|twap\w*|getTimeWeighted\w*|getArithmeticMeanTick\w*)\s*\(", re.I)
+TWAP_CONST = re.compile(r"\b(\w*(?:twap|period|window|seconds_?ago|observation)\w*)\s*=\s*(\d+)\s*(seconds|minutes|hours)?\s*;", re.I)
+TWAP_SECONDS_AGO = re.compile(r"secondsAgos?\s*\[\s*0\s*\]\s*=\s*(\d+)\s*(seconds|minutes|hours)?", re.I)
+TIME_UNIT = {None: 1, "seconds": 1, "minutes": 60, "hours": 3600}
+TWAP_MIN = 1800
+VIEW_GUARD = re.compile(r"_reentrancyGuardEntered|nonReentrantView|_status\b|\blocked\b|_locked\b|reentrancyLock", re.I)
+TS_EQ = re.compile(r"block\.(timestamp|number)\s*(?:==|!=)\s*([A-Za-z_][\w.]*)|([A-Za-z_][\w.]*)\s*(?:==|!=)\s*block\.(timestamp|number)")
+TS_TARGET = re.compile(r"start|end|deadline|expir|unlock|open|close|launch|release|vest|matur|time|epoch", re.I)
+NATIVE_ONE_ARG = re.compile(r"(payable\s*\((?:[^()]|\([^()]*\))*\)|[A-Za-z_$][\w$]*(?:\[[^\]]*\])?)\s*\.\s*(transfer|send)\s*\(")
+FIXED_GAS = re.compile(r"\{[^}]*\bgas\s*:\s*\d+[^}]*\}\s*\(")
+LOOP_HEAD = re.compile(r"\b(for|while)\s*\(")
+NATIVE_PAY = re.compile(r"\.\s*(transfer|send)\s*\(\s*[^,()]*(?:\([^()]*\))?[^,()]*\)|\{\s*value\s*:|\bsendValue\s*\(|safeTransferETH\s*\(")
+SLIPPAGE_ZERO = re.compile(
+    r"\b(amountOutMin(?:imum)?|minAmountOut|minOut|minReturn\w*|min_dy|amountAMin|amountBMin|minDy|minAmountsOut)\s*:\s*0\s*[,})]|"
+    r"\b(swapExactTokensFor\w*|swapExactETHFor\w*|swapTokensForExact\w*)\s*(?:\{[^}]*\})?\s*\(\s*(?:[^,()]+(?:\([^()]*\))?\s*,\s*)?0\s*,|"
+    r"\bexchange(?:_underlying)?\s*\(\s*[^,()]+,\s*[^,()]+,\s*[^,()]+(?:\([^()]*\))?\s*,\s*0\s*\)")
+DEADLINE_NOW = re.compile(r"\bdeadline\s*:\s*block\.timestamp\s*[,})]|"
+                          r"\b(swap\w*|addLiquidity\w*|removeLiquidity\w*)\s*(?:\{[^}]*\})?\s*\([^;]*?,\s*block\.timestamp\s*\)")
+DOWNCAST = re.compile(r"(?<![\w.$])(u?int)(8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|168|176|184|192|"
+                      r"200|208|216|224|232|240|248)\s*\(")
+SIG_AS_KEY = re.compile(r"\[\s*(sig\w*|signature\w*)\s*\]|keccak256\s*\(\s*(abi\.encodePacked\s*\(\s*)?"
+                        r"(sig\w*|signature\w*|v\s*,\s*r\s*,\s*s|r\s*,\s*s\s*,\s*v)\s*\)", re.I)
+S_UPPER_BOUND = re.compile(r"0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0", re.I)
+SLOT_DEF = re.compile(r"(?:bytes32\s+(?:(?:internal|private|public|constant|immutable)\s+)*)?([A-Za-z_]\w*)\s*=\s*keccak256\s*\(\s*"
+                      r"(?:abi\.encodePacked\s*\(\s*|bytes\s*\(\s*)?\"([^\"]+)\"")
+
+
+def _contract_header(sf: _SolFile, c: SolContract) -> str:
+    i = sf.clean.rfind(c.name, 0, c.start)
+    return sf.clean[i:c.start] if i >= 0 else ""
+
+
+def _inherited_names(sf: _SolFile) -> set[str]:
+    names: set[str] = set()
+    for c in sf.contracts:
+        hdr = _contract_header(sf, c)
+        m = re.search(r"\bis\b(.*)$", hdr, re.S)
+        if m:
+            names |= set(re.findall(r"[A-Za-z_]\w*", re.sub(r"\([^()]*\)", "", m.group(1))))
+    return names
+
+
+def _upgradeable(sf: _SolFile, c: SolContract) -> bool:
+    return bool(re.search(r"\bInitializable\b|\w+Upgradeable\b", _contract_header(sf, c))) or any(
+        m in ("initializer", "reinitializer", "onlyInitializing") for f in c.functions for m in f.modifiers)
+
+
+def _with_locals(sf: _SolFile, c: SolContract, fn: SolFunction) -> str:
+    """The function body plus the bodies of the contract's own functions it calls (one level)."""
+    body = sf.body(fn)
+    called = _local_calls(sf, fn)
+    return body + "".join(sf.body(o) for o in c.functions if o.name in called and o is not fn)
+
+
+def _loops(body: str) -> list[tuple[int, str]]:
+    out = []
+    for m in LOOP_HEAD.finditer(body):
+        p_close = match_close(body, m.end() - 1, "(", ")")
+        rest = body[p_close + 1:]
+        lead = len(rest) - len(rest.lstrip())
+        if rest[lead:lead + 1] == "{":
+            start = p_close + 1 + lead
+            out.append((m.start(), body[start:match_close(body, start) + 1]))
+        else:
+            end = body.find(";", p_close)
+            out.append((m.start(), body[p_close + 1:end + 1 if end >= 0 else len(body)]))
+    return out
+
+
+def _seconds(num: str, unit: str | None) -> int:
+    return int(num) * TIME_UNIT[unit.lower() if unit else None]
+
+
+def solidity_pack_fn(sf: _SolFile, c: SolContract, fn: SolFunction, add, authorized: bool) -> None:
+    body = sf.body(fn)
+    b0 = fn.body_start
+    cname = c.name
+
+    def hit(rule, title, off, mitigation=None, preset=None, is_line=False):
+        sig = signatures.lookup(rule)
+        add(rule, signatures.severity(rule), _SIG_LAYER.get(rule, "L4"), title, off,
+            mitigation or sig.mitigation, preset=preset, contract=cname, is_line=is_line)
+
+    # FG-17 oracle answer never checked > 0
+    for m in LATEST_ROUND.finditer(body):
+        stmt = body[max(body.rfind(";", 0, m.start()), body.rfind("{", 0, m.start())) + 1:m.start()]
+        nm = re.search(r"\bint\d*\s+([A-Za-z_]\w*)", stmt)
+        if not nm:
+            continue
+        v = re.escape(nm.group(1))
+        if not re.search(rf"\b{v}\s*(<=|<|>|>=|==|!=)\s*0\b|\b0\s*(<|>=|>|<=|==|!=)\s*{v}\b|toUint256\s*\(\s*{v}\s*\)", body):
+            hit("SOL-ORACLE-BAD-PRICE", f"`{nm.group(1)}` from `latestRoundData` is used without an `> 0` check",
+                b0 + m.start(), preset=6)
+
+    # FG-15 TWAP call with a literal short window
+    for m in TWAP_CALL.finditer(body):
+        close = match_close(body, m.end() - 1, "(", ")")
+        args = _split_args_sol(body[m.end():close])
+        if args:
+            lm = re.fullmatch(r"(?:uint32\s*\(\s*)?(\d+)\s*(seconds|minutes|hours)?\s*\)?", args[-1].strip())
+            if lm and 0 < _seconds(lm.group(1), lm.group(2)) < TWAP_MIN:
+                hit("SOL-TWAP-SHORT-WINDOW", f"`{m.group(1)}` over {_seconds(lm.group(1), lm.group(2))} s",
+                    b0 + m.start(), preset=6)
+    for m in TWAP_SECONDS_AGO.finditer(body):
+        if 0 < _seconds(m.group(1), m.group(2)) < TWAP_MIN:
+            hit("SOL-TWAP-SHORT-WINDOW", f"TWAP observation window of {_seconds(m.group(1), m.group(2))} s",
+                b0 + m.start(), preset=6)
+
+    # FG-22 UUPS upgrade authorization left empty
+    if fn.name == "_authorizeUpgrade" and re.fullmatch(r"\{\s*\}", body) and not fn.modifiers:
+        hit("SOL-UUPS-NO-AUTH", "`_authorizeUpgrade` is empty and has no modifier: anyone can upgrade",
+            fn.line, preset=None, is_line=True)
+
+    # FG-27 caller picks target and calldata
+    if fn.exposed and fn.kind == "function" and fn.state_changing and not authorized:
+        addr = {p[1] for p in fn.params if p[0] in ("address", "address[]") and p[1]}
+        data = {p[1] for p in fn.params if p[0] in ("bytes", "bytes[]") and p[1]}
+        if addr and data:
+            pat = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)(?:\s*\[[^\]]*\])?\s*\.\s*(call|functionCall\w*)\s*"
+                             r"(?:\{[^}]*\})?\s*\(\s*([A-Za-z_$][\w$]*)|"
+                             r"functionCall\w*\s*\(\s*([A-Za-z_$][\w$]*)(?:\s*\[[^\]]*\])?\s*,\s*([A-Za-z_$][\w$]*)")
+            for m in pat.finditer(body):
+                target, payload = (m.group(1), m.group(3)) if m.group(1) else (m.group(4), m.group(5))
+                if target in addr and payload in data:
+                    hit("SOL-ARBITRARY-CALL", f"`{fn.name}` calls `{target}` with `{payload}`, both chosen by the caller",
+                        b0 + m.start())
+                    break
+
+    # FG-29 malleable ecrecover, only where the signature itself is the replay key (a nonce makes it harmless)
+    m = re.search(r"\becrecover\s*\(", full_body := _with_locals(sf, c, fn))
+    if m and "ecrecover" in body and not S_UPPER_BOUND.search(sf.clean) and SIG_AS_KEY.search(full_body):
+        hit("SOL-SIG-MALLEABLE", f"`{fn.name}` keys replay protection on the signature bytes and uses raw `ecrecover`",
+            b0 + body.find("ecrecover"))
+
+    # FG-35 timestamp equality
+    for m in TS_EQ.finditer(body):
+        other = m.group(2) or m.group(3) or ""
+        if TS_TARGET.search(other) and not re.search(r"last|updated|prev|current", other, re.I):
+            hit("SOL-TIMESTAMP-EQUALITY", f"`block.{m.group(1) or m.group(4)}` compared for equality with `{other}`",
+                b0 + m.start())
+            break
+
+    # FG-36 fixed gas stipend
+    for m in NATIVE_ONE_ARG.finditer(body):
+        close = match_close(body, m.end() - 1, "(", ")")
+        if len(_split_params(body[m.end():close])) == 1 and m.group(1) not in ("super", "this"):
+            hit("SOL-GAS-STIPEND", f"Ether sent with `.{m.group(2)}` (2300 gas stipend)", b0 + m.start())
+            break
+    else:
+        m = FIXED_GAS.search(body)
+        if m:
+            hit("SOL-GAS-STIPEND", "External call with a hard-coded gas amount", b0 + m.start())
+
+    # FG-37 hand-decoded calldata
+    m = re.search(r"\bcalldataload\s*\(\s*(0x[0-9a-fA-F]+|\d+)\s*\)", body)
+    if m and int(m.group(1), 0) >= 4 and not re.search(r"calldatasize|msg\.data\.length", sf.clean[c.start:c.end]):
+        hit("SOL-SHORT-CALLDATA", f"`{fn.name}` reads calldata at fixed offsets and never checks its length",
+            b0 + m.start())
+
+    full = _with_locals(sf, c, fn)
+    # FG-38 order filled without state checks
+    if fn.exposed and fn.state_changing and re.match(r"^_?(fill|execute|match|take|settle)\w*order", fn.name, re.I) and \
+            any("order" in (p[0] + p[1]).lower() for p in fn.params) and \
+            not re.search(r"filled|cancel|status|isValid|validat|verify|used|executed|remaining|nonce|invalidat", full, re.I):
+        hit("SOL-DIRTY-ORDER", f"`{fn.name}` fills an order without checking filled/cancelled state or a nonce",
+            fn.line, is_line=True)
+
+    # FG-39 / FG-40 swap protection
+    m = SLIPPAGE_ZERO.search(body)
+    if m:
+        hit("SOL-SLIPPAGE-ZERO", "Swap with a minimum output of 0", b0 + m.start())
+    m = DEADLINE_NOW.search(body)
+    if m:
+        hit("SOL-DEADLINE-NOW", "Swap deadline is `block.timestamp`", b0 + m.start())
+
+    # FG-41 / FG-42 governance tallies
+    if fn.exposed and re.match(r"^(castVote\w*|vote\w*)$", fn.name) and re.search(r"\+=|\+\+", full) and \
+            not re.search(r"hasVoted|voted|receipt|alreadyVoted|hasCast|ballot", full, re.I):
+        hit("SOL-VOTE-DOUBLE-COUNT", f"`{fn.name}` adds to the tally with no has-voted check", fn.line,
+            preset=7, is_line=True)
+    if fn.exposed and re.match(r"^delegate(BySig)?$", fn.name) and re.search(r"\+=", full) and not re.search(r"-=", full):
+        hit("SOL-DELEGATE-INFLATION", f"`{fn.name}` adds votes to the new delegate and never removes them from the old one",
+            fn.line, preset=7, is_line=True)
+
+    # FG-43 / FG-44 loops
+    for off, block in _loops(body):
+        if fn.exposed and fn.state_changing and NATIVE_PAY.search(block):
+            hit("SOL-ETH-PUSH-LOOP", f"`{fn.name}` sends ether to every entry of a loop", b0 + off)
+            break
+    for off, block in _loops(body):
+        if "msg.value" in block:
+            hit("SOL-MSG-VALUE-LOOP", f"`msg.value` read inside a loop in `{fn.name}`", b0 + off)
+            break
+    else:
+        if fn.mutability == "payable" and re.search(r"address\s*\(\s*this\s*\)\s*\.\s*delegatecall", body):
+            m = re.search(r"delegatecall", body)
+            hit("SOL-MSG-VALUE-LOOP", f"payable `{fn.name}` delegatecalls into itself (msg.value reused per call)",
+                b0 + m.start())
+
+    # FG-47 downcast of a caller-supplied 256-bit value with no bound in sight
+    if fn.exposed and fn.kind == "function" and not re.search(r"\bSafeCast\w*\b", sf.clean):
+        wide = {p[1] for p in fn.params if p[0] in ("uint256", "int256", "uint", "int") and p[1]}
+        for m in DOWNCAST.finditer(body):
+            close = match_close(body, m.end() - 1, "(", ")")
+            arg = body[m.end():close].strip()
+            if arg not in wide:
+                continue
+            if re.search(rf"(?<![\w.$]){re.escape(arg)}\s*(<=?|>=?)|(<=?|>=?)\s*{re.escape(arg)}\b", body):
+                continue
+            hit("SOL-UNSAFE-DOWNCAST", f"`{m.group(1)}{m.group(2)}({arg})` truncates the caller's value silently",
+                b0 + m.start())
+            break
+
+
+def _split_args_sol(text: str) -> list[str]:
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def solidity_pack_contract(sf: _SolFile, c: SolContract, add, inherited: set[str]) -> None:
+    cname = c.name
+    text = sf.clean[c.start:c.end]
+
+    def hit(rule, title, off, preset=None, is_line=False):
+        add(rule, signatures.severity(rule), _SIG_LAYER.get(rule, "L4"), title, off,
+            signatures.lookup(rule).mitigation, preset=preset, contract=cname, is_line=is_line)
+
+    # FG-10 read-only reentrancy
+    late: dict[str, str] = {}
+    for fn in c.functions:
+        if not (fn.exposed and fn.state_changing and fn.kind == "function"):
+            continue
+        body = sf.body(fn)
+        calls = list(EXTERNAL_CALL.finditer(body)) + list(LOW_LEVEL_CALL.finditer(body))
+        if calls:
+            first = fn.body_start + min(m.start() for m in calls)
+            for off, var in sf.writes(c, fn.body_start, fn.body_end):
+                if off > first:
+                    late.setdefault(var, fn.name)
+    if late:
+        for fn in c.functions:
+            if not (fn.exposed and fn.kind == "function" and fn.mutability == "view"):
+                continue
+            body = sf.body(fn)
+            used = [v for v in late if re.search(rf"(?<![\w.$]){re.escape(v)}\b", body)]
+            if used and not VIEW_GUARD.search(body) and not any(REENTRANCY_GUARDS.match(m) or "nonReentrant" in m
+                                                               for m in fn.modifiers):
+                hit("SOL-READONLY-REENTRANCY",
+                    f"`{fn.name}` returns `{used[0]}`, which `{late[used[0]]}` updates after an external call",
+                    fn.line, preset=8, is_line=True)
+
+    # FG-15 TWAP window constants
+    if TWAP_CALL.search(text):
+        for m in TWAP_CONST.finditer(sf.clean, c.start, c.end):
+            secs = _seconds(m.group(2), m.group(3))
+            if 0 < secs < TWAP_MIN:
+                hit("SOL-TWAP-SHORT-WINDOW", f"TWAP window `{m.group(1)}` is {secs} s", c.start + (m.start() - c.start), preset=6)
+
+    if c.kind == "interface" or c.kind == "library":
+        return
+    upgradeable = _upgradeable(sf, c)
+    mutable_vars = [(v, meta) for v, meta in c.state_vars.items() if meta["mutable"] and not meta.get("transient")]
+    # FG-21 implementation never locks its initializers
+    public_init = any(f.exposed and any(m in ("initializer", "reinitializer") for m in f.modifiers) for f in c.functions)
+    if c.kind == "contract" and upgradeable and public_init and c.name not in inherited \
+            and not re.search(r"_disableInitializers\s*\(", text):
+        hit("SOL-IMPL-NOT-DISABLED", f"`{cname}` is upgradeable and its constructor never calls `_disableInitializers()`",
+            c.line, is_line=True)
+    # FG-23 proxy with its own storage
+    if any(f.kind == "fallback" for f in c.functions) and "delegatecall" in text and mutable_vars:
+        v, meta = mutable_vars[0]
+        hit("SOL-PROXY-STORAGE-COLLISION", f"Delegating proxy `{cname}` stores `{v}` in an ordinary slot",
+            meta["line"], is_line=True)
+    # FG-25 storage gap
+    raw_text = sf.raw[c.start:c.end]
+    if upgradeable and (c.kind == "abstract contract" or c.name in inherited) and mutable_vars \
+            and "__gap" not in text and not re.search(r"erc7201|storage-location", raw_text, re.I):
+        hit("SOL-STORAGE-GAP", f"Upgradeable base `{cname}` has state but no `__gap`", c.line, is_line=True)
+
+
+def solidity_pack_file(sf: _SolFile, add) -> None:
+    # FG-48 compiler without checked arithmetic
+    pm = re.search(r"pragma\s+solidity\s+([^;]+);", sf.clean)
+    if not pm:
+        return
+    spec = pm.group(1)
+    minors = [int(x) for x in re.findall(r"0\.(\d+)", spec)]
+    open_ended = re.search(r">", spec) and not re.search(r"<", spec)  # ">=0.5.0" also compiles under 0.8
+    if minors and max(minors) < 8 and not open_ended and not re.search(r"\b\w*SafeMath\b|\.\s*(add|sub|mul)\s*\(", sf.clean):
+        for c in sf.contracts:
+            for fn in c.functions:
+                if re.search(r"[\w)\]]\s*(?:[-+*]|\+=|-=|\*=)\s*[\w(]", sf.body(fn).replace("++", "").replace("--", "")):
+                    add("SOL-NO-OVERFLOW-CHECKS", signatures.severity("SOL-NO-OVERFLOW-CHECKS"), "L4",
+                        f"`pragma solidity {pm.group(1).strip()}` has no overflow checks and the code does arithmetic "
+                        "without SafeMath", line_of(sf.clean, pm.start()),
+                        signatures.lookup("SOL-NO-OVERFLOW-CHECKS").mitigation, is_line=True)
+                    return
+
+
+def diamond_slots(sol_files: list[tuple[str, str]]) -> list[Finding]:
+    """FG-24: the same storage namespace string hashed under two different names (across all .sol files)."""
+    seen: dict[str, list[tuple[str, str, int, str]]] = {}
+    for rel, raw in sol_files:
+        text = strip_comments(raw, blank_strings=False)
+        lines = raw.splitlines()
+        for m in SLOT_DEF.finditer(text):
+            ns = m.group(2)
+            if ns.lower().startswith("eip1967."):
+                continue
+            ln = line_of(text, m.start())
+            seen.setdefault(ns, []).append((rel, m.group(1), ln, snippet(lines, ln)))
+    out = []
+    for ns, defs in seen.items():
+        names = []
+        for rel, name, ln, ev in defs:
+            if name not in names:
+                names.append(name)
+                if len(names) > 1:
+                    out.append(Finding("SOL-DIAMOND-SLOT-REUSE", signatures.severity("SOL-DIAMOND-SLOT-REUSE"), "L4",
+                                       f"`{name}` and `{names[0]}` both hash \"{ns}\" (same storage slot)", rel, ln, ev,
+                                       signatures.lookup("SOL-DIAMOND-SLOT-REUSE").mitigation))
+    return out
+
+
+_SIG_LAYER = {
+    "SOL-READONLY-REENTRANCY": "L4", "SOL-TWAP-SHORT-WINDOW": "L4", "SOL-ORACLE-BAD-PRICE": "L1",
+    "SOL-IMPL-NOT-DISABLED": "L2", "SOL-UUPS-NO-AUTH": "L2", "SOL-PROXY-STORAGE-COLLISION": "L4",
+    "SOL-STORAGE-GAP": "L4", "SOL-ARBITRARY-CALL": "L5", "SOL-SIG-MALLEABLE": "L2", "SOL-TIMESTAMP-EQUALITY": "L4",
+    "SOL-GAS-STIPEND": "L5", "SOL-SHORT-CALLDATA": "L1", "SOL-DIRTY-ORDER": "L4", "SOL-SLIPPAGE-ZERO": "L1",
+    "SOL-DEADLINE-NOW": "L1", "SOL-VOTE-DOUBLE-COUNT": "L4", "SOL-DELEGATE-INFLATION": "L4", "SOL-ETH-PUSH-LOOP": "L5",
+    "SOL-MSG-VALUE-LOOP": "L4", "SOL-UNSAFE-DOWNCAST": "L4",
+}
+
+
 def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Finding], list[SolContract]]:
     sf = _SolFile(rel, raw)
     out: list[Finding] = []
@@ -530,6 +880,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
         add("SOL-FLOATING-PRAGMA", "LOW", "L9", f"Floating pragma `{pm.group(1).strip()}`", pragma_line,
             "Pin the compiler version you tested with (e.g. `pragma solidity 0.8.24;`).", is_line=True)
 
+    inherited = _inherited_names(sf)
     nft_only = bool(re.search(r"\bI?ERC(721|1155)\w*", sf.clean)) and not re.search(r"\bI?ERC20\w*|SafeERC20", sf.clean)
     for c in sf.contracts:
         if c.kind == "interface":
@@ -681,6 +1032,8 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                             contract=cname)
                         break
 
+            solidity_pack_fn(sf, c, fn, add, _authorized(sf, c, fn))
+
             # Presets
             if fn.exposed and SPOT_PRICE.search(body):
                 m = SPOT_PRICE.search(body)
@@ -744,6 +1097,8 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                         b0 + m.start(), "Keep `unchecked` to loop counters and proven bounds; document the bound "
                         "next to each unchecked operation.", contract=cname)
 
+        solidity_pack_contract(sf, c, add, inherited)
+
         # Preset 05: tstore slots never written back to zero
         stores: dict[str, list[tuple[int, str]]] = {}
         for m in TSTORE.finditer(sf.clean, c.start, c.end):
@@ -760,6 +1115,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                 add("SOL-TRANSIENT-LEAK", "HIGH", "L4", f"Transient variable `{var}` is never reset", meta["line"],
                     "Reset it (`delete x;`) at the end of every function that sets it.", preset=5, contract=cname, is_line=True)
 
+    solidity_pack_file(sf, add)
     for m in re.finditer(r"\btx\.origin\b", sf.clean):
         add("SOL-TX-ORIGIN", "CRITICAL", "L2", "Authorization through `tx.origin`", m.start(),
             "Use `msg.sender`; any contract the user calls can act as them under `tx.origin`.")
@@ -858,6 +1214,48 @@ LINE_RULES: tuple[LineRule, ...] = (
              _r(r"^\s+global\s+[A-Za-z_]\w*"),
              "Keep request state local or in a store with explicit locking; globals drift between requests and workers.",
              frozenset({PY})),
+    LineRule("WEB-NOSQL", "HIGH", "L6", "NoSQL query built from the raw request object",
+             _r(r"\$where\b|\.(find|findOne|findOneAndDelete|deleteOne|deleteMany|countDocuments|where|aggregate)\s*\(\s*"
+                r"(req\.(body|query)|request\.(json|args|get_json\(\)))\s*\)"),
+             "Pick the expected fields and cast them (`String(req.body.email)`); never pass `$where` or a whole body.",
+             frozenset({PY, JS, PHP})),
+    LineRule("WEB-SSTI", "CRITICAL", "L6", "Template built from request data",
+             _r(r"(render_template_string|from_string|renderString|\bTemplate|ejs\.render|pug\.render|pug\.compile|"
+                r"[Hh]andlebars\.compile|_\.template)\s*\([^)\n]*(request\.(args|form|values|json|get_json|data)|"
+                r"req\.(body|query|params))|render_template_string\s*\(\s*(f['\"]|[^)\n]*(%\s*\(|\.format\(|\+\s*\w))"),
+             "Render fixed template files and pass request values as context variables.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-SSRF", "HIGH", "L6", "Outbound request to a URL from the request",
+             _r(r"(requests\.\w+|httpx\.\w+|urlopen|\bfetch|axios(?:\.\w+)?|\bgot(?:\.\w+)?|https?\.(?:get|request)|"
+                r"curl_init)\s*\(\s*[^)\n]*(request\.(args|form|values|json|get_json)|req\.(body|query|params)|"
+                r"\$_(GET|POST|REQUEST))"),
+             "Allowlist hosts, block private and metadata addresses (169.254.169.254), and disable redirects.",
+             frozenset({PY, JS, PHP})),
+    LineRule("WEB-XXE", "HIGH", "L6", "XML parser resolves external entities",
+             _r(r"resolve_entities\s*=\s*True|\bnoent\s*:\s*true|LIBXML_NOENT|libxml_disable_entity_loader\s*\(\s*false"),
+             "Use defusedxml or switch entity resolution off.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-MASS-ASSIGNMENT", "HIGH", "L1", "Whole request body written into a model",
+             _r(r"\.(create|update|insert|insertOne|insertMany|build|updateOne|updateMany|findOneAndUpdate|"
+                r"findByIdAndUpdate|upsert)\s*\(\s*(?:[^,()]+(?:\([^()]*\))?\s*,\s*)?req\.body\s*[,)]|"
+                r"new\s+[A-Z]\w*\s*\(\s*req\.body\s*\)|Object\.assign\s*\(\s*\w+\s*,\s*req\.body\s*\)|\{\s*\.\.\.req\.body\b|"
+                r"[A-Z]\w*\s*\(\s*\*\*\s*request\.(json|form|get_json\(\)|values)|\.update\s*\(\s*\*\*\s*request\.|"
+                r"for\s+\w+\s*,\s*\w+\s+in\s+request\.(json|form|get_json\(\))\.items\s*\(\s*\)|"
+                r"(::create|->fill|->update)\s*\(\s*\$request->all\s*\(\s*\)"),
+             "Copy only the fields the caller may change into the model.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-TIMING-COMPARE", "MEDIUM", "L7", "Secret compared with == (not constant time)",
+             _r(r"\b[\w.$]*(?:token|secret|signature|hmac|digest|api_?key|apikey|otp|csrf)[\w$]*(?:\[[^\]]*\])?\s*"
+                r"(?:===?|!==?)\s*(?!(?:null|undefined|None|True|False|true|false|0)\b|['\"`]|typeof\b)[A-Za-z_$(]", re.I),
+             "Compare with `hmac.compare_digest` / `crypto.timingSafeEqual` / `hash_equals`.", frozenset({PY, JS, PHP}),
+             unless=_r(r"compare_digest|timingSafeEqual|hash_equals|secure_compare|constantTimeEq|safeCompare")),
+    LineRule("WEB-TOKEN-ENTROPY", "MEDIUM", "L7", "Token with too little entropy",
+             _r(r"secrets\.token_(hex|bytes|urlsafe)\s*\(\s*([1-9]|1[0-5])\s*\)|randomBytes\s*\(\s*([1-9]|1[0-5])\s*\)|"
+                r"random_bytes\s*\(\s*([1-9]|1[0-5])\s*\)|\buuid\.?uuid1\s*\(|"
+                r"\buuidv1\s*\(|\buuid\.v1\s*\(|\buniqid\s*\(|Date\.now\(\)\.toString\(\s*36\s*\)|str\(\s*time\.time\(\)\s*\)"),
+             "Use 16+ random bytes from a CSPRNG (`secrets.token_urlsafe(32)`).", WEB, needs=SECRET_TERMS),
+    LineRule("WEB-COOKIE-INSECURE", "MEDIUM", "L7", "Session cookie flags switched off",
+             _r(r"SESSION_COOKIE_(SECURE|HTTPONLY)\s*=\s*False|httpOnly\s*:\s*false|\bsecure\s*:\s*false|"
+                r"session\.cookie_(secure|httponly)['\"]?\s*,\s*['\"]?(0|false|off)", re.I),
+             "Set `Secure; HttpOnly; SameSite=Lax` on session cookies.", frozenset({PY, JS, PHP}),
+             needs=_r(r"cookie|session", re.I)),
     LineRule("WEB-MUTABLE-DEFAULT", "MEDIUM", "L4", "Mutable default argument shared between calls",
              _r(r"def\s+\w+\s*\([^)]*=\s*(\[\]|\{\}|set\(\))"),
              "Default to `None` and create the list/dict inside the function.", frozenset({PY})),
@@ -867,6 +1265,23 @@ LINE_RULES: tuple[LineRule, ...] = (
 def _lang(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return (PY if ext in PY_EXT else JS if ext in JS_EXT else HTML if ext in HTML_EXT else PHP if ext in PHP_EXT else None)
+
+
+FILE_RULE_LAYER = {"WEB-BODY-LIMIT": "L9", "WEB-RATE-LIMIT": "L2", "WEB-SSRF": "L6", "WEB-IDOR": "L2",
+                   "WEB-COOKIE-INSECURE": "L7", "WEB-XXE": "L6", "WEB-NO-HEADERS-MW": "L9", "WEB-VULN-DEPENDENCY": "L9"}
+
+
+def check_manifest(rel: str, raw: str) -> list[Finding]:
+    """FG-90: package.json, package-lock.json and requirements*.txt against the offline advisory list."""
+    lines = raw.splitlines()
+    sig = signatures.lookup("WEB-VULN-DEPENDENCY")
+    return [Finding(rule, sig.severity, "L9", title, rel, ln, snippet(lines, ln), sig.mitigation)
+            for rule, ln, title in signatures.check_manifest(rel, raw)]
+
+
+def is_manifest(name: str) -> bool:
+    low = name.lower()
+    return low in ("package.json", "package-lock.json") or (low.startswith("requirements") and low.endswith(".txt"))
 
 
 def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
@@ -892,9 +1307,9 @@ def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
             if rule.pattern.search(ln):
                 out.append(Finding(rule.rule, rule.severity, rule.layer, rule.title, rel, i, snippet(lines, i),
                                    rule.mitigation))
-    for rule, ln, title in signatures.check_backend(raw, lang):
+    for rule, ln, title in signatures.check_backend(raw, lang) + signatures.missing_security_headers(raw, lang):
         sig = signatures.lookup(rule)
-        out.append(Finding(rule, sig.severity, "L9" if rule == "WEB-BODY-LIMIT" else "L2", title, rel, ln,
+        out.append(Finding(rule, sig.severity, FILE_RULE_LAYER.get(rule, "L2"), title, rel, ln,
                            snippet(lines, ln), sig.mitigation))
     if lang == HTML:
         out += check_html(rel, raw)
@@ -1070,6 +1485,10 @@ def discover(root: Path, config: ScanConfig | None = None) -> list[Path]:
                              and not config.ignored((here / d).relative_to(root).as_posix()))
         for f in sorted(filenames):
             p = here / f
+            if is_manifest(f):
+                if not config.ignored(p.relative_to(root).as_posix()):
+                    files.append(p)
+                continue
             if p.suffix.lower() not in SCANNED_EXT or f.endswith((".t.sol", ".s.sol", ".min.js", ".d.ts")):
                 continue
             if re.search(r"(^test_|_test\.py$|\.test\.|\.spec\.)", f):
@@ -1095,7 +1514,8 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
     config = config if config is not None else load_scan_config(target)
     base = target.parent if target.is_file() else target
     files = discover(target, config)
-    limiter_seen = False
+    limiter_seen = headers_seen = False
+    sol_sources: list[tuple[str, str]] = []
     findings: list[Finding] = []
     sol_contracts: dict[str, list[SolContract]] = {}
     lines = 0
@@ -1114,9 +1534,15 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
         rel = p.relative_to(base).as_posix() if p != base else p.name
         lines += raw.count("\n") + 1
         limiter_seen = limiter_seen or (p.suffix.lower() not in SOL_EXT and signatures.limiter_present(raw))
+        headers_seen = headers_seen or (p.suffix.lower() not in SOL_EXT and signatures.headers_present(raw))
+        if is_manifest(p.name):
+            kinds.add("web")
+            findings += check_manifest(rel, raw)
+            continue
         if web_surface.relevant(rel, raw):
             bridge_sources.append((rel, raw))
         if p.suffix.lower() in SOL_EXT:
+            sol_sources.append((rel, raw))
             kinds.add("solidity")
             f, contracts = check_solidity(rel, raw, presets)
             findings += f
@@ -1136,6 +1562,10 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
             bridge = rep.as_dict()
     if limiter_seen:  # a limiter wired up in another file (app-wide middleware) covers the auth routes
         findings = [f for f in findings if f.rule != "WEB-RATE-LIMIT"]
+    if headers_seen:  # helmet/Talisman or explicit header code anywhere covers the app
+        findings = [f for f in findings if f.rule != "WEB-NO-HEADERS-MW"]
+    if sol_sources:
+        findings += diamond_slots(sol_sources)
     findings = signatures.apply(findings, config.severity)
     if config.source:
         notes.append(f"config: {config.source}")
@@ -1374,6 +1804,10 @@ td.loc { white-space: nowrap; } td.ev { color: #555; word-break: break-word; }
 ol.plan li { margin: 6px 0; }
 ol.plan pre.fix { margin: 4px 0 0; padding: 6px 8px; background: #f4f5f6; border-left: 3px solid #4a5560; font-size: 12px; }
 span.sig { font-weight: 700; color: #2f3a44; }
+details.sigdb { margin: 8px 0; } details.sigdb summary { cursor: pointer; font-weight: 700; padding: 4px 0; }
+table.sigmatch { table-layout: fixed; width: 100%; min-width: 760px; } table.sigmatch td { vertical-align: top; word-break: break-word; }
+table.sigmatch td.loc { white-space: normal; } table.sigmatch .ref { font-size: 11px; } table.sigmatch pre.fix { margin: 0; padding: 6px 8px; background: #f4f5f6;
+  border-left: 3px solid #4a5560; font-size: 12px; white-space: pre-wrap; }
 tr.sigrow td { color: #8a9096; } tr.sigrow td:nth-child(-n+5) { white-space: nowrap; } tr.sigrow.hit td { color: #111; } tr.sigrow.hit td.n { font-weight: 700; }
 """
 
@@ -1395,25 +1829,55 @@ def _sig_tag(f: Finding) -> str:
     return f'<span class="sig">{_h(f.signature)}</span> ' if f.signature else ""
 
 
-def signature_section(findings: list[Finding]) -> list[str]:
-    """Layer 13 table: every signature in the database, how often it matched and what it costs."""
-    hits = signatures.hits(findings)
-    sev_now = {}
-    for f in findings:
-        if f.signature:
-            sev_now.setdefault(f.signature, f.severity)
-    out = ["<h2>Signature database</h2>",
-           f'<p class="muted">{len(signatures.SIGNATURES)} signatures, {sum(1 for v in hits.values() if v)} matched. '
-           "Severities can be changed or switched off in foundryguard.toml under [score.severity].</p>",
-           '<div class="scroll"><table><tr><th>ID</th><th>Stack</th><th>Rule</th><th>Severity</th><th>Ref</th>'
-           '<th class="n">Hits</th><th>Signature</th></tr>']
-    for sig in signatures.SIGNATURES:
+def _sig_rows(sigs, hits: dict[str, int], sev_now: dict[str, str]) -> list[str]:
+    out = []
+    for sig in sigs:
         n = hits[sig.id]
         sev = sev_now.get(sig.id, sig.severity)
         out.append(f'<tr class="sigrow{" hit" if n else ""}"><td>{_h(sig.id)}</td><td>{_h(sig.stack)}</td>'
                    f"<td>{_h(sig.rule)}</td><td><span class=\"sev {sev}\">{sev}</span></td><td>{_h(sig.ref)}</td>"
                    f'<td class="n">{n}</td><td>{_md(sig.title)}</td></tr>')
-    out.append("</table></div>")
+    return out
+
+
+SIG_HEAD = ('<div class="scroll"><table><tr><th>ID</th><th>Stack</th><th>Rule</th><th>Severity</th><th>Ref</th>'
+            '<th class="n">Hits</th><th>Signature</th></tr>')
+
+
+def signature_section(findings: list[Finding]) -> list[str]:
+    """Layer 13: matched signatures with their fixes first, then the whole database split by surface."""
+    hits = signatures.hits(findings)
+    sev_now = {}
+    for f in findings:
+        if f.signature:
+            sev_now.setdefault(f.signature, f.severity)
+    matched = [s for s in signatures.SIGNATURES if hits[s.id]]
+    web3 = [s for s in signatures.SIGNATURES if s.surface == "web3"]
+    web2 = [s for s in signatures.SIGNATURES if s.surface == "web2"]
+    out = ["<h2>Signature database</h2>",
+           f'<p class="muted">{len(signatures.SIGNATURES)} signatures ({len(web3)} contract, {len(web2)} web), '
+           f"{len(matched)} matched. Severities can be changed or switched off in foundryguard.toml under "
+           "[score.severity].</p>"]
+    if matched:
+        out.append('<h3>Matched</h3><div class="scroll"><table class="sigmatch"><colgroup><col style="width:13%">'
+                   '<col style="width:29%"><col style="width:6%"><col style="width:20%"><col style="width:32%">'
+                   '</colgroup><tr><th>ID</th><th>Rule</th><th class="n">Hits</th><th>Where</th><th>Fix</th></tr>')
+        for sig in matched:
+            locs = [f.location for f in findings if f.signature == sig.id]
+            where = "<br>".join(_h(x) for x in locs[:6]) + (f"<br>and {len(locs) - 6} more" if len(locs) > 6 else "")
+            sev = sev_now.get(sig.id, sig.severity)
+            out.append(f'<tr><td><span class="sig">{_h(sig.id)}</span><br><span class="sev {sev}">{sev}</span>'
+                       f'<br><span class="muted ref">{_h(sig.ref)}</span></td>'
+                       f"<td>{_h(sig.rule)}<br><span class=\"muted\">{_md(sig.title)}</span></td>"
+                       f'<td class="n">{hits[sig.id]}</td><td class="loc">{where}</td>'
+                       f'<td><pre class="fix">{_h(sig.fix)}</pre></td></tr>')
+        out.append("</table></div>")
+    for title, sigs in ((f"Contract surface, FG-01 to FG-{signatures.WEB3_LAST:02d}", web3),
+                        (f"Web surface, FG-{signatures.WEB3_LAST + 1:02d} to FG-{len(signatures.SIGNATURES):02d}", web2)):
+        n_hit = sum(1 for s in sigs if hits[s.id])
+        out.append(f'<details class="sigdb"><summary>{_h(title)} ({n_hit} of {len(sigs)} matched)</summary>{SIG_HEAD}')
+        out += _sig_rows(sigs, hits, sev_now)
+        out.append("</table></div></details>")
     return out
 
 
@@ -1561,7 +2025,7 @@ def cmd_score(args) -> int:
     else:
         print(f"{result.score}/100 {result.verdict}  {len(result.findings)} deduction(s)  {page}")
         for f in result.findings[:20]:
-            print(f"  -{f.points:<3} {f.severity:<8} {f.layer:<3} {(f.signature or '-'):<5} {f.rule:<26} {f.location}  {f.title}")
+            print(f"  -{f.points:<3} {f.severity:<8} {f.layer:<3} {(f.signature or '-'):<6} {f.rule:<26} {f.location}  {f.title}")
         if len(result.findings) > 20:
             print(f"  ... {len(result.findings) - 20} more in the report")
         if result.bridge and result.bridge.get("links"):

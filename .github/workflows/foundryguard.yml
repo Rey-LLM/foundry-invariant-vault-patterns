@@ -40,6 +40,7 @@ jobs:
         run: |
           foundryguard score tests/foundryguard/fixtures/signatures/safe --out "$RUNNER_TEMP/sig-safe" --min-score 100
           ! foundryguard score tests/foundryguard/fixtures/signatures/weak --out "$RUNNER_TEMP/sig-weak" --min-score 50
+          ! foundryguard score tests/foundryguard/fixtures/ultrapack/weak --out "$RUNNER_TEMP/pack-weak" --min-score 50
 
   forge:
     name: Generated suites build and run

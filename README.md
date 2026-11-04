@@ -89,7 +89,7 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | 10 | `scoring.py`, `gui.py` | 1-100 score, preset matrix, desktop window |
 | 11 | `scoring.py` | backend and site code rules |
 | 12 | `web_surface.py` | backend to contract bridge |
-| 13 | `signatures.py` | the signature database (FG-01 to FG-15) |
+| 13 | `signatures.py` | the signature database (FG-01 to FG-103 since 0.15) |
 
 ### Scanning
 
@@ -360,29 +360,136 @@ Express, Fastify-style routers, Next.js route handlers, Flask and FastAPI routes
 
 ### Signature database
 
-Fifteen signatures sit on top of the score rules. Each has a fixed cost, a CWE or SWC reference and a fix example, and every hit in the report and in `--json` carries its id.
+103 signatures sit on top of the score rules, each a separate failure mode with a fixed cost, a CWE or SWC reference and a fix example. Every hit in the report and in `--json` carries its id. FG-01 to FG-50 cover contracts; FG-51 to FG-103 cover backend code, response headers, dependency manifests and the backend-to-contract bridge.
 
-| ID | Stack | Rule | Severity | Catches |
-| :-- | :-- | :-- | :-- | :-- |
-| FG-01 | Solidity | `SOL-ZERO-ADDRESS` | HIGH | address parameter stored without an `address(0)` check |
-| FG-02 | Solidity | `SOL-DIV-BEFORE-MUL` | HIGH | `a / b * c` precision loss |
-| FG-03 | Solidity | `SOL-TX-ORIGIN` | CRITICAL | `tx.origin` used for authorization |
-| FG-04 | Solidity | `SOL-WEAK-RANDOMNESS` | HIGH | randomness from `block.timestamp`, `prevrandao`, `blockhash` (hashed or `%`) |
-| FG-05 | Solidity | `SOL-UNCHECKED-CALL` | HIGH | `.call` / `.send` result ignored |
-| FG-06 | Solidity | `SOL-ERC20-UNCHECKED` | HIGH | ERC-20 `transfer` / `transferFrom` / `approve` bool ignored |
-| FG-07 | Solidity | `SOL-ARBITRARY-FROM` | CRITICAL | `transferFrom(from, ...)` with `from` chosen by the caller |
-| FG-08 | Solidity | `SOL-UNBOUNDED-LOOP` | HIGH | entry point loops over a whole storage array |
-| FG-09 | Backend | `WEB-SECRET` | CRITICAL | private keys, API keys and tokens in source |
-| FG-10 | Backend | `WEB-WEAK-RANDOM` | HIGH | `Math.random()` / `random` in token, nonce or password code |
-| FG-11 | Backend | `WEB-BODY-LIMIT` | HIGH | Flask without `MAX_CONTENT_LENGTH`, multer without `limits`, body parsers above 50 MB |
-| FG-12 | Backend | `WEB-RATE-LIMIT` | HIGH | login, signup, reset, OTP or token routes with no rate limiter anywhere in the project |
-| FG-13 | Backend | `WEB-CORS-ANY` | HIGH | wildcard CORS |
-| FG-14 | Backend | `WEB-EVAL` | CRITICAL | `eval`, `exec`, `new Function` |
-| FG-15 | Backend | `WEB-COMMAND` | CRITICAL | shell commands built at runtime (`os.system`, `child_process`, `shell=True`) |
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-01 | Solidity | `SOL-ZERO-ADDRESS` | HIGH | CWE-20 / SWC-123 | Address parameter stored without a zero-address check |
+| FG-02 | Solidity | `SOL-DIV-BEFORE-MUL` | HIGH | CWE-682 / SWC-101 | Division before multiplication loses precision |
+| FG-03 | Solidity | `SOL-TX-ORIGIN` | CRITICAL | CWE-477 / SWC-115 | Authorization through tx.origin |
+| FG-04 | Solidity | `SOL-WEAK-RANDOMNESS` | HIGH | CWE-330 / SWC-120 | Randomness derived from block values |
+| FG-05 | Solidity | `SOL-UNCHECKED-CALL` | HIGH | CWE-252 / SWC-104 | Low-level call or send whose result is ignored |
+| FG-06 | Solidity | `SOL-ERC20-UNCHECKED` | HIGH | CWE-252 / SWC-104 | ERC-20 transfer/transferFrom/approve whose bool is ignored |
+| FG-07 | Solidity | `SOL-ARBITRARY-FROM` | CRITICAL | CWE-285 | transferFrom pulls from a caller-chosen address |
+| FG-08 | Solidity | `SOL-UNBOUNDED-LOOP` | HIGH | CWE-834 / SWC-128 | Loop over a storage array that anyone can grow |
+| FG-09 | Solidity | `SOL-CEI-DRIFT` | HIGH | CWE-841 / SWC-107 | Reentrancy: state written after an external call |
+| FG-10 | Solidity | `SOL-READONLY-REENTRANCY` | HIGH | CWE-841 / SWC-107 | View function exposes state that is stale during an external call |
+| FG-11 | Solidity | `SOL-SPOT-PRICE` | HIGH | CWE-807 | Price read from a pool's spot reserves (flash-loan manipulable) |
+| FG-12 | Solidity | `SOL-DONATION-DRIFT` | MEDIUM | CWE-682 | Accounting reads the contract's own balance (donation manipulable) |
+| FG-13 | Solidity | `SOL-SHARE-INFLATION` | HIGH | CWE-1339 | First-depositor share inflation (no virtual offset) |
+| FG-14 | Solidity | `SOL-FLASH-VOTE` | HIGH | CWE-807 | Votes weighed by live balance (flash-loan votes) |
+| FG-15 | Solidity | `SOL-TWAP-SHORT-WINDOW` | HIGH | CWE-807 | TWAP window shorter than 30 minutes (TWAP squeeze) |
+| FG-16 | Solidity | `SOL-STALE-ORACLE` | MEDIUM | CWE-672 | Oracle answer used without a staleness check |
+| FG-17 | Solidity | `SOL-ORACLE-BAD-PRICE` | MEDIUM | CWE-20 | Oracle answer cast to uint without checking it is positive |
+| FG-18 | Solidity | `SOL-TRANSIENT-LEAK` | HIGH | CWE-459 | Transient storage slot set and never cleared |
+| FG-19 | Solidity | `SOL-UNPROTECTED-MUTATION` | CRITICAL | CWE-284 / SWC-105 | Privileged state writable by anyone |
+| FG-20 | Solidity | `SOL-UNGUARDED-INITIALIZER` | CRITICAL | CWE-665 | Initializer without an initializer lock (can be called again) |
+| FG-21 | Solidity | `SOL-IMPL-NOT-DISABLED` | HIGH | CWE-665 | Upgradeable implementation left uninitialized |
+| FG-22 | Solidity | `SOL-UUPS-NO-AUTH` | CRITICAL | CWE-284 | UUPS `_authorizeUpgrade` with no access check |
+| FG-23 | Solidity | `SOL-PROXY-STORAGE-COLLISION` | CRITICAL | SWC-124 / CWE-123 | Proxy declares its own storage variables (slot collision) |
+| FG-24 | Solidity | `SOL-DIAMOND-SLOT-REUSE` | CRITICAL | SWC-124 / CWE-694 | Two diamond storage structs hashed to the same slot |
+| FG-25 | Solidity | `SOL-STORAGE-GAP` | MEDIUM | SWC-124 | Upgradeable base contract with state but no storage gap |
+| FG-26 | Solidity | `SOL-DELEGATECALL` | CRITICAL | SWC-112 / CWE-829 | delegatecall into a variable or caller-supplied target |
+| FG-27 | Solidity | `SOL-ARBITRARY-CALL` | CRITICAL | CWE-749 | Caller chooses both the target and the calldata of an external call |
+| FG-28 | Solidity | `SOL-SELFDESTRUCT` | HIGH | SWC-106 / CWE-284 | selfdestruct in deployed code |
+| FG-29 | Solidity | `SOL-SIG-MALLEABLE` | MEDIUM | SWC-117 / CWE-347 | Raw ecrecover accepts malleable (high-s) signatures |
+| FG-30 | Solidity | `BRIDGE-RAW-ECRECOVER` | MEDIUM | SWC-122 / CWE-252 | ecrecover result not checked against address(0) |
+| FG-31 | Solidity | `BRIDGE-SIG-REPLAY` | HIGH | SWC-121 / CWE-294 | Signature can be submitted again (no nonce consumed) |
+| FG-32 | Solidity | `BRIDGE-SIG-NO-DOMAIN` | HIGH | SWC-121 / CWE-294 | Signature not bound to chain id and contract (cross-chain replay) |
+| FG-33 | Solidity | `BRIDGE-PACKED-COLLISION` | MEDIUM | SWC-133 / CWE-328 | abi.encodePacked with two dynamic values in a signed hash |
+| FG-34 | Solidity | `BRIDGE-SIG-NO-EXPIRY` | LOW | CWE-613 | Accepted signatures never expire |
+| FG-35 | Solidity | `SOL-TIMESTAMP-EQUALITY` | MEDIUM | SWC-116 / CWE-829 | Logic depends on block.timestamp hitting an exact value |
+| FG-36 | Solidity | `SOL-GAS-STIPEND` | MEDIUM | SWC-134 / CWE-400 | Ether sent with a fixed gas stipend (transfer/send/gas: N) |
+| FG-37 | Solidity | `SOL-SHORT-CALLDATA` | MEDIUM | CWE-130 | Calldata decoded by hand without a length check (short address) |
+| FG-38 | Solidity | `SOL-DIRTY-ORDER` | HIGH | CWE-841 | Order executed without checking it is still open |
+| FG-39 | Solidity | `SOL-SLIPPAGE-ZERO` | HIGH | CWE-20 | Swap with a minimum output of zero (sandwichable) |
+| FG-40 | Solidity | `SOL-DEADLINE-NOW` | MEDIUM | CWE-20 | Swap deadline set to block.timestamp (no deadline) |
+| FG-41 | Solidity | `SOL-VOTE-DOUBLE-COUNT` | HIGH | CWE-837 | Vote tally increased without a has-voted check |
+| FG-42 | Solidity | `SOL-DELEGATE-INFLATION` | HIGH | CWE-682 | Delegation adds voting weight without removing it from the old delegate |
+| FG-43 | Solidity | `SOL-ETH-PUSH-LOOP` | HIGH | SWC-113 / CWE-703 | Ether pushed to many recipients in one loop |
+| FG-44 | Solidity | `SOL-MSG-VALUE-LOOP` | HIGH | CWE-837 | msg.value read inside a loop (or a payable multicall) |
+| FG-45 | Solidity | `SOL-INPUT-VALIDATION` | HIGH | CWE-20 | External function takes input and never validates any of it |
+| FG-46 | Solidity | `SOL-DIV-BY-TOTAL` | MEDIUM | CWE-369 | Division by a total that can be zero |
+| FG-47 | Solidity | `SOL-UNSAFE-DOWNCAST` | MEDIUM | CWE-681 / SWC-101 | Integer downcast without a bound check |
+| FG-48 | Solidity | `SOL-NO-OVERFLOW-CHECKS` | HIGH | SWC-101 / CWE-190 | Compiler before 0.8 and arithmetic without SafeMath |
+| FG-49 | Solidity | `SOL-UNCHECKED-MATH` | LOW | CWE-190 | Subtraction or multiplication inside unchecked |
+| FG-50 | Solidity | `SOL-UNFUNDED-REWARDS` | HIGH | CWE-682 | Reward rate set without checking the tokens are there |
+| FG-51 | Backend | `WEB-SECRET` | CRITICAL | CWE-798 | Private key, API key, salt or secret hardcoded in source |
+| FG-52 | Backend | `WEB-WEAK-RANDOM` | HIGH | CWE-338 | Math.random / random module used for tokens, nonces or secrets |
+| FG-53 | Backend | `WEB-BODY-LIMIT` | HIGH | CWE-770 | Request body size not capped |
+| FG-54 | Backend | `WEB-RATE-LIMIT` | HIGH | CWE-307 | Login, signup, reset or OTP route with no rate limiter in the project |
+| FG-55 | Backend | `WEB-CORS-ANY` | HIGH | CWE-942 | CORS allows any origin |
+| FG-56 | Backend | `WEB-EVAL` | CRITICAL | CWE-95 | eval / exec / new Function on runtime data |
+| FG-57 | Backend | `WEB-COMMAND` | CRITICAL | CWE-78 | Shell command built and executed at runtime |
+| FG-58 | Backend | `WEB-SQL` | CRITICAL | CWE-89 | SQL built from strings |
+| FG-59 | Backend | `WEB-NOSQL` | HIGH | CWE-943 | NoSQL query built from the raw request object (operator injection) |
+| FG-60 | Backend | `WEB-SSTI` | CRITICAL | CWE-1336 | Template rendered from a string that contains request data |
+| FG-61 | Backend | `WEB-XSS` | HIGH | CWE-79 | Untrusted HTML written into the page |
+| FG-62 | Backend | `WEB-SSRF` | HIGH | CWE-918 | Server fetches a URL taken from the request |
+| FG-63 | Backend | `WEB-XXE` | HIGH | CWE-611 | XML parser resolves external entities |
+| FG-64 | Backend | `WEB-DESERIALIZE` | HIGH | CWE-502 | Insecure deserialization of untrusted data |
+| FG-65 | Backend | `WEB-PATH-TRAVERSAL` | HIGH | CWE-22 | File path taken from the request |
+| FG-66 | Backend | `WEB-OPEN-REDIRECT` | MEDIUM | CWE-601 | Redirect target taken from the request |
+| FG-67 | Backend | `WEB-INPUT-VALIDATION` | HIGH | CWE-20 | Request input used with no validation layer in the file |
+| FG-68 | Backend | `WEB-MASS-ASSIGNMENT` | HIGH | CWE-915 | Whole request body written into a model (parameter contamination) |
+| FG-69 | Backend | `WEB-IDOR` | HIGH | CWE-639 | Record loaded by an id from the URL with no ownership check (BOLA/IDOR) |
+| FG-70 | Backend | `WEB-JWT-NONE` | HIGH | CWE-347 | JWT signature or expiry not verified |
+| FG-71 | Backend | `WEB-TIMING-COMPARE` | MEDIUM | CWE-208 | Secret, token or signature compared with == (timing leak) |
+| FG-72 | Backend | `WEB-TOKEN-ENTROPY` | MEDIUM | CWE-331 | Token with too little entropy (short or time-based) |
+| FG-73 | Backend | `WEB-WEAK-HASH` | LOW | CWE-328 | MD5 or SHA-1 in use |
+| FG-74 | Backend | `WEB-TOKEN-STORAGE` | MEDIUM | CWE-922 | Auth token kept in localStorage |
+| FG-75 | Backend | `WEB-COOKIE-INSECURE` | MEDIUM | CWE-614 / CWE-1004 | Session cookie missing Secure or HttpOnly |
+| FG-76 | Backend | `WEB-CSRF` | MEDIUM | CWE-352 | POST form without an anti-CSRF token |
+| FG-77 | Backend | `WEB-TLS-OFF` | HIGH | CWE-295 | TLS certificate checks disabled |
+| FG-78 | Backend | `WEB-PLAIN-HTTP` | MEDIUM | CWE-319 | Plain http:// endpoint or page |
+| FG-79 | HTTP headers | `WEB-MIXED-CONTENT` | MEDIUM | CWE-319 | http:// resource loaded by an https page |
+| FG-80 | Backend | `WEB-NO-SRI` | LOW | CWE-353 | Third-party script without an integrity hash |
+| FG-81 | Backend | `WEB-DEBUG` | MEDIUM | CWE-489 | Debug mode enabled |
+| FG-82 | Backend | `WEB-GLOBAL-STATE` | MEDIUM | CWE-362 | Request handler mutates module-level state (race) |
+| FG-83 | Backend | `WEB-NO-HEADERS-MW` | MEDIUM | CWE-693 | App sets no security headers (no helmet / Talisman) |
+| FG-84 | HTTP headers | `URL-NO-CSP` | HIGH | CWE-693 | No Content-Security-Policy header |
+| FG-85 | HTTP headers | `URL-WEAK-CSP` | MEDIUM | CWE-693 | CSP allows unsafe-inline or unsafe-eval |
+| FG-86 | HTTP headers | `URL-NO-HSTS` | MEDIUM | CWE-319 | No Strict-Transport-Security header |
+| FG-87 | HTTP headers | `URL-NO-NOSNIFF` | LOW | CWE-693 | No X-Content-Type-Options: nosniff |
+| FG-88 | HTTP headers | `URL-CLICKJACKING` | MEDIUM | CWE-1021 | Page can be framed by any site |
+| FG-89 | HTTP headers | `URL-VERSION-LEAK` | LOW | CWE-200 | Server or X-Powered-By header discloses a version |
+| FG-90 | Dependencies | `WEB-VULN-DEPENDENCY` | HIGH | CWE-1395 | Dependency (direct or transitive) pinned to a version with a known advisory |
+| FG-91 | Bridge | `BRIDGE-SIGNING-ORACLE` | CRITICAL | CWE-306 | Public route signs with the server key for any caller |
+| FG-92 | Bridge | `BRIDGE-OPEN-RELAYER` | CRITICAL | CWE-306 | Public route sends transactions from the server key for any caller |
+| FG-93 | Bridge | `BRIDGE-SIGNED-INPUT-UNCHECKED` | HIGH | CWE-20 | Request values signed without bounds |
+| FG-94 | Bridge | `BRIDGE-KEY-FROM-REQUEST` | CRITICAL | CWE-522 | Private key or mnemonic read from the request |
+| FG-95 | Bridge | `BRIDGE-KEY-LOGGED` | HIGH | CWE-532 | Key material written to a log or response |
+| FG-96 | Bridge | `BRIDGE-KEY-CLIENT` | CRITICAL | CWE-312 | Signing key shipped to the browser |
+| FG-97 | Bridge | `BRIDGE-TX-NONCE-RACE` | MEDIUM | CWE-362 | Transaction nonce read and set by hand without a lock |
+| FG-98 | Bridge | `BRIDGE-RECEIPT-STATUS` | HIGH | CWE-252 | Transaction receipt used without checking status |
+| FG-99 | Bridge | `BRIDGE-REORG` | MEDIUM | CWE-345 | Chain events acted on with no confirmation depth |
+| FG-100 | Bridge | `BRIDGE-ABI-DRIFT` | MEDIUM | CWE-628 | Backend calls a contract function that does not match the ABI |
+| FG-101 | Bridge | `BRIDGE-TYPEHASH-DRIFT` | HIGH | CWE-347 | Backend EIP-712 struct differs from the contract typehash |
+| FG-102 | Bridge | `BRIDGE-DOMAIN-DRIFT` | MEDIUM | CWE-347 | Backend EIP-712 domain differs from the contract |
+| FG-103 | Bridge | `BRIDGE-DEADLINE-UNENFORCED` | HIGH | CWE-613 | Backend signs an expiry the contract never checks |
 
-CRITICAL costs 25 points and HIGH 15, with the same three-hits-per-rule cap as the rest of the score. The Layer 12 rules for a seed phrase or RPC key in source count as FG-09, and weak signature nonces as FG-10. The report has a Signature database table (matched rows in black, the rest greyed out) and the mitigation plan prints each fix example under its rule.
+Costs follow the score: CRITICAL 25, HIGH 15, MEDIUM 8, LOW 3, with the three-hits-per-rule cap. Some rules have aliases that count as the same signature: the Layer 12 seed-phrase and RPC-key rules count as FG-51, weak signature nonces as FG-52, a server signature with no nonce as FG-31, an unbound server signature as FG-32, and the URL-mode CORS, plain-http and cookie checks as FG-55, FG-78 and FG-75. FG-26 keeps the severity its detector picks (CRITICAL for a caller-supplied target, MEDIUM otherwise).
 
-FG-06, FG-07, FG-08, FG-11 and FG-12 are new in 0.14; run over OpenZeppelin, Solady and this repo's modules they report nothing. Like the other score rules they read source text, not data flow, so tune them per project:
+In 0.15 the seven backend signatures that were FG-09 to FG-15 moved to FG-51 to FG-57, so a `foundryguard.toml` that tunes them by id needs the new ids; tuning by rule name is unchanged.
+
+The report lists matched signatures first with their locations and fix, then the whole database in two collapsible tables, one per surface.
+
+What the new detectors look at, and what they leave alone:
+
+* FG-10 read-only reentrancy: a public view that returns a variable some entry point writes after an external call, even under `nonReentrant`. A view that checks the lock is fine.
+* FG-15 TWAP window: literal windows or `*PERIOD`/`*WINDOW`/`*TWAP*` constants under 30 minutes in a contract that calls `consult`/`observe`.
+* FG-21 uninitialized implementation: a deployable contract with a public `initializer` function and no `_disableInitializers()`.
+* FG-24 diamond slots: the same namespace string hashed under two different constant names anywhere in the scanned tree. EIP-1967 slot strings are skipped.
+* FG-29 malleability only fires when replay protection is keyed on the signature bytes; a consumed nonce makes high-s signatures harmless.
+* FG-37 short calldata: assembly `calldataload` at a fixed offset with no `calldatasize()` / `msg.data.length` check anywhere in the contract. Solidity's ABI decoder already rejects short calldata.
+* FG-47 downcast: only a 256-bit parameter of an external function cast down with no comparison on it.
+* FG-48: a pragma that can only resolve below 0.8 (`^0.6.12`, `=0.7.6`; not `>=0.5.0`) and arithmetic with no SafeMath.
+* FG-62 SSRF: a request value reaching `requests`/`httpx`/`urlopen`/`fetch`/`axios`/`got`/`http.get` directly or through one variable.
+* FG-69 IDOR: `findById(req.params.id)`, `get_or_404(id)` and similar in a file that never mentions an owner, the current user or a 403.
+* FG-83 headers: an Express or Flask app with no helmet, Talisman or header code anywhere in the project.
+* FG-90 dependencies: `package.json` exact, `^` and `~` pins that cannot reach the fixed version, every entry in `package-lock.json` (transitive ones included) and `==` pins in `requirements*.txt`, against a short offline list (lodash, minimist, jsonwebtoken, axios, node-fetch, express, jquery, handlebars, serialize-javascript, PyYAML, requests, Jinja2, urllib3, Flask, Werkzeug). It is a floor, not a replacement for `npm audit` or `pip-audit`.
+
+Run over OpenZeppelin 5.1 (plain and upgradeable), Solady, Uniswap v2/v3, express, express-session, passport, jsonwebtoken, requests, httpx, lxml and bs4, the new rules report: four OpenZeppelin upgradeable presets with a public `initializer` and no constructor lock (FG-21, which OpenZeppelin's docs also ask you to add), pre-0.8 Uniswap files doing unchecked math (FG-48), one example swap with a zero minimum (FG-39), the v3 payable multicall (FG-44), and an `express` 4.17.3 dev pin (FG-90). Like the other score rules they read source text, not data flow, so tune them per project:
 
 ```toml
 [score]
@@ -391,7 +498,7 @@ max_depth = 8                                     # folder levels below the targ
 
 [score.severity]
 "FG-02" = "MEDIUM"        # by signature id
-"WEB-RATE-LIMIT" = "off"  # or by rule name; works for every rule, not only the fifteen
+"WEB-RATE-LIMIT" = "off"  # or by rule name; works for every rule, signature or not
 ```
 
 `foundryguard score` and the window read the nearest `foundryguard.toml` at or above the target; `--config` points at another one.

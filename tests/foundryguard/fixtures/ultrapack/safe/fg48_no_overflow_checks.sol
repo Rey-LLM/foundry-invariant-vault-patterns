@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+contract Ledger {
+    uint256 public total;
+
+    function add(uint256 a) external {
+        require(a > 0);
+        total = total + a;
+    }
+}

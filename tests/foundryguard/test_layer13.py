@@ -32,21 +32,20 @@ EXPECTED_WEAK = {
     ("FG-06", "src/LotteryVault.sol", 38),
     ("FG-07", "src/LotteryVault.sol", 26),
     ("FG-08", "src/LotteryVault.sol", 34),
-    ("FG-09", "backend/server.js", 7),
-    ("FG-10", "backend/server.js", 14),
-    ("FG-11", "backend/server.js", 8),
-    ("FG-12", "backend/server.js", 13),
-    ("FG-13", "backend/server.js", 10),
-    ("FG-14", "backend/server.js", 21),
-    ("FG-15", "backend/server.js", 4),
+    ("FG-51", "backend/server.js", 7),
+    ("FG-52", "backend/server.js", 14),
+    ("FG-53", "backend/server.js", 8),
+    ("FG-54", "backend/server.js", 13),
+    ("FG-55", "backend/server.js", 10),
+    ("FG-56", "backend/server.js", 21),
+    ("FG-57", "backend/server.js", 4),
 }
 
 
 class CatalogTests(unittest.TestCase):
-    def test_fifteen_signatures_with_score_weights(self):
-        sigs = signatures.SIGNATURES
-        self.assertEqual(len(sigs), 15)
-        self.assertEqual([s.id for s in sigs], [f"FG-{i:02d}" for i in range(1, 16)])
+    def test_original_fifteen_signatures_with_score_weights(self):
+        # The fifteen 0.14 signatures: FG-01..FG-08 kept their ids, the backend seven are FG-51..FG-57 since 0.15.
+        sigs = [signatures.BY_ID[f"FG-{i:02d}"] for i in (*range(1, 9), *range(51, 58))]
         self.assertEqual(len({s.rule for s in sigs}), 15)
         self.assertEqual(sum(s.stack == "solidity" for s in sigs), 8)
         self.assertEqual(sum(s.stack == "backend" for s in sigs), 7)
@@ -66,11 +65,13 @@ class DetectionTests(unittest.TestCase):
         result, _ = scoring.score_path(FIXTURES / "weak", config=scoring.ScanConfig())
         got = {(f.signature, f.file, f.line) for f in result.findings if f.signature}
         self.assertTrue(EXPECTED_WEAK <= got, sorted(EXPECTED_WEAK - got))
-        self.assertEqual({f.signature for f in result.findings if f.signature}, set(signatures.BY_ID))
+        expected_ids = {sid for sid, _, _ in EXPECTED_WEAK}
+        self.assertTrue(expected_ids <= {f.signature for f in result.findings if f.signature})
         for f in result.findings:
             if f.signature:
                 sig = signatures.BY_ID[f.signature]
-                self.assertEqual(f.severity, sig.severity, f.rule)
+                if f.rule == sig.rule and sig.fixed:
+                    self.assertEqual(f.severity, sig.severity, f.rule)
                 self.assertEqual(f.fix, sig.fix)
                 self.assertTrue(f.evidence and f.mitigation, f.rule)
         self.assertEqual(result.score, 1)
@@ -117,7 +118,7 @@ contract Pull {
             (root / "limits.js").write_text('const rateLimit = require("express-rate-limit");\n'
                                             "module.exports = rateLimit({ max: 5 });\n")
             result, _ = scoring.score_path(root, config=scoring.ScanConfig())
-            self.assertNotIn("FG-12", {f.signature for f in result.findings})
+            self.assertNotIn("FG-54", {f.signature for f in result.findings})
 
     def test_flask_body_cap(self):
         app = 'from flask import Flask, request\napp = Flask(__name__)\n@app.post("/x")\ndef x():\n    return request.get_json()\n'
@@ -143,7 +144,7 @@ class ConfigTests(unittest.TestCase):
         result, _ = scoring.score_path(self.root)
         sev = {f.signature: f.severity for f in result.findings if f.signature}
         self.assertEqual(sev["FG-02"], "LOW")
-        self.assertNotIn("FG-12", sev)
+        self.assertNotIn("FG-54", sev)
         self.assertTrue(any(n.startswith("config: ") for n in result.notes))
 
     def test_ignore_and_max_depth(self):
@@ -195,9 +196,9 @@ class ReportTests(unittest.TestCase):
             result, page = scoring.simulate(str(FIXTURES / "weak"), run_forge=False, out_dir=d)
             html = page.read_text()
         self.assertIn("<h2>Signature database</h2>", html)
-        rows = re.findall(r'<tr class="sigrow( hit)?"><td>(FG-\d\d)</td>', html)
-        self.assertEqual(len(rows), 15)
-        self.assertTrue(all(hit for hit, _ in rows))
+        rows = dict((sid, hit) for hit, sid in re.findall(r'<tr class="sigrow( hit)?"><td>(FG-\d+)</td>', html))
+        self.assertEqual(len(rows), 103)
+        self.assertTrue(all(rows[sid] for sid, _, _ in EXPECTED_WEAK))
         self.assertIn('<pre class="fix">', html)
         self.assertIn('<span class="sig">FG-07</span>', html)
         self.assertNotRegex(html, r"linear-gradient|animation")

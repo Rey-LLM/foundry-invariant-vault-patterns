@@ -1173,7 +1173,7 @@ def cmd_bridge(args) -> int:
         for ln in text_lines(bridge):
             print(ln)
         for f in findings:
-            print(f"  {f.severity:<8} {f.rule:<30} {f.location}  {f.title}")
+            print(f"  {f.severity:<8} {(f.signature or '-'):<6} {f.rule:<30} {f.location}  {f.title}")
     if args.fail_on == "NONE":
         return 0
     worst = scoring.SEVERITIES.index(args.fail_on)

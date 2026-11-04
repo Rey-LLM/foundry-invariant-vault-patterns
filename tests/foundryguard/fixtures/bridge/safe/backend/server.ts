@@ -1,10 +1,12 @@
 import express from "express";
+import helmet from "helmet";
 import { z } from "zod";
 import { Contract, JsonRpcProvider, Wallet } from "ethers";
 import { requireSession } from "./session";
 import abi from "./SafeClaim.json";
 
 const app = express();
+app.use(helmet());
 const CONFIRMATIONS = 12;
 const MAX_CLAIM = 1_000n * 10n ** 18n;
 const provider = new JsonRpcProvider(process.env.RPC_URL);
