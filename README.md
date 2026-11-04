@@ -23,7 +23,8 @@ src/
   twap-validation/     module 02
   flashloan-reward/    module 03
   transient-vault/     module 05
-  cli/                 FoundryGuard (foundryguard.py, compiler.py, parser.py, injector.py, ai_generator.py, reporter.py, reporting.py)
+  cli/                 FoundryGuard (foundryguard.py, compiler.py, parser.py, injector.py, ai_generator.py, reporter.py, reporting.py,
+                       scoring.py for the 1-100 score, gui.py for the desktop window)
                        parser.py also builds the cross-contract dependency matrix, injector.py the ecosystem suites
     blueprints/        invariant presets (hook_reentrancy.py, transient_storage.py)
 test/                  module tests
@@ -66,6 +67,8 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | `foundryguard check` | exits 1 when generated suites are missing or stale |
 | `foundryguard heal` | compiles the generated suites and fixes what the local compiler rejects |
 | `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md` and `foundryguard-report.html`, plus CI Markdown and SARIF |
+| `foundryguard score <path or URL>` | risk score from 1 to 100 with a deduction per file and line, written to `foundryguard-report.html` |
+| `foundryguard-gui [path or URL]` | desktop window that runs the score, the preset matrix and, with forge installed, the fuzzing (`foundryguard gui` does the same) |
 
 ### Scanning
 
@@ -278,6 +281,32 @@ The metrics count each invariant campaign once. Forge 1.x runs all invariants of
 forge test -vvv | foundryguard report -
 ```
 
+### Score and desktop window
+
+`foundryguard score` and the `foundryguard-gui` window rate a codebase from 1 to 100. The score starts at 100 and every finding takes points off: CRITICAL 25, HIGH 15, MEDIUM 8, LOW 3. One rule can take at most three times its weight, so the same mistake repeated a hundred times does not hide everything else. The floor is 1. The scale is strict on purpose: a function that takes an amount and never checks it, a privileged variable anyone can set, or a state write after an external call each cost 15 to 25 points.
+
+Each deduction lists the file and line, the severity, the layer (L1 input validation, L2 access control, L3 mutability, L4 state drift, L5 external calls, L6 injection, L7 secrets, L8 transport, L9 configuration, L10 fuzzed invariant) and what to do about it. The report ends with a mitigation plan grouped by rule.
+
+What it reads:
+
+- Solidity: missing input checks, unprotected writes to owner/fee/oracle-style variables, `tx.origin`, unguarded initializers, functions that could be `view`, `payable` functions that ignore `msg.value`, writes after an external call, unchecked low-level calls, delegatecall targets, spot prices and stale oracle reads, votes weighed by live balance, first-depositor share math, division by a total that can be zero, unfunded reward schedules, transient slots that are never cleared, weak randomness, division before multiplication. Rules tied to a preset follow the preset toggles.
+- Backend and site code (`.py`, `.js`/`.ts`, `.html`, `.php`): string-built SQL, shell commands, `eval`, unsafe deserialization, request input with no validation library in the file, secrets in source, TLS checks turned off, XSS sinks, POST forms without a CSRF token, tokens in `localStorage`, debug mode, wildcard CORS, mutable global state.
+- A URL: one GET of the page. The response headers (CSP, HSTS, framing, cookie flags, version banners) and the returned HTML and inline scripts are checked. Nothing else is requested and nothing is fuzzed against the host, so only point it at sites you own or may test.
+
+`test`, `lib`, `node_modules`, `script` and build folders are skipped, as are `*.t.sol` files.
+
+For Solidity the report also has a simulation matrix: one row per contract, one column per preset. ARMED means the AST detectors that `foundryguard gen` uses would generate that suite; FLAGGED means a scoring rule for that preset matched. With `--fuzz` (on by default in the window), forge on PATH and a `foundry.toml` above the target, it runs `foundryguard run --test`; every broken invariant becomes a CRITICAL L10 deduction and the forge results are embedded in the same page.
+
+```sh
+foundryguard score .                        # score the project, write foundryguard-report.html
+foundryguard score . --fuzz --min-score 75  # also fuzz with forge; exit 1 below 75 (for CI)
+foundryguard score src/Vault.sol --presets 1,4,8 --json
+foundryguard score https://app.example.com  # one passive GET; report goes to ~/foundryguard-reports/<host>/
+foundryguard-gui                            # the window
+```
+
+The window is plain Tk (`python3-tk` on Debian and Ubuntu; the python.org installers ship it). It has one bar for a folder, a file or a URL, eight preset toggles, and LAUNCH SECURITY SIMULATION. The run happens in a background thread, so the window stays responsive and Stop works. When it finishes, the report opens in the browser with the score at the top. `foundryguard-score.json` next to it has the same data for scripts.
+
 ### Config
 
 ```toml
@@ -327,6 +356,7 @@ Broken invariants show up as code-scanning alerts on the failing `invariant_*` f
 - Ecosystem suites do not run the single-contract presets (ERC-4626 previews, hooks, transient storage) on their members.
 - Presets assume no external yield. Relax `solvency` and the `*OutBoundedByIn` invariants for vaults that earn yield.
 - AI suites go through the heal loop like the others, but it only fixes the specifier and pragma problems listed above. A model mistake in logic or types still needs a hand fix.
+- The score's Solidity and web rules work on source text, not on data flow. They can miss a check done in another contract or flag one done in a way they do not recognise; the line in each deduction lets you judge it quickly.
 - Preset 05 sees `tstore` in the contract's own lineage only. Transient storage written through a library (OpenZeppelin `TransientSlot`, `ReentrancyGuardTransient`) or Solidity `transient` state variables is not detected yet; list those slots under `transient_slots`.
 
 ## License

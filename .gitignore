@@ -9,3 +9,7 @@ lib/
 # FoundryGuard lineage fixture dependencies (npm install)
 tests/foundryguard/fixtures/libs/node_modules/
 tests/foundryguard/fixtures/libs/package-lock.json
+
+# Layer 10 score pages written next to scanned fixtures
+foundryguard-score.json
+tests/foundryguard/fixtures/**/foundryguard-report.html

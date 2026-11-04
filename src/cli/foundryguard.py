@@ -8,6 +8,8 @@
     foundryguard check                CI: exit 1 when generated suites are missing or stale
     foundryguard heal                 compile the generated suites and fix what the local compiler rejects
     foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, foundryguard-report.html, Markdown, SARIF
+    foundryguard score TARGET         risk score 1-100 for a project, a file or a URL -> foundryguard-report.html
+    foundryguard gui [TARGET]         desktop window (same as `foundryguard-gui`)
 
 Run it as ``foundryguard`` after ``pipx install .`` or as ``python3 src/cli/foundryguard.py``.
 """
@@ -23,7 +25,7 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from . import healer, injector, parser, reporter, reporting
+    from . import healer, injector, parser, reporter, reporting, scoring
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import healer  # type: ignore
@@ -31,6 +33,7 @@ else:
     import parser  # type: ignore
     import reporter  # type: ignore
     import reporting  # type: ignore
+    import scoring  # type: ignore
 
 CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 
@@ -206,6 +209,14 @@ def cmd_report(args) -> int:
     return 1 if (args.fail_on_failure and reporting.failed_tests(data)) else 0
 
 
+def cmd_gui(args) -> int:
+    if __package__:
+        from . import gui
+    else:
+        import gui  # type: ignore
+    return gui.main([args.target] if args.target else [])
+
+
 def _as_forge_json(run) -> dict:
     """The subset of ``forge test --json`` the CI Markdown / SARIF writers read, built from parsed stdout."""
     data: dict = {}
@@ -275,6 +286,14 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--sarif", help="write SARIF here")
     p.add_argument("--fail-on-failure", action="store_true", help="exit 1 if any test failed")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("score", help="risk score 1-100 for a project, a file or a URL (Layer 10)")
+    scoring.add_score_args(p)
+    p.set_defaults(func=scoring.cmd_score)
+
+    p = sub.add_parser("gui", help="open the desktop simulation window (same as foundryguard-gui)")
+    p.add_argument("target", nargs="?", default="", help="path or URL to fill in")
+    p.set_defaults(func=cmd_gui)
 
     for sp in sub.choices.values():
         sp.add_argument("-v", "--verbose", action="count", default=0)

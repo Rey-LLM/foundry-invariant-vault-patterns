@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head>
+  <script src="https://cdn.example.net/lib.js"></script>
+</head>
+<body>
+  <form method="post" action="/login">
+    <input name="user"><input name="pass" type="password">
+  </form>
+  <div id="out"></div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    document.getElementById("out").innerHTML = q.get("msg");
+    localStorage.setItem("authToken", q.get("t"));
+  </script>
+</body>
+</html>
