@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foundryguard"
-version = "0.12.0"
-description = "Generate Foundry invariant test suites from Solidity sources, score a codebase 1-100, and run it all from a desktop window."
+version = "0.13.0"
+description = "Generate Foundry invariant test suites from Solidity sources, score a codebase 1-100, check the seam between backend and contracts, and run it all from a desktop window."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -23,6 +23,7 @@ Homepage = "https://github.com/Rey-LLM/foundry-invariant-vault-patterns"
 [project.scripts]
 foundryguard = "foundryguard.foundryguard:main"
 foundryguard-gui = "foundryguard.gui:main"
+foundryguard-bridge = "foundryguard.web_surface:main"
 
 [tool.setuptools]
 package-dir = { "foundryguard" = "src/cli" }

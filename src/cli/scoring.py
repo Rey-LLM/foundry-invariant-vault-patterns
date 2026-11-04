@@ -18,6 +18,10 @@ What gets read:
   When a solc AST is available the preset matrix comes from the same detectors ``foundryguard gen`` uses.
 * Backend and site code (``.py``, ``.js``/``.ts``, ``.html``, ``.php``): injection, unvalidated request
   input, secrets in source, TLS turned off, unsafe deserialization, mutable global state.
+* The bridge between them (Layer 12, ``web_surface.py``): where the backend signs with a server key, sends
+  transactions, allocates nonces or trusts RPC answers, paired with the contract function that verifies
+  the signature. Typehash and domain drift, replayable or never-expiring signatures, public signing routes
+  and leaked keys land under layer L11.
 * A URL: one passive GET of the page. The response headers and the HTML/inline scripts it returns are
   checked. Nothing else is requested and nothing is fuzzed against a remote host.
 
@@ -71,6 +75,7 @@ LAYERS = {
     "L8": "transport",
     "L9": "configuration",
     "L10": "fuzzed invariant",
+    "L11": "web2-web3 bridge",
 }
 
 PRESETS = {
@@ -99,7 +104,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.12 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.13 (passive single-page check)"
 SCORE_JSON = "foundryguard-score.json"
 
 
@@ -142,6 +147,7 @@ class ScoreResult:
     matrix: list[MatrixRow] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     forge: dict | None = None  # {"status", "passed", "failed", "report", "command", "returncode"}
+    bridge: dict | None = None  # web_surface.BridgeReport.as_dict(), when the target has a web2-web3 seam
 
     @property
     def verdict(self) -> str:
@@ -962,6 +968,10 @@ def discover(root: Path) -> list[Path]:
 
 
 def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[ScoreResult, dict[str, list[SolContract]]]:
+    if __package__:
+        from . import web_surface
+    else:
+        import web_surface  # type: ignore
     presets = frozenset(presets)
     target = target.resolve()
     if not target.exists():
@@ -973,6 +983,7 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
     lines = 0
     kinds = set()
     notes = []
+    bridge_sources: list[tuple[str, str]] = []
     for p in files:
         try:
             if p.stat().st_size > MAX_FILE_BYTES:
@@ -984,6 +995,8 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
             continue
         rel = p.relative_to(base).as_posix() if p != base else p.name
         lines += raw.count("\n") + 1
+        if web_surface.relevant(rel, raw):
+            bridge_sources.append((rel, raw))
         if p.suffix.lower() in SOL_EXT:
             kinds.add("solidity")
             f, contracts = check_solidity(rel, raw, presets)
@@ -996,8 +1009,15 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
                 findings += check_text(rel, raw, lang)
     if not files:
         notes.append("no .sol/.py/.js/.ts/.html/.php files found (test, lib and node_modules dirs are skipped)")
+    bridge = None
+    if bridge_sources:
+        rep = web_surface.analyze(bridge_sources)
+        if not rep.empty:
+            findings += rep.findings
+            bridge = rep.as_dict()
     kind = "mixed" if len(kinds) > 1 else (kinds.pop() if kinds else "empty")
-    result = ScoreResult(str(target), kind, score(findings), findings, len(files), lines, sorted(presets), notes=notes)
+    result = ScoreResult(str(target), kind, score(findings), findings, len(files), lines, sorted(presets), notes=notes,
+                         bridge=bridge)
     if not files:
         result.score = 1
     return result, sol_contracts
@@ -1297,6 +1317,13 @@ def render_html(result: ScoreResult, run=None, generated: str | None = None) -> 
                        f"{_md(fs[0].mitigation)}<br><span class=\"muted\">at {_h(locs)}</span></li>")
         out.append("</ol>")
 
+    if result.bridge:
+        if __package__:
+            from . import web_surface
+        else:
+            import web_surface  # type: ignore
+        out += web_surface.html_section(result.bridge, _h)
+
     if result.matrix:
         out.append("<h2>Simulation matrix</h2>")
         src = "solc AST (the same detectors `foundryguard gen` uses)" if any(r.source == "ast" for r in result.matrix) \
@@ -1378,7 +1405,19 @@ def cmd_score(args) -> int:
             print(f"  -{f.points:<3} {f.severity:<8} {f.layer:<3} {f.rule:<26} {f.location}  {f.title}")
         if len(result.findings) > 20:
             print(f"  ... {len(result.findings) - 20} more in the report")
+        if result.bridge and result.bridge.get("links"):
+            print(f"bridge map ({len(result.bridge['links'])} signing site(s)):")
+            for ln in _bridge_lines(result.bridge):
+                print(ln)
     return 1 if result.score < args.min_score else 0
+
+
+def _bridge_lines(bridge: dict) -> list[str]:
+    if __package__:
+        from . import web_surface
+    else:
+        import web_surface  # type: ignore
+    return web_surface.text_lines(bridge)
 
 
 def main(argv: list[str] | None = None) -> int:

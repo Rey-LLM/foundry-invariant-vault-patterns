@@ -9,6 +9,7 @@
     foundryguard heal                 compile the generated suites and fix what the local compiler rejects
     foundryguard report results       forge test output (--json or stdout) -> FoundryGuard_Report.md, foundryguard-report.html, Markdown, SARIF
     foundryguard score TARGET         risk score 1-100 for a project, a file or a URL -> foundryguard-report.html
+    foundryguard bridge TARGET        Web2-to-Web3 seam: backend signers and senders vs the contracts that verify them
     foundryguard gui [TARGET]         desktop window (same as `foundryguard-gui`)
 
 Run it as ``foundryguard`` after ``pipx install .`` or as ``python3 src/cli/foundryguard.py``.
@@ -25,7 +26,7 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from . import healer, injector, parser, reporter, reporting, scoring
+    from . import healer, injector, parser, reporter, reporting, scoring, web_surface
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import healer  # type: ignore
@@ -34,6 +35,7 @@ else:
     import reporter  # type: ignore
     import reporting  # type: ignore
     import scoring  # type: ignore
+    import web_surface  # type: ignore
 
 CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 
@@ -290,6 +292,10 @@ def build_cli() -> argparse.ArgumentParser:
     p = sub.add_parser("score", help="risk score 1-100 for a project, a file or a URL (Layer 10)")
     scoring.add_score_args(p)
     p.set_defaults(func=scoring.cmd_score)
+
+    p = sub.add_parser("bridge", help="check where the backend signs, sends and trusts the chain (Layer 12)")
+    web_surface.add_bridge_args(p)
+    p.set_defaults(func=web_surface.cmd_bridge)
 
     p = sub.add_parser("gui", help="open the desktop simulation window (same as foundryguard-gui)")
     p.add_argument("target", nargs="?", default="", help="path or URL to fill in")

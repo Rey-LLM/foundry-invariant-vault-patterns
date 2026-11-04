@@ -32,6 +32,10 @@ jobs:
         run: npm install --prefix tests/foundryguard/fixtures/libs --no-audit --no-fund --no-package-lock
       - run: pip install .
       - run: python -m unittest discover -s tests/foundryguard -v
+      - name: Bridge validator on the fixtures
+        run: |
+          foundryguard bridge tests/foundryguard/fixtures/bridge/safe
+          ! foundryguard bridge tests/foundryguard/fixtures/bridge/weak
 
   forge:
     name: Generated suites build and run

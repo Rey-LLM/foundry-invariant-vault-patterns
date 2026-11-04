@@ -68,6 +68,7 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | `foundryguard heal` | compiles the generated suites and fixes what the local compiler rejects |
 | `foundryguard report <file or ->` | `forge test --json` or `-vvv` output to `FoundryGuard_Report.md` and `foundryguard-report.html`, plus CI Markdown and SARIF |
 | `foundryguard score <path or URL>` | risk score from 1 to 100 with a deduction per file and line, written to `foundryguard-report.html` |
+| `foundryguard bridge <path>` | the seam between backend and contracts: who can make the server key sign or send, and whether the contract enforces what the backend signs |
 | `foundryguard-gui [path or URL]` | desktop window that runs the score, the preset matrix and, with forge installed, the fuzzing (`foundryguard gui` does the same) |
 
 ### Scanning
@@ -307,6 +308,36 @@ foundryguard-gui                            # the window
 
 The window is built on customtkinter (installed with the package; Tk itself comes from `python3-tk` on Debian and Ubuntu, the python.org installers ship it). Dark theme: one bar for a folder, a file or a URL, the eight presets as a 4 x 2 grid, and LAUNCH SECURITY SIMULATION. The run happens in a background thread with a progress bar and elapsed time, so the window stays responsive and Stop works. When it finishes, the score card turns green, amber or red and the report opens in the browser with the score at the top. `foundryguard-score.json` next to it has the same data for scripts.
 
+### Backend to contract bridge
+
+Signature mints, claims, relayers and bridges usually break at the seam: a route that signs whatever the request asks for, a nonce the backend puts in the payload and the contract never consumes, an EIP-712 struct that drifted from the contract's typehash. `foundryguard bridge` (and every `foundryguard score` run) reads both sides of the repository together and checks that seam. Point it at a repo that holds the contracts and the Node or Python backend.
+
+Each place a server key signs (EIP-712 typed data or a raw message) is linked to the contract function that verifies it, by EIP-712 primary type or by the function the backend calls. The pair is then judged as one:
+
+| Rule | What it means |
+| --- | --- |
+| `BRIDGE-SIGNING-ORACLE` | a route signs with the server key and never checks who is calling |
+| `BRIDGE-OPEN-RELAYER` | a route sends transactions from the server key for any caller |
+| `BRIDGE-SIGNED-INPUT-UNCHECKED` | the caller is checked, but the signed values from the request are not bounded |
+| `BRIDGE-TYPEHASH-DRIFT` | the backend's EIP-712 struct differs from the contract's typehash (names, types or order) |
+| `BRIDGE-DOMAIN-DRIFT` | domain name, version or fields differ between backend and contract |
+| `BRIDGE-SIG-REPLAY` | the verifier never marks the nonce or digest used |
+| `BRIDGE-DEADLINE-UNENFORCED` | the backend signs an expiry the contract never checks |
+| `BRIDGE-SIG-NO-DOMAIN` / `BRIDGE-SIG-UNBOUND` | the signed digest is not bound to the chain id and contract address |
+| `BRIDGE-ABI-DRIFT` | the backend calls a function or argument count the contracts in the repo do not expose |
+| `BRIDGE-KEY-*`, `BRIDGE-MNEMONIC-LITERAL` | key read from a request, logged, shipped to the browser through a public env var, or a seed phrase in source |
+| `BRIDGE-TX-NONCE-RACE`, `BRIDGE-WEAK-NONCE` | transaction nonces set by hand without a lock; signature nonces from a clock or an in-memory counter |
+| `BRIDGE-RECEIPT-STATUS`, `BRIDGE-REORG` | a receipt trusted without checking `status`; events acted on with no confirmation depth |
+
+Findings count toward the score under L11 and the HTML report gets a bridge map: one row per signing site with its route, whether the caller is authenticated, the verifier, and whether chain, contract, nonce and expiry are actually enforced.
+
+```sh
+foundryguard bridge .                  # bridge map + findings, exit 1 on HIGH or worse
+foundryguard bridge . --fail-on CRITICAL --json
+```
+
+Express, Fastify-style routers, Next.js route handlers, Flask and FastAPI routes are recognised. ethers, viem, web3.js, web3.py and eth-account cover the signing and sending side. Nothing is executed and nothing is sent anywhere.
+
 ### Config
 
 ```toml
@@ -357,6 +388,7 @@ Broken invariants show up as code-scanning alerts on the failing `invariant_*` f
 - Presets assume no external yield. Relax `solvency` and the `*OutBoundedByIn` invariants for vaults that earn yield.
 - AI suites go through the heal loop like the others, but it only fixes the specifier and pragma problems listed above. A model mistake in logic or types still needs a hand fix.
 - The score's Solidity and web rules work on source text, not on data flow. They can miss a check done in another contract or flag one done in a way they do not recognise; the line in each deduction lets you judge it quickly.
+- The bridge pass links signer and verifier inside one repository. A backend that signs for a contract kept in another repo is checked on its own side only, and handlers wired through a framework it does not recognise are judged as plain functions (no route, no oracle check).
 - Preset 05 sees `tstore` in the contract's own lineage only. Transient storage written through a library (OpenZeppelin `TransientSlot`, `ReentrancyGuardTransient`) or Solidity `transient` state variables is not detected yet; list those slots under `transient_slots`.
 
 ## License
