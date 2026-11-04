@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FoundryGuard: one command for scanning, generating, checking and reporting.
 
-    foundryguard init                 write a commented foundryguard.toml
+    foundryguard init                 write a commented foundryguard.toml into the project root
     foundryguard scan                 Solidity -> foundryguard.json blueprint
     foundryguard gen                  blueprint -> test/foundryguard/<Contract>/ suites
     foundryguard run [--test]         scan + gen (+ forge test on the generated suites + FoundryGuard_Report.md)
@@ -42,6 +42,19 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 [scan]
 # Source dirs to scan (default: src/ or contracts/).
 # paths = ["src"]
+
+[score]
+# Layer 10/13: `foundryguard score`, `foundryguard gui` and the report read this section.
+# ignore = ["src/legacy/**", "frontend/vendor/*"]   # globs, relative to the scanned directory
+# max_depth = 8              # directory levels walked below the target (0 = only the target dir)
+# max_files = 5000
+
+[score.severity]
+# Retune or silence any rule, by signature id (FG-01..FG-15) or rule name.
+# CRITICAL costs 25 points, HIGH 15, MEDIUM 8, LOW 3; "off" drops the rule.
+# "FG-02" = "MEDIUM"          # division before multiplication
+# "FG-08" = "off"             # unbounded loop over a storage array
+# "SOL-MUTABILITY" = "off"
 
 [generate]
 # out = "test/foundryguard"
@@ -115,8 +128,19 @@ def _scan(args) -> dict:
     return blueprint
 
 
+def _project_root(start: Path) -> Path:
+    """The nearest dir at or above ``start`` holding foundry.toml, package.json, pyproject.toml or .git."""
+    start = start.resolve()
+    for d in (start, *start.parents):
+        if any((d / m).exists() for m in ("foundry.toml", ".git", "package.json", "pyproject.toml", "hardhat.config.js",
+                                         "hardhat.config.ts")):
+            return d
+    return start
+
+
 def cmd_init(args) -> int:
-    path = Path(args.root) / parser.CONFIG_FILE
+    root = Path(args.root) if args.root else _project_root(Path.cwd())
+    path = root / parser.CONFIG_FILE
     if path.exists() and not args.force:
         print(f"foundryguard: {path} already exists (use --force)", file=sys.stderr)
         return 1
@@ -235,8 +259,9 @@ def build_cli() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=f"foundryguard {parser.TOOL_VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init", help="write a commented foundryguard.toml")
-    p.add_argument("--root", default=".")
+    p = sub.add_parser("init", help="write a commented foundryguard.toml into the project root")
+    p.add_argument("--root", help="where to write it (default: the nearest dir with foundry.toml, .git, package.json "
+                                  "or pyproject.toml)")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 

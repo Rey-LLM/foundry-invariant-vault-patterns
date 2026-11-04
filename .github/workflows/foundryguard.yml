@@ -36,6 +36,10 @@ jobs:
         run: |
           foundryguard bridge tests/foundryguard/fixtures/bridge/safe
           ! foundryguard bridge tests/foundryguard/fixtures/bridge/weak
+      - name: Signature database on the fixtures
+        run: |
+          foundryguard score tests/foundryguard/fixtures/signatures/safe --out "$RUNNER_TEMP/sig-safe" --min-score 100
+          ! foundryguard score tests/foundryguard/fixtures/signatures/weak --out "$RUNNER_TEMP/sig-weak" --min-score 50
 
   forge:
     name: Generated suites build and run

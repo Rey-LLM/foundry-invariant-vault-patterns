@@ -60,7 +60,7 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 
 | Command | What it does |
 | :-- | :-- |
-| `foundryguard init` | writes a commented `foundryguard.toml` |
+| `foundryguard init` | writes a commented `foundryguard.toml` into the project root (the nearest folder with `foundry.toml`, `.git`, `package.json` or `pyproject.toml`) |
 | `foundryguard scan` | Solidity to a `foundryguard.json` blueprint |
 | `foundryguard gen` | blueprint to `test/foundryguard/<Contract>/` and `test/foundryguard/<Name>Ecosystem/` suites |
 | `foundryguard run [--test]` | `scan` and `gen`; with `--test` also `forge test` and the report |
@@ -70,6 +70,26 @@ Without installing: `python3 path/to/src/cli/foundryguard.py run`.
 | `foundryguard score <path or URL>` | risk score from 1 to 100 with a deduction per file and line, written to `foundryguard-report.html` |
 | `foundryguard bridge <path>` | the seam between backend and contracts: who can make the server key sign or send, and whether the contract enforces what the backend signs |
 | `foundryguard-gui [path or URL]` | desktop window that runs the score, the preset matrix and, with forge installed, the fuzzing (`foundryguard gui` does the same) |
+
+`pipx install` puts `foundryguard`, `foundryguard-gui` and `foundryguard-bridge` on PATH, so they work from any directory.
+
+### How it fits together
+
+| Layer | Module | What it does |
+| :-- | :-- | :-- |
+| 01 | `parser.py` | reads the contracts and classifies value flows into a blueprint |
+| 02 | `injector.py` | writes handlers and invariant suites (Presets 01-03 inline) |
+| 03 | `compiler.py` | drives solc, solcjs or forge for the AST |
+| 04 | `blueprints/hook_reentrancy.py`, `reporter.py` | hook read-reentrancy probe; forge output to a report |
+| 05 | `blueprints/transient_storage.py` | transient slots checked between calls |
+| 06 | `ai_generator.py` | opt-in model fallback for contracts no preset fits |
+| 07 | `parser.py`, `injector.py` | cross-contract ecosystems and deploy order |
+| 08 | `healer.py` | compiles generated suites and fixes what the compiler rejects |
+| 09 | `reporter.py` | static HTML report |
+| 10 | `scoring.py`, `gui.py` | 1-100 score, preset matrix, desktop window |
+| 11 | `scoring.py` | backend and site code rules |
+| 12 | `web_surface.py` | backend to contract bridge |
+| 13 | `signatures.py` | the signature database (FG-01 to FG-15) |
 
 ### Scanning
 
@@ -337,6 +357,44 @@ foundryguard bridge . --fail-on CRITICAL --json
 ```
 
 Express, Fastify-style routers, Next.js route handlers, Flask and FastAPI routes are recognised. ethers, viem, web3.js, web3.py and eth-account cover the signing and sending side. Nothing is executed and nothing is sent anywhere.
+
+### Signature database
+
+Fifteen signatures sit on top of the score rules. Each has a fixed cost, a CWE or SWC reference and a fix example, and every hit in the report and in `--json` carries its id.
+
+| ID | Stack | Rule | Severity | Catches |
+| :-- | :-- | :-- | :-- | :-- |
+| FG-01 | Solidity | `SOL-ZERO-ADDRESS` | HIGH | address parameter stored without an `address(0)` check |
+| FG-02 | Solidity | `SOL-DIV-BEFORE-MUL` | HIGH | `a / b * c` precision loss |
+| FG-03 | Solidity | `SOL-TX-ORIGIN` | CRITICAL | `tx.origin` used for authorization |
+| FG-04 | Solidity | `SOL-WEAK-RANDOMNESS` | HIGH | randomness from `block.timestamp`, `prevrandao`, `blockhash` (hashed or `%`) |
+| FG-05 | Solidity | `SOL-UNCHECKED-CALL` | HIGH | `.call` / `.send` result ignored |
+| FG-06 | Solidity | `SOL-ERC20-UNCHECKED` | HIGH | ERC-20 `transfer` / `transferFrom` / `approve` bool ignored |
+| FG-07 | Solidity | `SOL-ARBITRARY-FROM` | CRITICAL | `transferFrom(from, ...)` with `from` chosen by the caller |
+| FG-08 | Solidity | `SOL-UNBOUNDED-LOOP` | HIGH | entry point loops over a whole storage array |
+| FG-09 | Backend | `WEB-SECRET` | CRITICAL | private keys, API keys and tokens in source |
+| FG-10 | Backend | `WEB-WEAK-RANDOM` | HIGH | `Math.random()` / `random` in token, nonce or password code |
+| FG-11 | Backend | `WEB-BODY-LIMIT` | HIGH | Flask without `MAX_CONTENT_LENGTH`, multer without `limits`, body parsers above 50 MB |
+| FG-12 | Backend | `WEB-RATE-LIMIT` | HIGH | login, signup, reset, OTP or token routes with no rate limiter anywhere in the project |
+| FG-13 | Backend | `WEB-CORS-ANY` | HIGH | wildcard CORS |
+| FG-14 | Backend | `WEB-EVAL` | CRITICAL | `eval`, `exec`, `new Function` |
+| FG-15 | Backend | `WEB-COMMAND` | CRITICAL | shell commands built at runtime (`os.system`, `child_process`, `shell=True`) |
+
+CRITICAL costs 25 points and HIGH 15, with the same three-hits-per-rule cap as the rest of the score. The Layer 12 rules for a seed phrase or RPC key in source count as FG-09, and weak signature nonces as FG-10. The report has a Signature database table (matched rows in black, the rest greyed out) and the mitigation plan prints each fix example under its rule.
+
+FG-06, FG-07, FG-08, FG-11 and FG-12 are new in 0.14; run over OpenZeppelin, Solady and this repo's modules they report nothing. Like the other score rules they read source text, not data flow, so tune them per project:
+
+```toml
+[score]
+ignore = ["src/legacy/**", "frontend/vendor/*"]   # globs relative to the scanned folder
+max_depth = 8                                     # folder levels below the target (0 = the target folder only)
+
+[score.severity]
+"FG-02" = "MEDIUM"        # by signature id
+"WEB-RATE-LIMIT" = "off"  # or by rule name; works for every rule, not only the fifteen
+```
+
+`foundryguard score` and the window read the nearest `foundryguard.toml` at or above the target; `--config` points at another one.
 
 ### Config
 

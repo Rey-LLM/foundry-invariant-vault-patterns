@@ -22,6 +22,10 @@ What gets read:
   transactions, allocates nonces or trusts RPC answers, paired with the contract function that verifies
   the signature. Typehash and domain drift, replayable or never-expiring signatures, public signing routes
   and leaked keys land under layer L11.
+* The signature database (Layer 13, ``signatures.py``): fifteen named signatures (FG-01..FG-15), eight
+  Solidity and seven backend, each with a fixed severity, a CWE/SWC reference and a fix example. Matching
+  findings carry the signature id; ``foundryguard.toml`` ``[score]`` can retune severities, ignore paths
+  and limit how deep the walk goes.
 * A URL: one passive GET of the page. The response headers and the HTML/inline scripts it returns are
   checked. Nothing else is requested and nothing is fuzzed against a remote host.
 
@@ -51,10 +55,11 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 if __package__:
-    from . import reporter
+    from . import reporter, signatures
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import reporter  # type: ignore
+    import signatures  # type: ignore
 
 # --------------------------------------------------------------------------- #
 # Model
@@ -104,7 +109,8 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.13 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.14 (passive single-page check)"
+CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
 
 
@@ -121,6 +127,8 @@ class Finding:
     preset: int | None = None
     contract: str | None = None
     points: int = 0  # filled by score()
+    signature: str | None = None  # FG-xx when the rule is in the Layer 13 signature database
+    fix: str | None = None  # fix example from the signature database
 
     @property
     def location(self) -> str:
@@ -290,7 +298,11 @@ SELF_BALANCE = re.compile(r"balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)|addre
 VOTE_FN = re.compile(r"^(castVote\w*|vote\w*|_castVote\w*|propose\w*)$")
 PAST_VOTES = re.compile(r"getPastVotes|getPriorVotes|balanceOfAt|getVotesAt|snapshot|checkpoint", re.I)
 DIV_BEFORE_MUL = re.compile(r"/\s*[\w.$]+(?:\([^()]*\))?(?:\[[^\]]*\])?\s*\)?\s*\*(?!\*)")
-WEAK_RANDOM = re.compile(r"keccak256\s*\([^;]*\b(block\.timestamp|block\.prevrandao|block\.difficulty|blockhash|block\.number)\b")
+WEAK_RANDOM = re.compile(r"keccak256\s*\([^;]*\b(block\.timestamp|block\.prevrandao|block\.difficulty|blockhash|block\.number)\b|"
+                         r"\b(block\.timestamp|block\.prevrandao|block\.difficulty|block\.number|blockhash\s*\([^)]*\))\s*%")
+ERC20_CALL = re.compile(r"(?<![\w$])([A-Za-z_$][\w$]*(?:\s*\([^()]*\))?(?:\s*\[[^\]]*\])?)\s*\.\s*(transfer|transferFrom|approve)\s*\(")
+TRANSFER_FROM = re.compile(r"\.\s*(transferFrom|safeTransferFrom)\s*\(\s*([A-Za-z_$][\w$]*)\s*,")
+STORAGE_LOOP = re.compile(r"\bfor\s*\([^;]*;[^;]*<=?\s*([A-Za-z_$][\w$]*)\s*\.\s*length\s*;")
 TSTORE = re.compile(r"\btstore\s*\(\s*([^,()]+(?:\([^()]*\))?)\s*,\s*([^)]*?)\s*\)")
 
 
@@ -518,6 +530,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
         add("SOL-FLOATING-PRAGMA", "LOW", "L9", f"Floating pragma `{pm.group(1).strip()}`", pragma_line,
             "Pin the compiler version you tested with (e.g. `pragma solidity 0.8.24;`).", is_line=True)
 
+    nft_only = bool(re.search(r"\bI?ERC(721|1155)\w*", sf.clean)) and not re.search(r"\bI?ERC20\w*|SafeERC20", sf.clean)
     for c in sf.contracts:
         if c.kind == "interface":
             continue
@@ -543,7 +556,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                 stored = re.search(rf"(?<![\w.$])([A-Za-z_]\w*)\s*=\s*{re.escape(pname)}\s*;", body)
                 if stored and stored.group(1) in c.state_vars and not re.search(
                         rf"{re.escape(pname)}\s*(==|!=)\s*address\s*\(\s*0\s*\)|address\s*\(\s*0\s*\)\s*(==|!=)\s*{re.escape(pname)}", body):
-                    add("SOL-ZERO-ADDRESS", "MEDIUM", "L1",
+                    add("SOL-ZERO-ADDRESS", "HIGH", "L1",
                         f"`{fn.name}` stores `{pname}` into `{stored.group(1)}` without a zero-address check",
                         b0 + stored.start(), f"Revert when `{pname} == address(0)`; a zero address here locks the "
                         "role or burns funds sent to it.", contract=cname)
@@ -624,6 +637,50 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                     add("SOL-UNCHECKED-CALL", "HIGH", "L5", "Return value of `send` is ignored", b0 + m.start(),
                         "Check the bool `send` returns, or use `call{value:}` with a checked result.", contract=cname)
 
+            # FG-06 ERC-20 return value ignored (ERC-721 transferFrom returns nothing, so NFT-only files are skipped)
+            for m in ([] if nft_only else ERC20_CALL.finditer(body)):
+                recv = " ".join(m.group(1).split())
+                if recv in ("super", "this") or recv.startswith(("payable(", "payable (")):
+                    continue
+                args_end = match_close(body, m.end() - 1, "(", ")")
+                argc = len(_split_params(body[m.end():args_end])) if args_end > m.end() else 0
+                if argc < 2:
+                    continue  # payable(x).transfer(amount) is the native transfer
+                stmt_start = max(body.rfind(";", 0, m.start()), body.rfind("{", 0, m.start()), body.rfind("}", 0, m.start()))
+                stmt = body[stmt_start + 1:m.start()]
+                if not re.search(r"=|\breturn\b|require\s*\(|\bif\s*\(|\bassert\s*\(|!\s*$|&&|\|\|", stmt):
+                    add("SOL-ERC20-UNCHECKED", "HIGH", "L5", f"Return value of `{recv}.{m.group(2)}` is ignored",
+                        b0 + m.start(), "Use `SafeERC20` (`safeTransfer`, `safeTransferFrom`, `forceApprove`).",
+                        contract=cname)
+
+            # FG-07 transferFrom out of a caller-chosen address
+            if fn.exposed and fn.kind == "function" and fn.state_changing and not _authorized(sf, c, fn):
+                addr_params = {p[1] for p in fn.params if p[0] == "address" and p[1]}
+                for m in TRANSFER_FROM.finditer(body):
+                    src = m.group(2)
+                    if src not in addr_params or re.search(r"(?<![\w.$])super\s*$", body[:m.start()]):
+                        continue
+                    if re.search(rf"\b{re.escape(src)}\s*(==|!=)\s*(msg\.sender|_msgSender\(\))|"
+                                 rf"(msg\.sender|_msgSender\(\))\s*(==|!=)\s*{re.escape(src)}\b|allowance\s*\(|"
+                                 rf"permit\s*\(|isApprovedForAll\s*\(|ecrecover|ECDSA|SignatureChecker", body):
+                        continue
+                    add("SOL-ARBITRARY-FROM", "CRITICAL", "L2",
+                        f"`{fn.name}` pulls tokens from `{src}`, which the caller chooses", b0 + m.start(),
+                        "Pull from `msg.sender` only; anyone can drain wallets that approved this contract.",
+                        contract=cname)
+                    break
+
+            # FG-08 loop over a storage array in a state-changing entry point
+            if fn.exposed and fn.state_changing:
+                for m in STORAGE_LOOP.finditer(body):
+                    arr = m.group(1)
+                    if arr in c.state_vars and c.state_vars[arr]["type"].endswith("[]") and c.state_vars[arr]["mutable"]:
+                        add("SOL-UNBOUNDED-LOOP", "HIGH", "L4",
+                            f"`{fn.name}` loops over the whole `{arr}` storage array", b0 + m.start(),
+                            "Paginate (start/count) or keep a running total; an unbounded loop can exceed the block gas limit.",
+                            contract=cname)
+                        break
+
             # Presets
             if fn.exposed and SPOT_PRICE.search(body):
                 m = SPOT_PRICE.search(body)
@@ -673,12 +730,12 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
             # weak randomness, division before multiplication
             m = WEAK_RANDOM.search(body)
             if m:
-                add("SOL-WEAK-RANDOMNESS", "MEDIUM", "L4", f"Randomness from `{m.group(1)}`", b0 + m.start(),
+                add("SOL-WEAK-RANDOMNESS", "HIGH", "L4", f"Randomness from `{(m.group(1) or m.group(2)).split('(')[0]}`", b0 + m.start(),
                     "Use Chainlink VRF or commit-reveal; block values are known to (and set by) the block builder.",
                     contract=cname)
             m = DIV_BEFORE_MUL.search(body)
             if m:
-                add("SOL-DIV-BEFORE-MUL", "MEDIUM", "L4", "Division before multiplication truncates", b0 + m.start(),
+                add("SOL-DIV-BEFORE-MUL", "HIGH", "L4", "Division before multiplication truncates", b0 + m.start(),
                     "Multiply first, or use `Math.mulDiv(a, b, c)` for full precision.", contract=cname)
             for m in re.finditer(r"\bunchecked\s*\{", body):
                 inner = body[m.end():match_close(body, m.end() - 1)]
@@ -835,6 +892,10 @@ def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
             if rule.pattern.search(ln):
                 out.append(Finding(rule.rule, rule.severity, rule.layer, rule.title, rel, i, snippet(lines, i),
                                    rule.mitigation))
+    for rule, ln, title in signatures.check_backend(raw, lang):
+        sig = signatures.lookup(rule)
+        out.append(Finding(rule, sig.severity, "L9" if rule == "WEB-BODY-LIMIT" else "L2", title, rel, ln,
+                           snippet(lines, ln), sig.mitigation))
     if lang == HTML:
         out += check_html(rel, raw)
     return out
@@ -949,25 +1010,80 @@ def check_headers(url: str, headers: list[tuple[str, str]]) -> list[Finding]:
 # --------------------------------------------------------------------------- #
 
 
-def discover(root: Path) -> list[Path]:
+@dataclass
+class ScanConfig:
+    """``[score]`` from foundryguard.toml."""
+    ignore: tuple[str, ...] = ()  # glob patterns against the path relative to the scanned root
+    max_depth: int | None = None  # directory levels walked below the root (0 = the root dir only)
+    max_files: int = MAX_FILES
+    severity: dict = field(default_factory=dict)  # rule -> severity or "off"
+    source: str | None = None  # the toml file this came from
+
+    @classmethod
+    def from_dict(cls, cfg: dict, source: str | None = None) -> "ScanConfig":
+        sc = cfg.get("score") or {}
+        depth = sc.get("max_depth")
+        return cls(tuple(str(x) for x in sc.get("ignore", ()) or ()), None if depth is None else max(int(depth), 0),
+                   int(sc.get("max_files", MAX_FILES)), signatures.severity_overrides(cfg), source)
+
+    def ignored(self, rel: str) -> bool:
+        import fnmatch
+        return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, pat.rstrip("/") + "/*")
+                   or rel.startswith(pat.rstrip("/*") + "/") for pat in self.ignore)
+
+
+def find_config(target: Path) -> Path | None:
+    """The nearest foundryguard.toml at or above ``target`` (stops at a .git dir)."""
+    d = target if target.is_dir() else target.parent
+    for cand in (d, *d.parents):
+        if (cand / CONFIG_FILE).is_file():
+            return cand / CONFIG_FILE
+        if (cand / ".git").exists():
+            return None
+    return None
+
+
+def load_scan_config(target: Path, path: str | Path | None = None) -> ScanConfig:
+    cfg_path = Path(path) if path else find_config(target)
+    if not cfg_path:
+        return ScanConfig()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"config not found: {cfg_path}")
+    if __package__:
+        from . import compiler
+    else:
+        import compiler  # type: ignore
+    return ScanConfig.from_dict(compiler._toml(cfg_path), str(cfg_path))
+
+
+def discover(root: Path, config: ScanConfig | None = None) -> list[Path]:
     if root.is_file():
         return [root]
+    config = config or ScanConfig()
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+        here = Path(dirpath)
+        depth = len(here.relative_to(root).parts)
+        if config.max_depth is not None and depth >= config.max_depth:
+            dirnames[:] = []
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+                             and not config.ignored((here / d).relative_to(root).as_posix()))
         for f in sorted(filenames):
-            p = Path(dirpath) / f
+            p = here / f
             if p.suffix.lower() not in SCANNED_EXT or f.endswith((".t.sol", ".s.sol", ".min.js", ".d.ts")):
                 continue
             if re.search(r"(^test_|_test\.py$|\.test\.|\.spec\.)", f):
                 continue
+            if config.ignored(p.relative_to(root).as_posix()):
+                continue
             files.append(p)
-            if len(files) >= MAX_FILES:
+            if len(files) >= config.max_files:
                 return files
     return files
 
 
-def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[ScoreResult, dict[str, list[SolContract]]]:
+def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanConfig | None = None
+               ) -> tuple[ScoreResult, dict[str, list[SolContract]]]:
     if __package__:
         from . import web_surface
     else:
@@ -976,8 +1092,10 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
     target = target.resolve()
     if not target.exists():
         raise FileNotFoundError(f"{target} does not exist")
+    config = config if config is not None else load_scan_config(target)
     base = target.parent if target.is_file() else target
-    files = discover(target)
+    files = discover(target, config)
+    limiter_seen = False
     findings: list[Finding] = []
     sol_contracts: dict[str, list[SolContract]] = {}
     lines = 0
@@ -995,6 +1113,7 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
             continue
         rel = p.relative_to(base).as_posix() if p != base else p.name
         lines += raw.count("\n") + 1
+        limiter_seen = limiter_seen or (p.suffix.lower() not in SOL_EXT and signatures.limiter_present(raw))
         if web_surface.relevant(rel, raw):
             bridge_sources.append((rel, raw))
         if p.suffix.lower() in SOL_EXT:
@@ -1015,6 +1134,11 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS) -> tuple[Scor
         if not rep.empty:
             findings += rep.findings
             bridge = rep.as_dict()
+    if limiter_seen:  # a limiter wired up in another file (app-wide middleware) covers the auth routes
+        findings = [f for f in findings if f.rule != "WEB-RATE-LIMIT"]
+    findings = signatures.apply(findings, config.severity)
+    if config.source:
+        notes.append(f"config: {config.source}")
     kind = "mixed" if len(kinds) > 1 else (kinds.pop() if kinds else "empty")
     result = ScoreResult(str(target), kind, score(findings), findings, len(files), lines, sorted(presets), notes=notes,
                          bridge=bridge)
@@ -1038,6 +1162,7 @@ def score_url(url: str, presets: Iterable[int] = ALL_PRESETS, opener=None, timeo
              "requested and nothing was fuzzed against the host"]
     if final != url:
         notes.append(f"redirected from {url}")
+    findings = signatures.apply(findings)
     return ScoreResult(final, "url", score(findings), findings, 1, len(lines), sorted(frozenset(presets)), notes=notes)
 
 
@@ -1179,7 +1304,7 @@ def _run_forge(root: Path, progress: Progress, cancel, timeout: float) -> tuple[
 
 def simulate(target: str, presets: Iterable[int] = ALL_PRESETS, run_forge: bool = True, out_dir: str | Path | None = None,
              progress: Progress | None = None, cancel: Callable[[], bool] | None = None, ast_path: str | None = None,
-             forge_timeout: float = 1800.0, opener=None) -> tuple[ScoreResult, Path]:
+             forge_timeout: float = 1800.0, opener=None, config_path: str | Path | None = None) -> tuple[ScoreResult, Path]:
     """Score ``target`` (path or URL), build the preset matrix, optionally fuzz with forge, write the report."""
     progress = progress or (lambda _m: None)
     presets = frozenset(presets)
@@ -1197,7 +1322,7 @@ def simulate(target: str, presets: Iterable[int] = ALL_PRESETS, run_forge: bool 
     else:
         path = Path(target).expanduser()
         progress(f"Static pass over {path}")
-        result, sol = score_path(path, presets)
+        result, sol = score_path(path, presets, load_scan_config(path.expanduser().resolve(), config_path))
         progress(f"  {result.files_scanned} file(s), {result.lines_scanned} line(s), {len(result.findings)} finding(s)")
         check()
         if sol:
@@ -1247,6 +1372,9 @@ td.cell { text-align: center; white-space: nowrap; } td.ARMED { background: #111
 td.FLAGGED { background: #666; color: #fff; } td.off { color: #aaa; }
 td.loc { white-space: nowrap; } td.ev { color: #555; word-break: break-word; }
 ol.plan li { margin: 6px 0; }
+ol.plan pre.fix { margin: 4px 0 0; padding: 6px 8px; background: #f4f5f6; border-left: 3px solid #4a5560; font-size: 12px; }
+span.sig { font-weight: 700; color: #2f3a44; }
+tr.sigrow td { color: #8a9096; } tr.sigrow td:nth-child(-n+5) { white-space: nowrap; } tr.sigrow.hit td { color: #111; } tr.sigrow.hit td.n { font-weight: 700; }
 """
 
 
@@ -1261,6 +1389,32 @@ def _md(v) -> str:
 
 def _pts(f: Finding) -> str:
     return f"-{f.points}" if f.points else "0 (cap)"
+
+
+def _sig_tag(f: Finding) -> str:
+    return f'<span class="sig">{_h(f.signature)}</span> ' if f.signature else ""
+
+
+def signature_section(findings: list[Finding]) -> list[str]:
+    """Layer 13 table: every signature in the database, how often it matched and what it costs."""
+    hits = signatures.hits(findings)
+    sev_now = {}
+    for f in findings:
+        if f.signature:
+            sev_now.setdefault(f.signature, f.severity)
+    out = ["<h2>Signature database</h2>",
+           f'<p class="muted">{len(signatures.SIGNATURES)} signatures, {sum(1 for v in hits.values() if v)} matched. '
+           "Severities can be changed or switched off in foundryguard.toml under [score.severity].</p>",
+           '<div class="scroll"><table><tr><th>ID</th><th>Stack</th><th>Rule</th><th>Severity</th><th>Ref</th>'
+           '<th class="n">Hits</th><th>Signature</th></tr>']
+    for sig in signatures.SIGNATURES:
+        n = hits[sig.id]
+        sev = sev_now.get(sig.id, sig.severity)
+        out.append(f'<tr class="sigrow{" hit" if n else ""}"><td>{_h(sig.id)}</td><td>{_h(sig.stack)}</td>'
+                   f"<td>{_h(sig.rule)}</td><td><span class=\"sev {sev}\">{sev}</span></td><td>{_h(sig.ref)}</td>"
+                   f'<td class="n">{n}</td><td>{_md(sig.title)}</td></tr>')
+    out.append("</table></div>")
+    return out
 
 
 def render_html(result: ScoreResult, run=None, generated: str | None = None) -> str:
@@ -1302,7 +1456,8 @@ def render_html(result: ScoreResult, run=None, generated: str | None = None) -> 
         for i, f in enumerate(result.findings, 1):
             ev = f'<br><code class="muted">{_h(f.evidence)}</code>' if f.evidence else ""
             out.append(f'<tr><td class="n">{i}</td><td><span class="sev {f.severity}">{f.severity}</span></td>'
-                       f"<td>{f.layer} {_h(LAYERS[f.layer])}</td><td>{_h(f.rule)}</td>"
+                       f"<td>{f.layer} {_h(LAYERS[f.layer])}</td>"
+                       f"<td>{_sig_tag(f)}{_h(f.rule)}</td>"
                        f'<td class="loc">{_h(f.location)}</td><td class="n">{_pts(f)}</td>'
                        f'<td class="ev">{_md(f.title)}{ev}</td></tr>')
         out.append("</table></div>")
@@ -1313,9 +1468,12 @@ def render_html(result: ScoreResult, run=None, generated: str | None = None) -> 
             by_rule.setdefault(f.rule, []).append(f)
         for rule, fs in by_rule.items():
             locs = ", ".join(f.location for f in fs[:12]) + (f" and {len(fs) - 12} more" if len(fs) > 12 else "")
-            out.append(f'<li><span class="sev {fs[0].severity}">{fs[0].severity}</span> <b>{_h(rule)}</b>: '
-                       f"{_md(fs[0].mitigation)}<br><span class=\"muted\">at {_h(locs)}</span></li>")
+            fix = f'<pre class="fix">{_h(fs[0].fix)}</pre>' if fs[0].fix else ""
+            out.append(f'<li><span class="sev {fs[0].severity}">{fs[0].severity}</span> {_sig_tag(fs[0])}<b>{_h(rule)}</b>: '
+                       f"{_md(fs[0].mitigation)}<br><span class=\"muted\">at {_h(locs)}</span>{fix}</li>")
         out.append("</ol>")
+
+    out += signature_section(result.findings)
 
     if result.bridge:
         if __package__:
@@ -1383,6 +1541,7 @@ def add_score_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--ast", help="use a prebuilt solc Standard JSON output for the preset matrix")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     ap.add_argument("--min-score", type=int, default=0, help="exit 1 when the score is below this")
+    ap.add_argument("--config", help="foundryguard.toml to read [score] from (default: nearest one at or above the target)")
 
 
 def cmd_score(args) -> int:
@@ -1392,7 +1551,7 @@ def cmd_score(args) -> int:
         print(f"foundryguard: {exc}", file=sys.stderr)
         return 2
     try:
-        result, page = simulate(args.target, presets, run_forge=args.fuzz, out_dir=args.out, ast_path=args.ast,
+        result, page = simulate(args.target, presets, run_forge=args.fuzz, out_dir=args.out, ast_path=args.ast, config_path=args.config,
                                 progress=lambda m: print("foundryguard: " + m, file=sys.stderr))
     except (FileNotFoundError, urllib.error.URLError, OSError, ValueError) as exc:
         print(f"foundryguard: {exc}", file=sys.stderr)
@@ -1402,7 +1561,7 @@ def cmd_score(args) -> int:
     else:
         print(f"{result.score}/100 {result.verdict}  {len(result.findings)} deduction(s)  {page}")
         for f in result.findings[:20]:
-            print(f"  -{f.points:<3} {f.severity:<8} {f.layer:<3} {f.rule:<26} {f.location}  {f.title}")
+            print(f"  -{f.points:<3} {f.severity:<8} {f.layer:<3} {(f.signature or '-'):<5} {f.rule:<26} {f.location}  {f.title}")
         if len(result.findings) > 20:
             print(f"  ... {len(result.findings) - 20} more in the report")
         if result.bridge and result.bridge.get("links"):
