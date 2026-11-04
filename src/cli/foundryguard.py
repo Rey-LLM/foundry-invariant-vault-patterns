@@ -50,7 +50,7 @@ CONFIG_TEMPLATE = """# FoundryGuard configuration. Every key is optional.
 # max_files = 5000
 
 [score.severity]
-# Retune or silence any rule, by signature id (FG-01..FG-103) or rule name.
+# Retune or silence any rule, by signature id (FG-01..FG-150) or rule name.
 # CRITICAL costs 25 points, HIGH 15, MEDIUM 8, LOW 3; "off" drops the rule.
 # "FG-02" = "MEDIUM"          # division before multiplication
 # "FG-08" = "off"             # unbounded loop over a storage array

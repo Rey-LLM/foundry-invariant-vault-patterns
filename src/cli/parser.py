@@ -54,6 +54,7 @@ consumed by ``injector.py``.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 if __package__:
     from . import compiler
@@ -77,7 +78,7 @@ else:  # executed as a plain script directory (python3 src/cli/parser.py)
     from compiler import Diagnostic, SolidityError  # type: ignore
 
 SCHEMA = "foundryguard.blueprint/v2"
-TOOL_VERSION = "0.15.0"
+TOOL_VERSION = "0.16.0"
 
 log = logging.getLogger("foundryguard.parser")
 
@@ -342,6 +343,23 @@ def _ref_name(node: dict | None) -> str:
     return (node.get("name") or node.get("namePath") or "").split(".")[-1]
 
 
+@functools.lru_cache(maxsize=1024)
+def _name_pattern(n: str) -> re.Pattern[str]:
+    """Pool for ``[classify]`` entries: a regex as written, a plain name as an exact match. Compiled once per
+    process, so repeated runs from the desktop window or the CLI reuse them."""
+    return re.compile(n if any(ch in n for ch in "^$*+?[(|\\") else f"^{re.escape(n)}$")
+
+
+@functools.lru_cache(maxsize=8192)
+def _match_name(rules: tuple[tuple[str, str, re.Pattern[str]], ...], name: str) -> tuple[str, str] | None:
+    """First (category, direction) whose pattern matches ``name``; cached per rule set because the same
+    function names (deposit, withdraw, transfer, ...) recur across every contract of a project."""
+    for category, direction, pattern in rules:
+        if pattern.match(name):
+            return category, direction
+    return None
+
+
 def build_rules(config: dict | None) -> tuple[tuple[str, str, re.Pattern[str]], ...]:
     """Prepend user rules from ``foundryguard.toml`` ``[classify]`` to the built-in ones.
 
@@ -368,7 +386,7 @@ def build_rules(config: dict | None) -> tuple[tuple[str, str, re.Pattern[str]], 
             continue
         category, direction = mapping[key]
         for n in names:
-            rules.append((category, direction, re.compile(n if any(ch in n for ch in "^$*+?[(|\\") else f"^{re.escape(n)}$")))
+            rules.append((category, direction, _name_pattern(n)))
     # Ignore rules must win over everything, user rules over built-ins.
     rules.sort(key=lambda r: r[0] != "__ignore__")
     return tuple(rules) + CLASSIFICATION_RULES
@@ -384,14 +402,10 @@ def classify(fn: Function, rules: tuple[tuple[str, str, re.Pattern[str]], ...] =
         return
     if hook_reentrancy.is_callback_name(fn.name):
         return  # unlockCallback / beforeSwap ... are entry points for the caller, not value flows
-    for category, direction, pattern in rules:
-        if pattern.match(fn.name):
-            if category == "__ignore__":
-                return
-            fn.category, fn.direction = category, direction
-            break
-    else:
+    hit = _match_name(rules, fn.name)
+    if hit is None or hit[0] == "__ignore__":
         return
+    fn.category, fn.direction = hit
     uints = [p for p in fn.params if _is_uint(p)]
     named = next((p for p in uints if AMOUNT_PARAM.match(p.name)), None)
     if named:
@@ -939,6 +953,28 @@ def contracts_from_ast(result: "compiler.CompileResult", root: Path, paths: list
 # --------------------------------------------------------------------------- #
 
 
+def _walk_sol(top: Path) -> Iterator[Path]:
+    """Solidity sources under ``top``. ``os.scandir`` inside a context manager: one directory read per folder,
+    file type from the directory entry (no extra stat per file), handle closed as soon as the folder is done.
+    Symlinked folders are not followed, like ``os.walk``."""
+    stack = [str(top)]
+    while stack:
+        here = stack.pop()
+        subdirs = []
+        try:
+            with os.scandir(here) as it:
+                for entry in it:
+                    name = entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if name not in EXCLUDED_DIRS:
+                            subdirs.append(entry.path)
+                    elif name.endswith(".sol") and not name.endswith((".t.sol", ".s.sol")):
+                        yield Path(entry.path).resolve()
+        except OSError:
+            continue
+        stack.extend(sorted(subdirs, reverse=True))
+
+
 def discover_sources(root: Path, paths: Iterable[str]) -> list[Path]:
     paths = list(paths)
     targets = [root / p for p in paths] if paths else [root / d for d in DEFAULT_SOURCE_DIRS if (root / d).is_dir()]
@@ -951,11 +987,7 @@ def discover_sources(root: Path, paths: Iterable[str]) -> list[Path]:
             continue
         if not t.is_dir():
             raise SystemExit(f"foundryguard: path not found: {t}")
-        for dirpath, dirnames, filenames in os.walk(t):
-            dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
-            for f in filenames:
-                if f.endswith(".sol") and not f.endswith((".t.sol", ".s.sol")):
-                    files.add((Path(dirpath) / f).resolve())
+        files.update(_walk_sol(t))
     if not files:
         raise SystemExit(f"foundryguard: no .sol files under {', '.join(str(t) for t in targets)}")
     return sorted(files)

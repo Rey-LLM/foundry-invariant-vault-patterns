@@ -1,18 +1,18 @@
-# FoundryGuard v0.15
+# FoundryGuard v0.16
 
 **Hybrid Web2/Web3 Static and Dynamic Vulnerability Assessment Platform**
 
-FoundryGuard assesses a codebase that ships both smart contracts and the backend that drives them. It reads the Solidity through the compiler's typed AST, reads the Node and Python backend and site code as source, links the two at the signing seam, and then exercises the contracts dynamically with generated Foundry invariant suites. Every finding is tied to a file and line, mapped to one of 103 catalogued signatures with a CWE or SWC reference, weighted into a 1 to 100 risk score, and exported as HTML, Markdown, JSON and SARIF.
+FoundryGuard assesses a codebase that ships both smart contracts and the backend that drives them. It reads the Solidity through the compiler's typed AST, reads the Node and Python backend and site code as source, links the two at the signing seam, and then exercises the contracts dynamically with generated Foundry invariant suites. Every finding is tied to a file and line, mapped to one of 150 catalogued signatures with a CWE or SWC reference, weighted into a 1 to 100 risk score, and exported as HTML, Markdown, JSON and SARIF.
 
 It is built for engineering teams assessing their own code: point it at a repository you own or have been asked to review. Remote targets are limited to one passive request, and nothing is fuzzed against a host.
 
 | | |
 | :-- | :-- |
-| Version | 0.15.0 (`pyproject.toml`) |
+| Version | 0.16.0 (`pyproject.toml`) |
 | Runtime | Python 3.9 to 3.13; solc, solcjs or Foundry for contract analysis; Foundry for dynamic runs |
 | Interfaces | CLI (`foundryguard`, `foundryguard-bridge`), desktop console (`foundryguard-gui`), GitHub Action |
-| Outputs | `foundryguard-report.html`, `foundryguard-score.json`, `FoundryGuard_Report.md`, `foundryguard.sarif` |
-| Verification | 292 unit and integration tests, plus forge fuzzing of every fixture project in CI |
+| Outputs | `foundryguard-report.html`, `foundryguard-score.json`, `foundryguard-findings.log`, `FoundryGuard_Report.md`, `foundryguard.sarif` |
+| Verification | 411 unit and integration tests, plus forge fuzzing of every fixture project in CI |
 | License | MIT |
 
 ## Contents
@@ -21,7 +21,7 @@ It is built for engineering teams assessing their own code: point it at a reposi
 - [Installation and quick start](#installation-and-quick-start)
 - [Command reference](#command-reference)
 - [Architecture](#architecture)
-- [Signature matrix: FG-01 to FG-103](#signature-matrix-fg-01-to-fg-103)
+- [Signature matrix: FG-01 to FG-150](#signature-matrix-fg-01-to-fg-150)
 - [Risk scoring](#risk-scoring)
 - [Desktop console](#desktop-console)
 - [Static analysis: contract model](#static-analysis-contract-model)
@@ -38,9 +38,9 @@ It is built for engineering teams assessing their own code: point it at a reposi
 
 | Domain | Mode | What is assessed |
 | :-- | :-- | :-- |
-| Web3 contract safety | Static | 50 Solidity signatures (FG-01 to FG-50): reentrancy, price and oracle manipulation, access control, proxies and diamonds, signatures and replay, ordering, governance, arithmetic, transient storage |
+| Web3 contract safety | Static | 72 Solidity signatures (FG-01 to FG-50, FG-104 to FG-125): reentrancy, price and oracle manipulation, access control, proxies and diamonds, signatures and replay, ordering, governance, arithmetic, transient storage, staking and reward accounting, timelocks, emergency exits, ERC-721 and ERC-1155 state |
 | Web3 contract behaviour | Dynamic | Generated Foundry handlers and invariants, eight attack presets, cross-contract ecosystem suites; broken invariants are reported with the shrunk call sequence and a replay test |
-| Web2 backend | Static | Injection (SQL, NoSQL, command, template, eval), XSS, SSRF, XXE, deserialization, path traversal, IDOR, mass assignment, JWT, sessions, CSRF, rate limits, debug configuration |
+| Web2 backend | Static | Injection (SQL, NoSQL, command, template, eval, headers, regex, prototype pollution), XSS, SSRF, XXE, deserialization, path traversal, IDOR on reads and writes, unauthenticated state routes, mass assignment, JWT issue and verify, session cookies and fixation, WebSocket handshakes, cache scoping, CSRF, rate limits, debug configuration |
 | Secrets and data exposure | Static | Hardcoded keys and secrets, key material written to logs or responses, signing keys shipped to the browser, tokens in `localStorage`, version banners |
 | HTTP surface | Passive | One GET per URL: CSP, HSTS, framing, nosniff, cookie flags, CORS, mixed content |
 | Supply chain | Static, offline | `package.json`, `package-lock.json` (transitive) and `requirements*.txt` against a bundled advisory list |
@@ -94,7 +94,7 @@ FoundryGuard is a layered pipeline. Each layer is a separate module under `src/c
 | 10 | `scoring.py`, `gui.py` | 1-100 score, preset matrix, desktop window |
 | 11 | `scoring.py` | backend and site code rules |
 | 12 | `web_surface.py` | backend to contract bridge |
-| 13 | `signatures.py` | the signature database (FG-01 to FG-103 since 0.15) |
+| 13 | `signatures.py` | the signature database (FG-01 to FG-150 since 0.16) |
 
 ```text
 src/cli/
@@ -108,15 +108,15 @@ src/cli/
   reporter.py          forge output to Markdown, HTML and SARIF
   scoring.py           static rules, 1-100 score, simulation matrix
   web_surface.py       backend-to-contract bridge validator
-  signatures.py        FG-01 to FG-103 signature catalogue
+  signatures.py        FG-01 to FG-150 signature catalogue
   gui.py               desktop console
 tests/foundryguard/    unit and integration tests, weak/safe fixture pairs per layer
 src/, test/            reference contracts and invariant suites (see below)
 ```
 
-## Signature matrix: FG-01 to FG-103
+## Signature matrix: FG-01 to FG-150
 
-The signature database (`src/cli/signatures.py`) defines 103 distinct failure modes. Each carries a fixed severity, a CWE or SWC reference, a one-line mitigation and a fix example that the HTML report prints next to the hit. Every finding in the report and in `--json` output carries its signature id.
+The signature database (`src/cli/signatures.py`) defines 150 distinct failure modes. Ids only grow: 0.16 appended FG-104 to FG-150 and left FG-01 to FG-103 as they were. Each carries a fixed severity, a CWE or SWC reference, a one-line mitigation and a fix example that the HTML report prints next to the hit. Every finding in the report and in `--json` output carries its signature id.
 
 | Range | Surface | Stacks | Count |
 | :-- | :-- | :-- | --: |
@@ -125,6 +125,8 @@ The signature database (`src/cli/signatures.py`) defines 103 distinct failure mo
 | FG-84 to FG-89 | Web2 | HTTP response headers | 6 |
 | FG-90 | Web2 | Dependency manifests | 1 |
 | FG-91 to FG-103 | Web2 to Web3 | Backend-to-contract bridge | 13 |
+| FG-104 to FG-125 | Web3 | Solidity: staking, rewards, timelocks, emergency exits, NFTs | 22 |
+| FG-126 to FG-150 | Web2 | Backend source: API state routes, WebSockets, headers, caching, sessions, tokens, GraphQL | 25 |
 
 Secrets and data-exposure coverage spans the backend and bridge groups: FG-51 (hardcoded keys, API keys, salts and secrets), FG-74 (auth tokens in `localStorage`), FG-75 (session cookies without `Secure`/`HttpOnly`), FG-89 (version disclosure), FG-94 to FG-96 (key material read from requests, written to logs or responses, or shipped to the browser).
 
@@ -230,6 +232,45 @@ Secrets and data-exposure coverage spans the backend and bridge groups: FG-51 (h
 | FG-44 | Solidity | `SOL-MSG-VALUE-LOOP` | HIGH | CWE-837 | msg.value read inside a loop (or a payable multicall) |
 | FG-50 | Solidity | `SOL-UNFUNDED-REWARDS` | HIGH | CWE-682 | Reward rate set without checking the tokens are there |
 
+### Web3 staking, rewards, timelocks and NFT state (FG-104 to FG-125, since 0.16)
+
+#### Staking locks and reward accounting
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-104 | Solidity | `SOL-STAKE-NO-LOCK` | HIGH | CWE-841 | Stake withdrawable before its lock period ends |
+| FG-105 | Solidity | `SOL-REWARD-NOT-UPDATED` | HIGH | CWE-682 | Staked balance changes without settling rewards first |
+| FG-106 | Solidity | `SOL-REWARD-PRECISION` | MEDIUM | CWE-1339 | Reward-per-token accumulator divides without a scale factor |
+| FG-107 | Solidity | `SOL-REWARD-LOOP-DISTRIBUTION` | HIGH | CWE-834 | Rewards pushed pro-rata to every staker in one loop |
+| FG-120 | Solidity | `SOL-REWARD-CLAIM-NO-RESET` | CRITICAL | CWE-841 | Reward claim pays out without zeroing the owed amount |
+| FG-121 | Solidity | `SOL-REWARD-PERIOD-OVERWRITE` | HIGH | CWE-682 | New reward period overwrites the rate and drops the unpaid remainder |
+| FG-122 | Solidity | `SOL-LOCK-GRIEFING` | MEDIUM | CWE-284 | Anyone can extend another user's lock by depositing for them |
+| FG-123 | Solidity | `SOL-VESTING-OVERRUN` | HIGH | CWE-682 | Linear vesting keeps growing after the end date |
+
+#### Emergency exits, rescues and timelocks
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-108 | Solidity | `SOL-EMERGENCY-WITHDRAW-FLAW` | HIGH | CWE-841 | Emergency withdraw pays rewards or leaves the stake on the books |
+| FG-109 | Solidity | `SOL-RESCUE-DRAINS-STAKE` | HIGH | CWE-284 | Admin token rescue can pull the users' staked token |
+| FG-110 | Solidity | `SOL-NO-TIMELOCK` | MEDIUM | CWE-284 | Fee changed instantly by the admin with no cap and no timelock |
+| FG-111 | Solidity | `SOL-TIMELOCK-BYPASS` | CRITICAL | CWE-863 | Queued action executable before its ETA |
+| FG-112 | Solidity | `SOL-TIMELOCK-SHORT-DELAY` | MEDIUM | CWE-1188 | Timelock delay shorter than one day |
+| FG-125 | Solidity | `SOL-EMERGENCY-PAUSED` | MEDIUM | CWE-400 | Emergency exit disabled while the contract is paused |
+
+#### ERC-721 and ERC-1155 state
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-113 | Solidity | `SOL-NFT-UNSAFE-MINT` | LOW | CWE-20 | ERC-721 minted with _mint to a caller-chosen address |
+| FG-114 | Solidity | `SOL-NFT-HOOK-REENTRANCY` | HIGH | CWE-841 / SWC-107 | State written after _safeMint / safeTransferFrom (receiver hook reentrancy) |
+| FG-115 | Solidity | `SOL-NFT-STAKE-RECORD-DRIFT` | HIGH | CWE-672 | Staked NFT returned while its staker record stays set |
+| FG-116 | Solidity | `SOL-NFT-UNSTAKE-ANY` | CRITICAL | CWE-639 | Anyone can withdraw a staked NFT (no owner check) |
+| FG-117 | Solidity | `SOL-ARRAY-LENGTH-MISMATCH` | MEDIUM | CWE-130 | Parallel arrays (ids/amounts) used without a length check |
+| FG-118 | Solidity | `SOL-SUPPLY-DRIFT` | MEDIUM | CWE-682 | Per-id supply counter raised on mint and never lowered on burn |
+| FG-119 | Solidity | `SOL-NFT-APPROVAL-STALE` | HIGH | CWE-284 | Hand-written ERC-721 transfer keeps the previous owner's approval |
+| FG-124 | Solidity | `SOL-RECEIVER-ANY-TOKEN` | HIGH | CWE-345 | onERC721Received / onERC1155Received credits a deposit from any token contract |
+
 ### Web2 backend, HTTP surface and bridge (FG-51 to FG-103)
 
 #### Injection and unsafe execution (backend)
@@ -315,6 +356,53 @@ Secrets and data-exposure coverage spans the backend and bridge groups: FG-51 (h
 | FG-102 | Bridge | `BRIDGE-DOMAIN-DRIFT` | MEDIUM | CWE-347 | Backend EIP-712 domain differs from the contract |
 | FG-103 | Bridge | `BRIDGE-DEADLINE-UNENFORCED` | HIGH | CWE-613 | Backend signs an expiry the contract never checks |
 
+### Web2 API, WebSocket, caching and session security (FG-126 to FG-150, since 0.16)
+
+#### API state endpoints and injection through headers
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-126 | Backend | `WEB-IDOR-MUTATION` | HIGH | CWE-639 | Record updated or deleted by a URL id with no ownership check |
+| FG-147 | Backend | `WEB-API-STATE-NO-AUTH` | HIGH | CWE-306 | State-changing API route in a file with no authentication |
+| FG-130 | Backend | `WEB-HEADER-INJECTION` | HIGH | CWE-113 | Response header value taken from the request (header injection) |
+| FG-131 | Backend | `WEB-LOG-INJECTION` | LOW | CWE-117 | Raw request values written to the log |
+| FG-134 | Backend | `WEB-CACHE-POISON-HOST` | MEDIUM | CWE-349 | Response built from X-Forwarded-Host (web cache poisoning) |
+| FG-141 | Backend | `WEB-HOST-HEADER-LINK` | HIGH | CWE-640 | Reset or verification link built from the Host header |
+| FG-142 | Backend | `WEB-REGEX-INJECTION` | MEDIUM | CWE-1333 | Regular expression built from request data (ReDoS) |
+| FG-143 | Backend | `WEB-PROTOTYPE-POLLUTION` | HIGH | CWE-1321 | Request data deep-merged into an object (prototype pollution) |
+| FG-144 | Backend | `WEB-UPLOAD-FILENAME` | HIGH | CWE-434 | Uploaded file saved under the client's filename |
+| FG-148 | Backend | `WEB-ERROR-LEAK` | MEDIUM | CWE-209 | Exception message or stack trace returned to the client |
+
+#### WebSockets
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-127 | Backend | `WEB-WS-NO-ORIGIN` | HIGH | CWE-1385 | WebSocket server accepts any Origin (cross-site WebSocket hijacking) |
+| FG-128 | Backend | `WEB-WS-NO-AUTH` | HIGH | CWE-306 | WebSocket connection handled without authenticating the client |
+| FG-129 | Backend | `WEB-WS-UNBOUNDED-MESSAGE` | MEDIUM | CWE-770 | WebSocket server with no message size limit |
+| FG-150 | Backend | `WEB-WS-PLAINTEXT` | MEDIUM | CWE-319 | WebSocket endpoint over plain ws:// |
+
+#### Caching, CORS and GraphQL
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-132 | Backend | `WEB-CACHE-PUBLIC-AUTH` | HIGH | CWE-524 | Authenticated response marked cacheable by shared caches |
+| FG-133 | Backend | `WEB-CACHE-KEY-NO-USER` | HIGH | CWE-524 | Per-user response cached under a key without the user |
+| FG-149 | Backend | `WEB-CORS-REFLECT` | HIGH | CWE-942 | CORS reflects the caller's Origin |
+| FG-145 | Backend | `WEB-GRAPHQL-INTROSPECTION` | LOW | CWE-200 | GraphQL introspection or GraphiQL switched on |
+| FG-146 | Backend | `WEB-GRAPHQL-NO-LIMIT` | MEDIUM | CWE-770 | GraphQL server with no query depth or cost limit |
+
+#### Sessions and tokens
+
+| ID | Stack | Rule | Severity | Ref | Catches |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| FG-135 | Backend | `WEB-SESSION-COOKIE-CONFIG` | MEDIUM | CWE-614 | Session middleware leaves its cookie without Secure or HttpOnly |
+| FG-136 | Backend | `WEB-SAMESITE-NONE` | MEDIUM | CWE-1275 | Session cookie sent cross-site (SameSite=None) |
+| FG-137 | Backend | `WEB-SESSION-FIXATION` | HIGH | CWE-384 | Login stores the user in the session without regenerating its id |
+| FG-138 | Backend | `WEB-JWT-NO-EXPIRY` | MEDIUM | CWE-613 | JWT issued without an expiry |
+| FG-139 | Backend | `WEB-JWT-WEAK-SECRET` | HIGH | CWE-521 | JWT signed or verified with a short literal secret |
+| FG-140 | Backend | `WEB-PASSWORD-PLAINTEXT` | CRITICAL | CWE-256 | Password from the request stored without hashing |
+
 ### Severity, aliases and numbering
 
 Costs follow the score: CRITICAL 25, HIGH 15, MEDIUM 8, LOW 3, with the three-hits-per-rule cap. Some rules have aliases that count as the same signature: the Layer 12 seed-phrase and RPC-key rules count as FG-51, weak signature nonces as FG-52, a server signature with no nonce as FG-31, an unbound server signature as FG-32, and the URL-mode CORS, plain-http and cookie checks as FG-55, FG-78 and FG-75. FG-26 keeps the severity its detector picks (CRITICAL for a caller-supplied target, MEDIUM otherwise).
@@ -340,6 +428,14 @@ What the more specific detectors look at, and what they deliberately leave alone
 * FG-83 headers: an Express or Flask app with no helmet, Talisman or header code anywhere in the project.
 * FG-90 dependencies: `package.json` exact, `^` and `~` pins that cannot reach the fixed version, every entry in `package-lock.json` (transitive ones included) and `==` pins in `requirements*.txt`, against a short offline list (lodash, minimist, jsonwebtoken, axios, node-fetch, express, jquery, handlebars, serialize-javascript, PyYAML, requests, Jinja2, urllib3, Flask, Werkzeug). It is a floor, not a replacement for `npm audit` or `pip-audit`.
 
+* FG-104 lock: an unstake/withdraw in a contract that has a stake function and a lock-period variable, with no clock read. Reentrancy flags such as `locked` are not lock periods.
+* FG-110 timelock: a fee/tax/penalty setter with no upper bound, in a file with no timelock, queue, delay or pending value. It cannot see that the owner is itself a timelock contract; switch it off in that case.
+* FG-117 parallel arrays: two array parameters indexed in a loop with no `a.length == b.length` check, unless both arrays are handed whole to another call (a hash or a validator).
+* FG-127 to FG-129 WebSockets: `ws`, `websockets`, flask-sock and Flask-SocketIO servers. An `origin`, `verifyClient` or `allowRequest` anywhere in the file counts as an Origin check.
+* FG-147 state routes: POST/PUT/PATCH/DELETE routes in a file that never mentions auth, a session, a token, `login_required`, a guard or a permission. Login, signup, reset, webhook and health paths are skipped.
+
+0.16 rules were checked against OpenZeppelin 5.1, Solady, Synthetix, Uniswap v2/v3, express, express-session, ws, socket.io, jsonwebtoken, multer, cors, Apollo Server and GraphQL Yoga. Outside the libraries' own internals (which `node_modules` skipping already hides) the only hits were four Synthetix owner functions that index two arrays without a length check (FG-117), which is what the rule describes.
+
 Calibrated against OpenZeppelin 5.1 (plain and upgradeable), Solady, Uniswap v2/v3, express, express-session, passport, jsonwebtoken, requests, httpx, lxml and bs4. On that corpus the rules report: four OpenZeppelin upgradeable presets with a public `initializer` and no constructor lock (FG-21, which OpenZeppelin's documentation also asks you to add), pre-0.8 Uniswap files doing unchecked math (FG-48), one example swap with a zero minimum (FG-39), the v3 payable multicall (FG-44), and an `express` 4.17.3 dev pin (FG-90). The rules read source text, not data flow, so tune them per project:
 
 ```toml
@@ -362,7 +458,7 @@ Each deduction lists the file and line, the severity, the signature, the layer (
 
 Inputs:
 
-- **Solidity**, for the FG-01 to FG-50 rules. Rules tied to a preset follow the preset toggles.
+- **Solidity**, for the FG-01 to FG-50 and FG-104 to FG-125 rules. Rules tied to a preset follow the preset toggles.
 - **Backend and site code** (`.py`, `.js`/`.ts`, `.html`, `.php`), for the backend rules.
 - **Dependency manifests** (`package.json`, `package-lock.json`, `requirements*.txt`), for FG-90.
 - **A URL**: one GET of the page. Response headers and the returned HTML and inline scripts are checked. Nothing else is requested and nothing is fuzzed against the host, so only point it at sites you own or are authorised to test.
@@ -389,8 +485,9 @@ foundryguard score https://app.example.com  # one passive GET; report in ~/found
 | LAUNCH SECURITY SIMULATION | Runs the static pass, the preset matrix and, when available, the dynamic pass |
 | Progress row | Progress bar, elapsed time and Stop; the run executes on a background thread so the window stays responsive |
 | Score card | Final score, coloured green, amber or red by band |
+| Log | Progress while running; at the end, every deduction ranked by severity with its signature id, file and line, points, the source line and the fix example (first 300; the report has all) |
 
-The layout is flat and dark: charcoal background, slate cards, white text and one muted green accent. On completion the HTML report opens in the browser with the score at the top, and `foundryguard-score.json` is written next to it for automation.
+The layout is flat and dark: charcoal background, slate cards, white text and one muted green accent. On completion the HTML report opens in the browser with the score at the top, and `foundryguard-score.json` plus `foundryguard-findings.log` (the same per-deduction listing as the window log, as plain text) are written next to it.
 
 ## Static analysis: contract model
 
@@ -717,7 +814,11 @@ To reuse a pattern, copy the closest handler and test, point the handler at your
 python3 -m unittest discover -s tests/foundryguard -v
 ```
 
-The suite holds 292 tests covering every layer, with weak and safe fixture pairs for the signatures, presets and bridge rules. Tests that compile Solidity are skipped without solc or solcjs (`npm install -g solc`); the OpenZeppelin and Solady resolution tests also need `npm install` in `tests/foundryguard/fixtures/libs`; the desktop console tests are skipped without a display. CI additionally fuzzes each fixture project with forge and requires every weak fixture to fail and every safe fixture to pass.
+The suite holds 411 tests covering every layer, with weak and safe fixture pairs for the signatures, presets and bridge rules. Tests that compile Solidity are skipped without solc or solcjs (`npm install -g solc`); the OpenZeppelin and Solady resolution tests also need `npm install` in `tests/foundryguard/fixtures/libs`; the desktop console tests are skipped without a display. CI additionally fuzzes each fixture project with forge and requires every weak fixture to fail and every safe fixture to pass.
+
+### Engine performance
+
+The scan reads each file once with a bounded read (no separate stat), walks folders with `os.scandir`, strips comments with one compiled tokenizer instead of a per-character loop, and gives every line rule a set of literal hints so a rule only runs line by line on files that contain one of them. Every fixed regex in the bridge validator and the AST parser is compiled once at import; per-identifier patterns and function-name classification are cached. On a 2,674-file JavaScript corpus the line-rule pass went from 41 s to 29 s with identical findings, and the folder walk and file reads take about half the time they did. A test checks that every line a rule matches contains one of its hints.
 
 ## Scope and known limitations
 
@@ -732,6 +833,7 @@ The suite holds 292 tests covering every layer, with weak and safe fixture pairs
 - The bridge pass links signer and verifier inside one repository. A backend that signs for a contract kept in another repo is checked on its own side only, and handlers wired through a framework it does not recognise are judged as plain functions (no route, no oracle check).
 - Preset 05 sees `tstore` in the contract's own lineage only. Transient storage written through a library (OpenZeppelin `TransientSlot`, `ReentrancyGuardTransient`) or Solidity `transient` state variables is not detected yet; list those slots under `transient_slots`.
 - Remote targets get one passive GET. Active injection testing against a running application is out of scope; use a dedicated DAST tool such as OWASP ZAP against your own staging environment and trace its hits back to code with the file and line findings here.
+- The 0.16 staking, NFT and API rules are pattern based like the rest: a lock check, ownership check or auth middleware done in another contract or file is invisible to them. Each deduction carries the line so a false hit is quick to dismiss or switch off in `foundryguard.toml`.
 - There is no dedicated detector for personal data (PII) or email addresses in source or responses. Secret and key exposure is covered by FG-51 and FG-94 to FG-96.
 
 ## License

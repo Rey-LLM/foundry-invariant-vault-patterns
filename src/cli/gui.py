@@ -181,6 +181,7 @@ class App:
     """The customtkinter window. Created only by ``main()`` (needs a display)."""
 
     POLL_MS = 100
+    DIGEST_LIMIT = 300  # findings printed into the log box when a run ends; the HTML report has all of them
 
     def __init__(self, root, initial: str = "") -> None:
         import tkinter as tk
@@ -491,6 +492,9 @@ class App:
                                 f"{c['HIGH']} high. Report: {ev.report}")
             self.last_report = ev.report
             self.report_btn.configure(state="normal")
+            self.write("")
+            for line in scoring.finding_digest(r, limit=self.DIGEST_LIMIT):
+                self.write(line)
             if self.open_var.get():
                 open_report(ev.report)
         else:

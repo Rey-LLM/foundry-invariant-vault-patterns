@@ -22,9 +22,9 @@ What gets read:
   transactions, allocates nonces or trusts RPC answers, paired with the contract function that verifies
   the signature. Typehash and domain drift, replayable or never-expiring signatures, public signing routes
   and leaked keys land under layer L11.
-* The signature database (Layer 13, ``signatures.py``): 103 named signatures, FG-01..FG-50 for contracts and
-  FG-51..FG-103 for backend code, response headers, dependency manifests and the bridge, each with a fixed
-  severity, a CWE/SWC reference and a fix example. Matching findings carry the signature id;
+* The signature database (Layer 13, ``signatures.py``): 150 named signatures, FG-01..FG-50 and FG-104..FG-125
+  for contracts, FG-51..FG-103 and FG-126..FG-150 for backend code, response headers, dependency manifests,
+  WebSockets, sessions and the bridge, each with a fixed severity, a CWE/SWC reference and a fix example. Matching findings carry the signature id;
   ``foundryguard.toml`` ``[score]`` can retune severities, ignore paths and limit how deep the walk goes.
 * A URL: one passive GET of the page. The response headers and the HTML/inline scripts it returns are
   checked. Nothing else is requested and nothing is fuzzed against a remote host.
@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 if __package__:
     from . import reporter, signatures
@@ -109,9 +109,10 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.15 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.16 (passive single-page check)"
 CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
+FINDINGS_LOG = "foundryguard-findings.log"
 
 
 @dataclass
@@ -199,36 +200,31 @@ def score(findings: list[Finding]) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def strip_comments(text: str, blank_strings: bool = True) -> str:
-    """Comments (and string contents) replaced by spaces; offsets and newlines are kept."""
-    out = list(text)
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        elif c == "/" and i + 1 < n and text[i + 1] == "*":
-            j = text.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-        elif c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c and text[j] != "\n":
-                j += 2 if text[j] == "\\" else 1
-            if blank_strings:
-                for k in range(i + 1, min(j, n)):
-                    out[k] = " "
-            i = j + 1
-        else:
-            i += 1
-    return "".join(out)
+# One pass of a compiled tokenizer instead of a Python loop over every character. The leftmost token wins, the
+# same way the old scanner worked: a quote inside a comment is comment, a // inside a string is string.
+_STRIP_BASE = (r"(?P<c>//[^\n]*|/\*[\s\S]*?(?:\*/|\Z))"
+               r"|(?P<q>[\"'])(?P<b>(?:\\[\s\S]|(?!(?P=q))[^\\\n])*)(?P<e>(?P=q))?")
+_STRIP_TOKENS = re.compile(_STRIP_BASE)
+_STRIP_TOKENS_TPL = re.compile(_STRIP_BASE + r"|(?P<t>`)(?P<tb>(?:\\[\s\S]|[^`\\])*)(?P<te>`)?")
+_NOT_NL = re.compile(r"[^\n]")
+
+
+def strip_comments(text: str, blank_strings: bool = True, templates: bool = False) -> str:
+    """Comments (and string contents) replaced by spaces; offsets and newlines are kept.
+
+    ``templates`` also treats JavaScript backtick literals as strings, so a ``//`` inside a template (a URL) is not
+    taken for a comment.
+    """
+    def sub(m: re.Match) -> str:
+        if m.group("c") is not None:
+            return _NOT_NL.sub(" ", m.group("c"))
+        if not blank_strings:
+            return m.group(0)
+        if m.group("q") is not None:
+            return m.group("q") + _NOT_NL.sub(" ", m.group("b")) + (m.group("e") or "")
+        return "`" + _NOT_NL.sub(" ", m.group("tb")) + (m.group("te") or "")
+
+    return (_STRIP_TOKENS_TPL if templates else _STRIP_TOKENS).sub(sub, text)
 
 
 def line_of(text: str, offset: int) -> int:
@@ -854,6 +850,296 @@ def diamond_slots(sol_files: list[tuple[str, str]]) -> list[Finding]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Solidity signatures added in 0.16 (FG-104..FG-125): staking and rewards, timelocks, emergency exits, NFTs
+# --------------------------------------------------------------------------- #
+
+STAKE_FN = re.compile(r"^_?(stake|deposit|lock|bond)\w*$", re.I)
+UNSTAKE_FN = re.compile(r"^(unstake|withdraw|redeem|exit|unbond|unlock|leave)\w*$", re.I)
+# lock periods and unlock times, not reentrancy flags (`locked`, `_status`)
+LOCK_VAR = re.compile(r"lock(ed)?_?(period|duration|time|until|up|end|days|secs|seconds|at)|lockup|unlock\w*|cooldown|unbond\w*|"
+                      r"min_?stake\w*|minimum_?stake\w*|staking_?period|stake_?duration|min_?duration|vesting_?period|"
+                      r"^_?LOCK$|^_?LOCK_\w+", re.I)
+LOCK_MODIFIER = re.compile(r"lock|cooldown|after|matur|unlocked|vested", re.I)
+TIME_READ = re.compile(r"\bblock\s*\.\s*(timestamp|number)\b|\bclock\s*\(|\b_now\s*\(|\b_blockTimestamp\s*\(")
+REWARD_ACC = re.compile(r"^_?(rewardPerTokenStored|rewardPerToken\w*Stored|accRewardPerShare|accRewardPerToken|accRewardsPerShare|"
+                        r"accTokenPerShare|rewardPerShare\w*|rewardIndex|globalIndex|cumulativeRewardPerToken)$")
+BALANCE_VAR = re.compile(r"^_?(balances?|balanceOf|stakes?|staked\w*|stakeOf|userInfo|users|deposits?|totalSupply|"
+                         r"totalStaked|totalDeposits?|totalShares|shares)$")
+REWARD_SYNC = re.compile(r"update\w*reward|_?update\w*|accrue\w*|_checkpoint\w*|checkpoint|harvest|updatePool|_settle\w*|"
+                         r"_claim\w*|_distribute\w*|_earn\w*", re.I)
+SCALE = re.compile(r"\b1e\d+\b|\b10\s*\*\*\s*\d+|PRECISION|SCALE|\bWAD\b|\bRAY\b|\bether\b|MULTIPLIER|\bUNIT\b|\bONE\b|"
+                   r"mulDiv|mulWad|divWad|FixedPoint|\bQ\d+\b", re.I)
+REWARD_WORD = re.compile(r"reward|distribut|dividend|yield|payout|airdrop", re.I)
+LOOP_PRORATA = re.compile(r"(\+=|[Tt]ransfer\w*\s*\(|sendValue\s*\()[^;]*/")
+PAYS_REWARD = re.compile(r"reward\w*Token\w*\s*\.\s*(safe)?[Tt]ransfer|\bearned\s*\(|(?<![\w.])_?(getReward|claim\w*|harvest)\s*\(")
+ZEROES = re.compile(r"=\s*0\s*;|\bdelete\s+\w")
+RESCUE_FN = re.compile(r"^(rescue|sweep|recover|withdrawStuck|withdrawToken|withdrawERC20|recoverERC20|emergencyToken|skim|"
+                       r"inCaseTokensGetStuck|salvage)\w*$", re.I)
+STAKE_TOKEN_VAR = re.compile(r"stak\w*token|deposit\w*token|^stakingToken$|^asset$|^_asset$|^underlying$|^want$|^lpToken$|"
+                             r"^stakeToken$|^token$", re.I)
+FEE_SETTER = re.compile(r"^set\w*(fee|tax|penalty|commission|royalt)\w*$", re.I)
+TIMELOCK_WORDS = re.compile(r"timelock|TimelockController|\beta\b|delay|pending[A-Z_]\w*|queue|schedule", re.I)
+EXECUTE_FN = re.compile(r"^execute\w*$", re.I)
+ETA_WORDS = re.compile(r"\beta\b|readyAt|executableAt|queuedAt|readyTime|executeAfter", re.I)
+QUEUE_WORDS = re.compile(r"\b(queue\w*|schedule\w*|propose\w*)\s*\(", re.I)
+DELAY_CONST = re.compile(r"\b(\w*[Dd]elay\w*|\w*DELAY\w*)\s*=\s*(\d+)\s*(seconds|minutes|hours|days|weeks)?\s*;")
+UNIT_SECS = {None: 1, "seconds": 1, "minutes": 60, "hours": 3600, "days": 86400, "weeks": 604800}
+SAFE_HOOK = re.compile(r"(?<![\w.$])(_safeMint|_safeTransfer|_mintBatch|_safeBatchTransferFrom)\s*\(|"
+                       r"\.\s*(safeBatchTransferFrom)\s*\(|"
+                       r"(?<![\w$])(\w*(?:nft|NFT|Nft|erc721|ERC721|erc1155|ERC1155|collection|Collection|items|Items)\w*)\s*"
+                       r"(?:\)\s*)?\.\s*safeTransferFrom\s*\(")
+NFT_OUT = re.compile(r"(?:safeTransferFrom|transferFrom)\s*\(\s*address\s*\(\s*this\s*\)\s*,\s*([A-Za-z_][\w.]*)")
+STAKER_MAP = re.compile(r"staker|owner|depositor|stakedBy|tokenOwner|holder", re.I)
+SUPPLY_MAP = re.compile(r"supply|minted|circulating", re.I)
+CLAIM_FN = re.compile(r"^(claim\w*|getReward\w*|harvest\w*|withdrawReward\w*|collect\w*)$", re.I)
+OWED_READ = re.compile(r"\b(\w*(?:reward|Reward|earned|Earned|pending|Pending|claimable|Claimable|owed|Owed|accrued|Accrued)\w*)"
+                       r"\s*\[\s*(?:msg\.sender|_msgSender\(\s*\)|account|user|to)\s*\]")
+PAYOUT = re.compile(r"[Tt]ransfer\w*\s*\(|\.\s*call\s*\{|sendValue\s*\(|safeTransferETH\s*\(|\._mint\s*\(|(?<![\w.])_mint\s*\(")
+PERIOD_VAR = re.compile(r"^(periodFinish|finishAt|periodEnd|rewardEnd\w*|endTime|finishTime|rewardsEnd\w*)$")
+RATE_SET = re.compile(r"\brewardRate\s*=\s*[^;]*/")
+LOCK_MAP_WRITE = r"\b(\w*(?:lock|Lock|until|Until|release|Release|cooldown|Cooldown|expir|Expir|vest|Vest)\w*)\s*\[\s*{u}\s*\]\s*=\s*[^;]*block\s*\.\s*timestamp"
+VEST_FN = re.compile(r"vest|releasable|unlocked|claimable|available", re.I)
+ELAPSED = re.compile(r"block\s*\.\s*timestamp\s*-\s*[\w.\[\]]+")
+PER_DURATION = re.compile(r"/\s*\(?\s*[\w.]*(duration|Duration|DURATION|period|Period|PERIOD|length|Length)\w*")
+TS_COMPARE = re.compile(r"block\s*\.\s*timestamp\s*[<>]|[<>]=?\s*block\s*\.\s*timestamp|\b(elapsed|timePassed|passed|dt)\w*\s*[<>]|"
+                        r"\bmin\s*\(")
+RECEIVER_FN = re.compile(r"^on(ERC721Received|ERC1155Received|ERC1155BatchReceived)$")
+SENDER_CHECKED = re.compile(r"msg\.sender\s*(==|!=)|(==|!=)\s*msg\.sender|_msgSender\(\s*\)\s*(==|!=)|\[\s*(msg\.sender|_msgSender\(\s*\))\s*\]")
+
+
+def _sol16_hit(add, cname: str):
+    def hit(rule, title, off, is_line=False):
+        add(rule, signatures.severity(rule), _SIG_LAYER.get(rule, "L4"), title, off,
+            signatures.lookup(rule).mitigation, contract=cname, is_line=is_line)
+    return hit
+
+
+def _nft_contract(sf: _SolFile, c: SolContract, kind: str = "721|1155") -> bool:
+    return bool(re.search(rf"\bERC({kind})\w*\b", _contract_header(sf, c)))
+
+
+def solidity_pack16_fn(sf: _SolFile, c: SolContract, fn: SolFunction, add, authorized: bool) -> None:
+    if fn.kind != "function":
+        return
+    hit = _sol16_hit(add, c.name)
+    body = sf.body(fn)
+    b0 = fn.body_start
+    full = _with_locals(sf, c, fn)
+    sv = c.state_vars
+    mutating = fn.exposed and fn.state_changing
+
+    # FG-104 unstake with no time check in a staking contract that declares a lock
+    if mutating and UNSTAKE_FN.match(fn.name) and any(STAKE_FN.match(o.name) for o in c.functions):
+        lock_vars = [v for v, meta in sv.items() if LOCK_VAR.search(v) and re.search(r"u?int|mapping", meta["type"])]
+        if lock_vars and not TIME_READ.search(full) and not any(LOCK_MODIFIER.search(m) for m in fn.modifiers) \
+                and not any(re.search(rf"(?<![\w.$]){re.escape(v)}\b", full) for v in lock_vars):
+            hit("SOL-STAKE-NO-LOCK", f"`{fn.name}` releases stake without checking `{lock_vars[0]}` against the clock",
+                fn.line, is_line=True)
+
+    # FG-105 balance changes without the reward checkpoint
+    if mutating and any(REWARD_ACC.match(v) for v in sv) and not re.match(r"^(notify|set|recover|rescue|sweep)", fn.name, re.I):
+        bal = [(off, v) for off, v in sf.writes(c, fn.body_start, fn.body_end) if BALANCE_VAR.match(v)]
+        if bal and not any(REWARD_SYNC.search(m) for m in fn.modifiers) \
+                and not re.search(r"(?<![\w.$])(" + REWARD_SYNC.pattern + r")\s*\(", full, re.I):
+            hit("SOL-REWARD-NOT-UPDATED", f"`{fn.name}` changes `{bal[0][1]}` without settling rewards first", bal[0][0])
+
+    # FG-107 pro-rata reward push loop
+    if mutating:
+        for off, block in _loops(body):
+            head = body[off:off + 200].split("{", 1)[0]
+            if ".length" in head and LOOP_PRORATA.search(block) and (REWARD_WORD.search(fn.name) or REWARD_WORD.search(block)):
+                hit("SOL-REWARD-LOOP-DISTRIBUTION", f"`{fn.name}` splits rewards across every entry in one loop", b0 + off)
+                break
+
+    # FG-108 emergency withdraw that pays rewards or never zeroes the position
+    if mutating and re.match(r"^emergency\w*(withdraw|exit|unstake)", fn.name, re.I) and PAYOUT.search(full):
+        m = PAYS_REWARD.search(full)
+        if m or not ZEROES.search(full):
+            why = "pays rewards" if m else "never zeroes the position"
+            hit("SOL-EMERGENCY-WITHDRAW-FLAW", f"`{fn.name}` {why}", fn.line, is_line=True)
+
+    # FG-125 emergency exit behind whenNotPaused
+    if fn.exposed and re.match(r"^emergency", fn.name, re.I) and "whenNotPaused" in fn.modifiers:
+        hit("SOL-EMERGENCY-PAUSED", f"`{fn.name}` has `whenNotPaused`, so it is off exactly when it is needed",
+            fn.line, is_line=True)
+
+    # FG-109 rescue that can take the staked token
+    if mutating and authorized and RESCUE_FN.match(fn.name):
+        stake_vars = [v for v, meta in sv.items() if STAKE_TOKEN_VAR.search(v) and not re.match(r"u?int|bool|mapping", meta["type"])]
+        for ptype, p in fn.params:
+            if ptype != "address" or not p or not stake_vars:
+                continue
+            pe = re.escape(p)
+            if re.search(rf"(?<![\w$]){pe}\s*\)?\s*\.\s*(safeTransfer|transfer)\s*\(", full) \
+                    and not re.search(rf"(?<![\w.$]){pe}\s*(==|!=)|(==|!=)\s*{pe}\b", full) \
+                    and not any(re.search(rf"(?<![\w.$]){re.escape(v)}\b", full) for v in stake_vars):
+                hit("SOL-RESCUE-DRAINS-STAKE", f"`{fn.name}` sends any `{p}` out, including `{stake_vars[0]}`",
+                    fn.line, is_line=True)
+                break
+
+    # FG-110 fee/rate setter with no bound and no timelock anywhere
+    if mutating and authorized and FEE_SETTER.match(fn.name) and not TIMELOCK_WORDS.search(sf.clean):
+        nums = [p for t, p in fn.params if t.startswith(("uint", "int")) and p]
+        if nums and sf.writes(c, fn.body_start, fn.body_end) and not any(
+                re.search(rf"(?<![\w.$]){re.escape(p)}\s*[<>]|[<>]=?\s*{re.escape(p)}\b", full) for p in nums):
+            hit("SOL-NO-TIMELOCK", f"`{fn.name}` sets `{nums[0]}` immediately with no maximum and no delay",
+                fn.line, is_line=True)
+
+    # FG-111 execute before eta
+    if mutating and EXECUTE_FN.match(fn.name):
+        ctext = sf.clean[c.start:c.end]
+        if ETA_WORDS.search(ctext) and QUEUE_WORDS.search(ctext) and not TIME_READ.search(full):
+            hit("SOL-TIMELOCK-BYPASS", f"`{fn.name}` never compares the queued ETA with `block.timestamp`",
+                fn.line, is_line=True)
+
+    # FG-113 ERC-721 _mint to a caller-chosen address
+    if mutating and _nft_contract(sf, c, "721") and not _nft_contract(sf, c, "20|1155"):
+        addrs = {p for t, p in fn.params if t == "address" and p}
+        for m in re.finditer(r"(?<![\w.$])_mint\s*\(\s*([A-Za-z_]\w*)\s*,", body):
+            if m.group(1) in addrs:
+                hit("SOL-NFT-UNSAFE-MINT", f"`_mint({m.group(1)}, ...)` skips the receiver check", b0 + m.start())
+                break
+
+    # FG-114 state written after a receiver hook
+    if mutating and not any(REENTRANCY_GUARDS.match(m) or "nonReentrant" in m for m in fn.modifiers):
+        hooks = [m.start() for m in SAFE_HOOK.finditer(body)]
+        if _nft_contract(sf, c, "1155"):
+            hooks += [m.start() for m in re.finditer(r"(?<![\w.$])_mint\s*\(", body)]
+        if hooks:
+            first = b0 + min(hooks)
+            late = [(off, v) for off, v in sf.writes(c, fn.body_start, fn.body_end) if off > first]
+            if late:
+                hit("SOL-NFT-HOOK-REENTRANCY", f"`{late[0][1]}` is written after the receiver hook in `{fn.name}`", late[0][0])
+
+    # FG-115 / FG-116 NFT leaves the contract
+    out = NFT_OUT.search(body)
+    if mutating and out and re.match(r"^(unstake|withdraw|claim|redeem|exit|unlock|leave)\w*$", fn.name, re.I) \
+            and any(t.startswith("uint") for t, _ in fn.params):
+        maps = [v for v, meta in sv.items() if meta["type"].replace(" ", "").startswith("mapping(uint")
+                and "=>address" in meta["type"].replace(" ", "") and STAKER_MAP.search(v)]
+        for v in maps:
+            if not _write_re(v).search(full):
+                hit("SOL-NFT-STAKE-RECORD-DRIFT", f"`{fn.name}` returns the token but leaves `{v}[id]` set", fn.line, is_line=True)
+                break
+        recipient = out.group(1)
+        addrs = {p for t, p in fn.params if t == "address" and p}
+        if (recipient == "msg.sender" or recipient in addrs) and not authorized \
+                and not re.search(r"msg\.sender\s*(==|!=)|(==|!=)\s*msg\.sender|_isApprovedOrOwner|_checkAuthorized|_isAuthorized|"
+                                  r"(?<![\w.$])_burn\s*\(|(?<![\w.$])_update\s*\([^;]*(msg\.sender|_msgSender)|"
+                                  r"\[\s*(msg\.sender|_msgSender\(\s*\))\s*\]\s*-=", full):
+            hit("SOL-NFT-UNSTAKE-ANY", f"`{fn.name}` sends any staked token to `{recipient}` without checking the staker",
+                b0 + out.start())
+
+    # FG-117 parallel arrays
+    if fn.exposed:
+        arrays = [p for t, p in fn.params if t.endswith("[]") and p]
+        if len(arrays) >= 2 and _loops(body):
+            used = [a for a in arrays if re.search(rf"(?<![\w.$]){re.escape(a)}\s*\[", body)]
+            whole = (rf"(?<![\w.$]){re.escape(used[0])}\b(?!\s*[\[.])[^;]*(?<![\w.$]){re.escape(used[1])}\b(?!\s*[\[.])"
+                     if len(used) >= 2 else "")
+            if len(used) >= 2 and not re.search(r"\.length\s*(==|!=)\s*[\w.]+\.length", full) \
+                    and not re.search(r"\w\s*\([^;]*" + whole, body):  # both arrays handed whole to a check or hash
+                hit("SOL-ARRAY-LENGTH-MISMATCH", f"`{fn.name}` indexes `{used[0]}` and `{used[1]}` without comparing lengths",
+                    fn.line, is_line=True)
+
+    # FG-119 hand-written transfer keeps the approval
+    if re.search(r"transfer", fn.name, re.I) and fn.state_changing:
+        owner_maps = [v for v, meta in sv.items() if re.match(r"^_?owners?$|^ownerOf$|^_ownerOf$", v) and "mapping" in meta["type"]]
+        appr_maps = [v for v, meta in sv.items() if re.search(r"approv", v, re.I) and "mapping" in meta["type"]
+                     and "=>bool" not in meta["type"].replace(" ", "")[-12:]]
+        for v in owner_maps:
+            m = re.search(rf"(?<![\w.$]){re.escape(v)}\s*\[[^\]]+\]\s*=(?!=)", body)
+            if m and appr_maps and not re.search(r"delete\s+\w*[Aa]pprov\w*|[Aa]pprov\w*\s*\[[^\]]*\]\s*=\s*address\s*\(\s*0\s*\)|"
+                                                 r"_approve\s*\(\s*address\s*\(\s*0", full):
+                hit("SOL-NFT-APPROVAL-STALE", f"`{fn.name}` moves `{v}[id]` but leaves `{appr_maps[0]}[id]`", b0 + m.start())
+                break
+
+    # FG-120 claim pays but never zeroes
+    if mutating and CLAIM_FN.match(fn.name) and PAYOUT.search(full):
+        for m in OWED_READ.finditer(full):
+            var = m.group(1)
+            if var in sv and not _write_re(var).search(full):
+                hit("SOL-REWARD-CLAIM-NO-RESET", f"`{fn.name}` pays `{var}[...]` and never sets it to zero", fn.line, is_line=True)
+                break
+
+    # FG-121 reward rate overwritten mid-period
+    m = RATE_SET.search(body)
+    if m and fn.state_changing:
+        periods = [v for v in sv if PERIOD_VAR.match(v)]
+        before = body[:m.start()]
+        if periods and not any(re.search(rf"(?<![\w.$]){re.escape(p)}\b", before) for p in periods) \
+                and not re.search(r"leftover|remaining", before, re.I):
+            hit("SOL-REWARD-PERIOD-OVERWRITE", f"`{fn.name}` sets `rewardRate` without adding what `{periods[0]}` still owes",
+                b0 + m.start())
+
+    # FG-122 deposit-for resets someone else's lock
+    if mutating and not authorized:
+        for t, u in fn.params:
+            if t != "address" or not u:
+                continue
+            m = re.search(LOCK_MAP_WRITE.format(u=re.escape(u)), body)
+            if m and not re.search(rf"\b{re.escape(u)}\s*(==|!=)\s*(msg\.sender|_msgSender\(\s*\))|(msg\.sender|_msgSender\(\s*\))\s*(==|!=)\s*{re.escape(u)}\b|"
+                                   r"isApproved|operator", full):
+                hit("SOL-LOCK-GRIEFING", f"`{fn.name}` lets any caller push `{m.group(1)}[{u}]` forward", b0 + m.start())
+                break
+
+    # FG-123 vesting without an end cap
+    if VEST_FN.search(fn.name):
+        m = ELAPSED.search(full)
+        if m and PER_DURATION.search(full) and "*" in full and not TS_COMPARE.search(full):
+            hit("SOL-VESTING-OVERRUN", f"`{fn.name}` scales by elapsed time with no cap at the end date",
+                b0 + body.find("block") if "block" in body else fn.line, is_line="block" not in body)
+
+    # FG-124 receiver hook credits any collection
+    if RECEIVER_FN.match(fn.name) and sf.writes(c, fn.body_start, fn.body_end) and not SENDER_CHECKED.search(full) \
+            and not any(not NON_AUTH_MODIFIERS.match(m) for m in fn.modifiers):
+        hit("SOL-RECEIVER-ANY-TOKEN", f"`{fn.name}` records a deposit without checking which contract called it",
+            fn.line, is_line=True)
+
+
+def solidity_pack16_contract(sf: _SolFile, c: SolContract, add) -> None:
+    if c.kind in ("interface", "library"):
+        return
+    hit = _sol16_hit(add, c.name)
+    ctext = sf.clean[c.start:c.end]
+
+    # FG-106 accumulator without a scale factor
+    accs = [v for v in c.state_vars if REWARD_ACC.match(v)]
+    for v in accs:
+        for m in re.finditer(rf"(?<![\w.$]){re.escape(v)}\s*(\+=|=(?!=))([^;]*);", ctext):
+            if "/" in m.group(2) and not SCALE.search(m.group(2)):
+                hit("SOL-REWARD-PRECISION", f"`{v}` grows by a quotient with no 1e18 scale", c.start + m.start())
+                return
+    for fn in c.functions:
+        if re.match(r"^rewardPerToken$", fn.name, re.I):
+            for m in re.finditer(r"\breturn\b([^;]*);", sf.body(fn)):
+                if "/" in m.group(1) and not SCALE.search(m.group(1)):
+                    hit("SOL-REWARD-PRECISION", f"`{fn.name}` divides by the total with no 1e18 scale",
+                        fn.body_start + m.start())
+                    return
+
+    # FG-112 short timelock delay
+    if re.search(r"\beta\b|queue|schedule|timelock", ctext, re.I):
+        for m in DELAY_CONST.finditer(ctext):
+            secs = int(m.group(2)) * UNIT_SECS[m.group(3)]
+            if secs < 86400:
+                hit("SOL-TIMELOCK-SHORT-DELAY", f"`{m.group(1)}` is {secs} s", c.start + m.start())
+                break
+
+    # FG-118 supply counter that only goes up
+    maps = [v for v, meta in c.state_vars.items() if SUPPLY_MAP.search(v) and meta["type"].replace(" ", "").startswith("mapping(uint")]
+    for v in maps:
+        wr = re.compile(rf"(?<![\w.$]){re.escape(v)}\s*\[[^\]]*\]\s*\+=")
+        if not any(wr.search(sf.body(f)) and re.search(r"(?<![\w.$])_mint\w*\s*\(", sf.body(f)) for f in c.functions):
+            continue
+        for f in c.functions:
+            fb = sf.body(f)
+            if f.kind == "function" and re.search(r"(?<![\w.$])_burn\w*\s*\(", fb) and not _write_re(v).search(_with_locals(sf, c, f)):
+                hit("SOL-SUPPLY-DRIFT", f"`{f.name}` burns without lowering `{v}`", f.line, is_line=True)
+                return
+
+
 _SIG_LAYER = {
     "SOL-READONLY-REENTRANCY": "L4", "SOL-TWAP-SHORT-WINDOW": "L4", "SOL-ORACLE-BAD-PRICE": "L1",
     "SOL-IMPL-NOT-DISABLED": "L2", "SOL-UUPS-NO-AUTH": "L2", "SOL-PROXY-STORAGE-COLLISION": "L4",
@@ -861,6 +1147,14 @@ _SIG_LAYER = {
     "SOL-GAS-STIPEND": "L5", "SOL-SHORT-CALLDATA": "L1", "SOL-DIRTY-ORDER": "L4", "SOL-SLIPPAGE-ZERO": "L1",
     "SOL-DEADLINE-NOW": "L1", "SOL-VOTE-DOUBLE-COUNT": "L4", "SOL-DELEGATE-INFLATION": "L4", "SOL-ETH-PUSH-LOOP": "L5",
     "SOL-MSG-VALUE-LOOP": "L4", "SOL-UNSAFE-DOWNCAST": "L4",
+    # 0.16
+    "SOL-STAKE-NO-LOCK": "L4", "SOL-REWARD-NOT-UPDATED": "L4", "SOL-REWARD-PRECISION": "L4",
+    "SOL-REWARD-LOOP-DISTRIBUTION": "L5", "SOL-EMERGENCY-WITHDRAW-FLAW": "L4", "SOL-RESCUE-DRAINS-STAKE": "L2",
+    "SOL-NO-TIMELOCK": "L2", "SOL-TIMELOCK-BYPASS": "L2", "SOL-TIMELOCK-SHORT-DELAY": "L9", "SOL-NFT-UNSAFE-MINT": "L5",
+    "SOL-NFT-HOOK-REENTRANCY": "L5", "SOL-NFT-STAKE-RECORD-DRIFT": "L4", "SOL-NFT-UNSTAKE-ANY": "L2",
+    "SOL-ARRAY-LENGTH-MISMATCH": "L1", "SOL-SUPPLY-DRIFT": "L4", "SOL-NFT-APPROVAL-STALE": "L2",
+    "SOL-REWARD-CLAIM-NO-RESET": "L4", "SOL-REWARD-PERIOD-OVERWRITE": "L4", "SOL-LOCK-GRIEFING": "L2",
+    "SOL-VESTING-OVERRUN": "L4", "SOL-RECEIVER-ANY-TOKEN": "L2", "SOL-EMERGENCY-PAUSED": "L9",
 }
 
 
@@ -1032,7 +1326,9 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                             contract=cname)
                         break
 
-            solidity_pack_fn(sf, c, fn, add, _authorized(sf, c, fn))
+            auth = _authorized(sf, c, fn)
+            solidity_pack_fn(sf, c, fn, add, auth)
+            solidity_pack16_fn(sf, c, fn, add, auth)
 
             # Presets
             if fn.exposed and SPOT_PRICE.search(body):
@@ -1098,6 +1394,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
                         "next to each unchecked operation.", contract=cname)
 
         solidity_pack_contract(sf, c, add, inherited)
+        solidity_pack16_contract(sf, c, add)
 
         # Preset 05: tstore slots never written back to zero
         stores: dict[str, list[tuple[int, str]]] = {}
@@ -1259,6 +1556,144 @@ LINE_RULES: tuple[LineRule, ...] = (
     LineRule("WEB-MUTABLE-DEFAULT", "MEDIUM", "L4", "Mutable default argument shared between calls",
              _r(r"def\s+\w+\s*\([^)]*=\s*(\[\]|\{\}|set\(\))"),
              "Default to `None` and create the list/dict inside the function.", frozenset({PY})),
+    # ---------------------------------------------------------------- 0.16: FG-126..FG-150 (line rules)
+    LineRule("WEB-IDOR-MUTATION", "HIGH", "L2", "Record changed or deleted by a URL id with no ownership check",
+             _r(r"(findByIdAndUpdate|findByIdAndDelete|findByIdAndRemove)\s*\(\s*req\.params\.\w+|"
+                r"(deleteOne|deleteMany|updateOne|updateMany|findOneAndUpdate|findOneAndDelete|findOneAndRemove)\s*\(\s*"
+                r"\{\s*_?id\s*:\s*req\.params\.\w+\s*\}|\.destroy\s*\(\s*\{\s*where\s*:\s*\{\s*id\s*:\s*req\.params\.\w+\s*\}\s*\}|"
+                r"filter_by\s*\(\s*id\s*=\s*\w*id\s*\)\s*\.\s*(delete|update)\s*\(|"
+                r"objects\.filter\s*\(\s*(pk|id)\s*=\s*\w*(id|pk)\s*\)\s*\.\s*(delete|update)\s*\(|"
+                r"session\.delete\s*\(\s*\w+\.query\.get(_or_404)?\s*\(\s*\w*id\s*\)\s*\)|"
+                r"(DELETE\s+FROM|UPDATE)\s+\w+[^'\"]*WHERE\s+id\s*=\s*['\"]?\s*\.\s*\$_(GET|POST|REQUEST)", re.I),
+             "Scope the write to the caller (`{ _id: id, owner: req.user.id }`) or check ownership first.",
+             frozenset({PY, JS, PHP}), unless=signatures.OWNERSHIP),
+    LineRule("WEB-WS-NO-ORIGIN", "HIGH", "L2", "WebSocket server without an Origin check",
+             _r(r"new\s+(WebSocket\.Server|WebSocketServer|WS\.Server)\s*\(|websockets\.serve\s*\(|\bSock\s*\(\s*app\s*\)|"
+                r"\bSocketIO\s*\(\s*app\b"),
+             "Check the handshake Origin against an allowlist (`verifyClient`, `allowRequest`, `origins=`).",
+             frozenset({PY, JS}), unless=_r(r"verifyClient|allowRequest|handleProtocols|cors_allowed_origins|"
+                                            r"allowed_origins|origins\s*=|checkOrigin|\borigin\b", re.I)),
+    LineRule("WEB-WS-NO-AUTH", "HIGH", "L2", "WebSocket connection accepted without authentication",
+             _r(r"\.on\s*\(\s*['\"]connection['\"]|@\s*sock\.route\s*\(|@\s*socketio\.on\s*\(\s*['\"]connect['\"]|"
+                r"websockets\.serve\s*\("),
+             "Authenticate in the handshake (session cookie or short-lived token) and close the socket otherwise.",
+             frozenset({PY, JS}), needs=_r(r"WebSocket|socket\.io|\bws\b|websockets|flask_sock|socketio", re.I),
+             unless=_r(r"auth|jwt|passport|session|token|verify|cookie|login_required|current_user|req\.user", re.I)),
+    LineRule("WEB-WS-UNBOUNDED-MESSAGE", "MEDIUM", "L9", "WebSocket server with no message size limit",
+             _r(r"new\s+(WebSocket\.Server|WebSocketServer|WS\.Server)\s*\(|max_size\s*=\s*None|"
+                r"maxHttpBufferSize\s*:\s*(\d{9,}|Infinity)"),
+             "Set `maxPayload` / `maxHttpBufferSize` / `max_size` to what the protocol needs.",
+             frozenset({PY, JS}), unless=_r(r"maxPayload")),
+    LineRule("WEB-HEADER-INJECTION", "HIGH", "L6", "Response header value taken from the request",
+             _r(r"\.(setHeader|set|header|append|writeHead)\s*\(\s*['\"`](?!Access-Control-Allow-Origin)[^'\"`]+['\"`]\s*,"
+                r"[^)\n]*req\.(query|body|params|headers|cookies)|"
+                r"headers\s*\[\s*['\"](?!Access-Control-Allow-Origin)[^'\"]+['\"]\s*\]\s*=\s*[^\n]*"
+                r"request\.(args|form|values|headers|json|cookies|get_json)|"
+                r"header\s*\(\s*['\"](?!Location)[^'\":]*:\s*['\"]?\s*\.\s*\$_(GET|POST|REQUEST|COOKIE|SERVER)"),
+             "Map request values to known header values, or strip CR/LF and validate before setting a header.",
+             frozenset({PY, JS, PHP})),
+    LineRule("WEB-LOG-INJECTION", "LOW", "L6", "Raw request value written to the log",
+             _r(r"(console\.(log|info|warn|error)|logger\.\w+|\blog\.(info|warn|warning|error|debug)|"
+                r"logging\.(info|warning|error|debug|critical)|error_log)\s*\([^)\n]*"
+                r"(req\.(body|query|params)|request\.(args|form|values|json|get_json|data)|\$_(GET|POST|REQUEST))"),
+             "Log structured fields or strip CR/LF from request values before logging them.",
+             frozenset({PY, JS, PHP}), unless=_r(r"replace\(\s*/\[?\\r\\n|sanitize\w*[Ll]og|escape\w*[Ll]og")),
+    LineRule("WEB-CACHE-PUBLIC-AUTH", "HIGH", "L9", "Authenticated response marked publicly cacheable",
+             _r(r"Cache-Control['\"]?\s*[,:=]\s*['\"][^'\"]*\bpublic\b|cache_control\s*\([^)\n]*public\s*=\s*True|"
+                r"cache_control\.public\s*=\s*True", re.I),
+             "Send `Cache-Control: private, no-store` on responses built for a logged-in user.",
+             frozenset({PY, JS, PHP}),
+             needs=_r(r"req\.user|request\.user|current_user|g\.user|req\.session|session\[|Authorization|"
+                      r"login_required|\$_SESSION|jwt", re.I)),
+    LineRule("WEB-CACHE-KEY-NO-USER", "HIGH", "L9", "Per-user response cached under a key without the user",
+             _r(r"\b\w*(cache|Cache|redis|memcached|lru|Lru)\w*\.(set|setex|put|setEx)\s*\(\s*req\.(originalUrl|url|path)\s*,|"
+                r"@\s*cache\.cached\s*\((?![^)\n]*(key_prefix|make_cache_key|unless|query_string))|@\s*cache_page\s*\("),
+             "Put the user id in the cache key or do not cache user-specific responses.",
+             frozenset({PY, JS}),
+             needs=_r(r"req\.user|request\.user|current_user|g\.user|req\.session|session\[", re.I)),
+    LineRule("WEB-CACHE-POISON-HOST", "MEDIUM", "L9", "Response built from X-Forwarded-Host",
+             _r(r"req\.(get|header)\s*\(\s*['\"]x-forwarded-host|req\.headers\s*\[\s*['\"]x-forwarded-host|"
+                r"request\.headers(\.get\s*\(|\s*\[)\s*['\"]x-forwarded-host|HTTP_X_FORWARDED_HOST", re.I),
+             "Build absolute URLs from a configured base URL.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-SAMESITE-NONE", "MEDIUM", "L7", "Session cookie with SameSite=None",
+             _r(r"same_?site['\"]?\s*[:=]\s*['\"]none['\"]|SameSite=None", re.I),
+             "Use `SameSite=Lax` (or Strict) for session cookies.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-SESSION-FIXATION", "HIGH", "L2", "User stored in the session without regenerating its id",
+             _r(r"req\.session\.(user\w*|uid|account\w*|auth\w*|loggedIn|isAuthenticated)\s*=(?!=)|"
+                r"\$_SESSION\s*\[\s*['\"](user\w*|uid|auth\w*|account\w*|logged\w*)['\"]\s*\]\s*=(?!=)"),
+             "Regenerate the session id at login (`req.session.regenerate`, `session_regenerate_id(true)`).",
+             frozenset({JS, PHP}), unless=_r(r"regenerate|session_regenerate_id|req\.logIn\s*\(|req\.login\s*\(")),
+    LineRule("WEB-JWT-WEAK-SECRET", "HIGH", "L7", "JWT key is a short string literal",
+             _r(r"\bjwt\.(sign|encode|verify|decode)\s*\([^,\n]+,\s*['\"][^'\"\n]{0,31}['\"]"),
+             "Load a 256-bit random key from the secret store.", frozenset({PY, JS})),
+    LineRule("WEB-PASSWORD-PLAINTEXT", "CRITICAL", "L7", "Password from the request stored without hashing",
+             _r(r"\bpassword\w*['\"]?\s*[:=]\s*(req\.body(\.password\w*|\[['\"]password\w*['\"]\])|"
+                r"request\.(form|json|values|args)(\[['\"]password\w*['\"]\]|\.get\(\s*['\"]password\w*['\"]\))|"
+                r"request\.get_json\(\)\[['\"]password\w*['\"]\]|\$_POST\[['\"]password\w*['\"]\])", re.I),
+             "Hash with argon2id or bcrypt before storing.", frozenset({PY, JS, PHP}),
+             needs=_r(r"\.create\s*\(|\.insert\w*\s*\(|\.save\s*\(|INSERT\s+INTO|\.add\s*\(|new\s+[A-Z]\w*\s*\(|\bUser\s*\(", re.I),
+             unless=_r(r"bcrypt|argon2|scrypt|pbkdf2|hash|passlib|werkzeug\.security|crypt\s*\(", re.I)),
+    LineRule("WEB-HOST-HEADER-LINK", "HIGH", "L6", "Emailed link built from the Host header",
+             _r(r"req\.(headers\.host|get\s*\(\s*['\"]host['\"]|hostname|header\s*\(\s*['\"]host['\"]|"
+                r"headers\s*\[\s*['\"]host['\"]\s*\])|request\.(host\b|host_url|url_root|get_host\s*\(|"
+                r"headers\.get\s*\(\s*['\"]host['\"])|\$_SERVER\s*\[\s*['\"]HTTP_HOST['\"]", re.I),
+             "Build emailed links from a configured base URL.", frozenset({PY, JS, PHP}),
+             needs=_r(r"reset|forgot|verify|confirm|invite|magic|activat", re.I)),
+    LineRule("WEB-REGEX-INJECTION", "MEDIUM", "L6", "Regular expression built from request data",
+             _r(r"new\s+RegExp\s*\(\s*[^)\n]*req\.(query|body|params)|"
+                r"\bre\.(compile|search|match|fullmatch|findall|finditer|sub|split)\s*\(\s*[^,\n]*request\.(args|form|values|json|get_json)|"
+                r"preg_\w+\s*\(\s*[^,\n]*\$_(GET|POST|REQUEST)|\$regex\s*:\s*req\.(query|body|params)"),
+             "Escape the input (`re.escape`, `escapeRegExp`, `preg_quote`) or match literally.",
+             frozenset({PY, JS, PHP}),
+             unless=_r(r"escapeRegExp|escape-string-regexp|escapeStringRegexp|re\.escape|preg_quote|escaperegexp")),
+    LineRule("WEB-PROTOTYPE-POLLUTION", "HIGH", "L6", "Request data deep-merged into an object",
+             _r(r"(?:\b_\.|\blodash\.|\$\.|\bjQuery\.|(?<![\w.$]))(merge|mergeWith|defaultsDeep|setWith|deepmerge|deepMerge|"
+                r"mergeDeep|extend)\s*\([^)\n]*req\.(body|query)|\b_\.set\s*\([^)\n]*req\.(body|query)"),
+             "Validate against a schema first and merge into `Object.create(null)`; reject `__proto__` keys.",
+             frozenset({JS})),
+    LineRule("WEB-UPLOAD-FILENAME", "HIGH", "L1", "Upload saved under the client's filename",
+             _r(r"\.save\s*\([^)\n]*\.filename\b|"
+                r"(path\.(join|resolve)|writeFile\w*|createWriteStream|rename\w*|\.mv)\s*\([^)\n]*\.(originalname|originalFilename)\b|"
+                r"\bcb\s*\(\s*null\s*,\s*file\.originalname|"
+                r"move_uploaded_file\s*\([^,]+,\s*[^)\n]*\$_FILES\s*\[[^\]]+\]\s*\[\s*['\"]name['\"]\s*\]"),
+             "Generate the stored name yourself (uuid + allowed extension) or use `secure_filename`.",
+             frozenset({PY, JS, PHP}),
+             unless=_r(r"secure_filename|sanitize-filename|sanitizeFilename|randomUUID|uuid")),
+    LineRule("WEB-GRAPHQL-INTROSPECTION", "LOW", "L9", "GraphQL introspection or GraphiQL on",
+             _r(r"introspection\s*:\s*true|graphiql\s*[:=]\s*(true|True)"),
+             "Disable introspection and the IDE outside development.", frozenset({PY, JS})),
+    LineRule("WEB-GRAPHQL-NO-LIMIT", "MEDIUM", "L9", "GraphQL server with no depth or cost limit",
+             _r(r"new\s+ApolloServer\s*\(|graphqlHTTP\s*\(|createYoga\s*\(|GraphQLView\.as_view\s*\(|GraphQLRouter\s*\("),
+             "Add depth and complexity limits as validation rules.", frozenset({PY, JS}),
+             unless=_r(r"depthLimit|depth_limit|depth-limit|QueryDepthLimiter|costAnalysis|queryComplexity|"
+                       r"ComplexityLimit|maxDepth|max_depth|validationRules|validation_rules|MaxAliasesLimiter")),
+    LineRule("WEB-API-STATE-NO-AUTH", "HIGH", "L2", "State-changing route with no authentication in the file",
+             _r(r"\b(app|router|api|server|route|bp|blueprint)\s*\.\s*(post|put|patch|delete)\s*\(\s*['\"`]"
+                r"(?![^'\"`]*(log-?in|sign-?(in|up)|register|auth|token|reset|forgot|webhook|health|otp))|"
+                r"@\s*[\w.]+\.(post|put|patch|delete)\s*\(\s*['\"](?![^'\"]*(log-?in|sign-?(in|up)|register|auth|token|reset|"
+                r"forgot|webhook|health|otp))|"
+                r"@\s*[\w.]+\.route\s*\(\s*['\"](?![^'\"]*(log-?in|sign-?(in|up)|register|auth|token|reset|forgot|webhook|"
+                r"health|otp))[^'\"]*['\"][^)\n]*methods\s*=\s*\[[^\]]*['\"](POST|PUT|PATCH|DELETE)['\"]", re.I),
+             "Put POST/PUT/PATCH/DELETE routes behind the auth middleware or decorator.", frozenset({PY, JS}),
+             unless=_r(r"auth|login_required|jwt|passport|session|token|requireUser|isAuthenticated|verify|current_user|"
+                       r"req\.user|request\.user|permission|guard|protect|api_?key|signature|hmac", re.I)),
+    LineRule("WEB-ERROR-LEAK", "MEDIUM", "L9", "Exception detail returned to the client",
+             _r(r"res\.(status\s*\(\s*\d+\s*\)\s*\.)?(send|json|end|write)\s*\(\s*(\{[^}\n]*)?\b(err|error|e|ex|exception)\.(stack|message)\b|"
+                r"res\.(status\s*\(\s*\d+\s*\)\s*\.)?(send|json)\s*\(\s*(err|error)\s*\)|"
+                r"return\s+[^\n]*traceback\.format_exc\s*\(|"
+                r"return\s+(jsonify\s*\([^)\n]*)?(str|repr)\s*\(\s*(e|err|exc|ex|error)\s*\)|"
+                r"jsonify\s*\([^)\n]*(str|repr)\s*\(\s*(e|err|exc|ex|error)\s*\)|echo\s+\$e->getMessage"),
+             "Log the error server-side and return a generic message with a request id.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-CORS-REFLECT", "HIGH", "L9", "CORS reflects the caller's Origin",
+             _r(r"\borigin\s*:\s*true\b|origin\s*:\s*\(\s*\w+\s*,\s*(cb|callback|done)\s*\)\s*=>\s*(cb|callback|done)\s*\(\s*null\s*,\s*true\s*\)|"
+                r"Access-Control-Allow-Origin['\"]\s*,\s*req\.(headers\.origin|headers\s*\[\s*['\"]origin['\"]\s*\]|"
+                r"get\s*\(\s*['\"]origin['\"]\s*\)|header\s*\(\s*['\"]origin['\"]\s*\))|"
+                r"\[\s*['\"]Access-Control-Allow-Origin['\"]\s*\]\s*=\s*request\.(headers|environ)|"
+                r"Access-Control-Allow-Origin:\s*['\"]\s*\.\s*\$_SERVER\s*\[\s*['\"]HTTP_ORIGIN", re.I),
+             "Compare the Origin to an allowlist before echoing it.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-WS-PLAINTEXT", "MEDIUM", "L8", "WebSocket over plain ws://",
+             _r(r"['\"`]ws://(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])"),
+             "Use wss:// for every non-local socket.", WEB),
 )
 
 
@@ -1268,7 +1703,8 @@ def _lang(path: str) -> str | None:
 
 
 FILE_RULE_LAYER = {"WEB-BODY-LIMIT": "L9", "WEB-RATE-LIMIT": "L2", "WEB-SSRF": "L6", "WEB-IDOR": "L2",
-                   "WEB-COOKIE-INSECURE": "L7", "WEB-XXE": "L6", "WEB-NO-HEADERS-MW": "L9", "WEB-VULN-DEPENDENCY": "L9"}
+                   "WEB-COOKIE-INSECURE": "L7", "WEB-XXE": "L6", "WEB-NO-HEADERS-MW": "L9", "WEB-VULN-DEPENDENCY": "L9",
+                   "WEB-SESSION-COOKIE-CONFIG": "L7", "WEB-JWT-NO-EXPIRY": "L7"}
 
 
 def check_manifest(rel: str, raw: str) -> list[Finding]:
@@ -1284,15 +1720,77 @@ def is_manifest(name: str) -> bool:
     return low in ("package.json", "package-lock.json") or (low.startswith("requirements") and low.endswith(".txt"))
 
 
+# Literal hints for the line rules: a rule runs line by line only when one of its hints occurs in the lowercased
+# file. Each tuple is a superset of what the rule's pattern can match (every alternative of the pattern contains
+# one of the hints), so skipping on a miss never changes the result; it only spares the regex engine a pass over
+# every line of files that cannot match. Rules without an entry always run.
+LINE_HINTS: dict[str, tuple[str, ...]] = {
+    "WEB-EVAL": ("eval", "exec", "function", "settimeout"),
+    "WEB-COMMAND": ("system", "popen", "shell", "child_process", "execsync", "passthru", "proc_open"),
+    "WEB-SQL": ("execute", "query", "raw", "prepare"),
+    "WEB-XSS": ("innerhtml", "outerhtml", "document.write", "dangerouslysetinnerhtml", "v-html", "safe", "markup",
+                "insertadjacenthtml", "echo"),
+    "WEB-INPUT-VALIDATION": ("request.", "req.", "$_", "urlsearchparams", "location."),
+    "WEB-SECRET": ("key", "secret", "passwd", "password", "token", "akia", "sk-", "0x"),
+    "WEB-TLS-OFF": ("verify", "rejectunauthorized", "node_tls_reject_unauthorized", "insecureskipverify"),
+    "WEB-PLAIN-HTTP": ("http://",),
+    "WEB-DESERIALIZE": ("pickle", "marshal", "yaml", "unserialize"),
+    "WEB-DEBUG": ("debug", "display_errors"),
+    "WEB-CORS-ANY": ("origin", "cors"),
+    "WEB-TOKEN-STORAGE": ("localstorage",),
+    "WEB-WEAK-RANDOM": ("random", "rand"),
+    "WEB-WEAK-HASH": ("md5", "sha1"),
+    "WEB-JWT-NONE": ("algorithms", "verify_signature", "jwt.decode", "ignoreexpiration"),
+    "WEB-OPEN-REDIRECT": ("redirect", "location:"),
+    "WEB-PATH-TRAVERSAL": ("request.", "req.", "$_"),
+    "WEB-GLOBAL-STATE": ("global",),
+    "WEB-NOSQL": ("$where", "req.", "request."),
+    "WEB-SSTI": ("template", "from_string", "render", "compile"),
+    "WEB-SSRF": ("request.", "req.", "$_"),
+    "WEB-XXE": ("resolve_entities", "noent", "libxml"),
+    "WEB-MASS-ASSIGNMENT": ("req.body", "request.", "$request->all"),
+    "WEB-TIMING-COMPARE": ("token", "secret", "signature", "hmac", "digest", "api", "otp", "csrf"),
+    "WEB-TOKEN-ENTROPY": ("token_", "randombytes", "random_bytes", "uuid", "uniqid", "date.now", "time.time"),
+    "WEB-COOKIE-INSECURE": ("httponly", "secure"),
+    "WEB-MUTABLE-DEFAULT": ("def",),
+    "WEB-IDOR-MUTATION": ("delete", "update", "destroy", "remove"),
+    "WEB-WS-NO-ORIGIN": ("websocket", "ws.server", "sock"),
+    "WEB-WS-NO-AUTH": ("connection", "sock", "websockets"),
+    "WEB-WS-UNBOUNDED-MESSAGE": ("websocket", "ws.server", "max_size", "maxhttpbuffersize"),
+    "WEB-HEADER-INJECTION": ("set", "header", "append", "writehead"),
+    "WEB-LOG-INJECTION": ("log",),
+    "WEB-CACHE-PUBLIC-AUTH": ("cache-control", "cache_control"),
+    "WEB-CACHE-KEY-NO-USER": ("cache", "redis", "memcached", "lru"),
+    "WEB-CACHE-POISON-HOST": ("x-forwarded-host", "http_x_forwarded_host"),
+    "WEB-SAMESITE-NONE": ("samesite", "same_site"),
+    "WEB-SESSION-FIXATION": ("req.session.", "$_session"),
+    "WEB-JWT-WEAK-SECRET": ("jwt.",),
+    "WEB-PASSWORD-PLAINTEXT": ("password",),
+    "WEB-HOST-HEADER-LINK": ("req.", "request.", "http_host"),
+    "WEB-REGEX-INJECTION": ("regexp", "re.", "preg_", "$regex"),
+    "WEB-PROTOTYPE-POLLUTION": ("merge", "defaultsdeep", "setwith", "extend", "_.set"),
+    "WEB-UPLOAD-FILENAME": (".save", "originalname", "originalfilename", "move_uploaded_file"),
+    "WEB-GRAPHQL-INTROSPECTION": ("introspection", "graphiql"),
+    "WEB-GRAPHQL-NO-LIMIT": ("apolloserver", "graphqlhttp", "createyoga", "graphqlview", "graphqlrouter"),
+    "WEB-API-STATE-NO-AUTH": ("post", "put", "patch", "delete"),
+    "WEB-ERROR-LEAK": ("res.", "traceback", "str", "repr", "getmessage"),
+    "WEB-CORS-REFLECT": ("origin",),
+    "WEB-WS-PLAINTEXT": ("ws://",),
+}
+_PY_COMMENT = re.compile(r"(^|\s)#.*$")
+LINE_MAX = 4000  # longer lines (minified bundles) are not matched line by line
+
+
 def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
     lines = raw.splitlines()
     # Strip comments for C-like and Python sources so commented-out code does not count.
     if lang == PY:
-        clean_lines = [re.sub(r"(^|\s)#.*$", r"\1", ln) for ln in lines]
+        clean_lines = [_PY_COMMENT.sub(r"\1", ln) for ln in lines]
     elif lang in (JS, PHP):
-        clean_lines = strip_comments(raw, blank_strings=False).splitlines()
+        clean_lines = strip_comments(raw, blank_strings=False, templates=True).splitlines()
     else:
         clean_lines = lines
+    low = raw.lower()
     out: list[Finding] = []
     for rule in LINE_RULES:
         if lang not in rule.langs:
@@ -1301,10 +1799,14 @@ def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
             continue
         if rule.unless and rule.unless.search(raw):
             continue
+        hints = LINE_HINTS.get(rule.rule)
+        if hints and not any(h in low for h in hints):
+            continue
+        search = rule.pattern.search
         for i, ln in enumerate(clean_lines, 1):
-            if len(ln) > 4000:
+            if len(ln) > LINE_MAX:
                 continue
-            if rule.pattern.search(ln):
+            if search(ln):
                 out.append(Finding(rule.rule, rule.severity, rule.layer, rule.title, rel, i, snippet(lines, i),
                                    rule.mitigation))
     for rule, ln, title in signatures.check_backend(raw, lang) + signatures.missing_security_headers(raw, lang):
@@ -1471,34 +1973,93 @@ def load_scan_config(target: Path, path: str | Path | None = None) -> ScanConfig
     return ScanConfig.from_dict(compiler._toml(cfg_path), str(cfg_path))
 
 
+_TEST_FILE = re.compile(r"(^test_|_test\.py$|\.test\.|\.spec\.)")
+_SKIP_SUFFIXES = (".t.sol", ".s.sol", ".min.js", ".d.ts")
+
+
 def discover(root: Path, config: ScanConfig | None = None) -> list[Path]:
+    """Files to score under ``root``, in a stable order (a folder's own files, then its subfolders, sorted).
+
+    Walks with ``os.scandir`` inside a context manager: one directory read per folder, entry types from the
+    directory listing instead of a stat per file, and the handle closed before descending. Symlinked folders
+    are listed but not entered, as with ``os.walk``.
+    """
     if root.is_file():
         return [root]
     config = config or ScanConfig()
     files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        here = Path(dirpath)
-        depth = len(here.relative_to(root).parts)
-        if config.max_depth is not None and depth >= config.max_depth:
-            dirnames[:] = []
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
-                             and not config.ignored((here / d).relative_to(root).as_posix()))
-        for f in sorted(filenames):
-            p = here / f
+    root_s = str(root)
+
+    def rel_of(path: str) -> str:
+        return Path(os.path.relpath(path, root_s)).as_posix()
+
+    def walk(here: str, depth: int) -> bool:
+        dirs: list[tuple[str, str, bool]] = []
+        names: list[str] = []
+        try:
+            with os.scandir(here) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        dirs.append((entry.name, entry.path, entry.is_symlink()))
+                    else:
+                        names.append(entry.name)
+        except OSError:
+            return True
+        for f in sorted(names):
+            path = os.path.join(here, f)
             if is_manifest(f):
-                if not config.ignored(p.relative_to(root).as_posix()):
-                    files.append(p)
+                if not config.ignored(rel_of(path)):
+                    files.append(Path(path))
                 continue
-            if p.suffix.lower() not in SCANNED_EXT or f.endswith((".t.sol", ".s.sol", ".min.js", ".d.ts")):
+            if Path(f).suffix.lower() not in SCANNED_EXT or f.endswith(_SKIP_SUFFIXES):
                 continue
-            if re.search(r"(^test_|_test\.py$|\.test\.|\.spec\.)", f):
+            if _TEST_FILE.search(f) or config.ignored(rel_of(path)):
                 continue
-            if config.ignored(p.relative_to(root).as_posix()):
-                continue
-            files.append(p)
+            files.append(Path(path))
             if len(files) >= config.max_files:
-                return files
+                return False
+        if config.max_depth is not None and depth >= config.max_depth:
+            return True
+        for name, path, link in sorted(dirs):
+            if name in SKIP_DIRS or name.startswith(".") or config.ignored(rel_of(path)):
+                continue
+            if not link and not walk(path, depth + 1):
+                return False
+        return True
+
+    walk(root_s, 0)
     return files
+
+
+def read_source(p: Path, limit: int = MAX_FILE_BYTES) -> str | None:
+    """One open and one bounded read per file (no separate stat). None when the file is larger than ``limit``.
+    Newlines are normalised the way text mode would, so offsets and line numbers match ``read_text``."""
+    with open(p, "rb") as fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def iter_sources(files: Iterable[Path], notes: list[str], limit: int = MAX_FILE_BYTES) -> Iterator[tuple[Path, str]]:
+    """Stream (path, text) one file at a time so only the file being scored is held in memory."""
+    for p in files:
+        try:
+            raw = read_source(p, limit)
+        except OSError as exc:
+            notes.append(f"skipped {p.name}: {exc}")
+            continue
+        if raw is None:
+            notes.append(f"skipped {p.name}: larger than {limit // 1000} KB")
+            continue
+        yield p, raw
 
 
 def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanConfig | None = None
@@ -1522,15 +2083,7 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
     kinds = set()
     notes = []
     bridge_sources: list[tuple[str, str]] = []
-    for p in files:
-        try:
-            if p.stat().st_size > MAX_FILE_BYTES:
-                notes.append(f"skipped {p.name}: larger than {MAX_FILE_BYTES // 1000} KB")
-                continue
-            raw = p.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            notes.append(f"skipped {p.name}: {exc}")
-            continue
+    for p, raw in iter_sources(files, notes):
         rel = p.relative_to(base).as_posix() if p != base else p.name
         lines += raw.count("\n") + 1
         limiter_seen = limiter_seen or (p.suffix.lower() not in SOL_EXT and signatures.limiter_present(raw))
@@ -1780,6 +2333,7 @@ def simulate(target: str, presets: Iterable[int] = ALL_PRESETS, run_forge: bool 
     page = out / reporter.HTML_FILE
     page.write_text(render_html(result, run), encoding="utf-8")
     (out / SCORE_JSON).write_text(json.dumps(result.as_dict(), indent=2) + "\n", encoding="utf-8")
+    (out / FINDINGS_LOG).write_text("\n".join(finding_digest(result)) + "\n", encoding="utf-8")
     progress(f"Score {result.score}/100 ({result.verdict}); report: {page}")
     return result, page
 
@@ -1844,6 +2398,18 @@ SIG_HEAD = ('<div class="scroll"><table><tr><th>ID</th><th>Stack</th><th>Rule</t
             '<th class="n">Hits</th><th>Signature</th></tr>')
 
 
+def _id_ranges(sigs) -> str:
+    """"FG-01 to FG-50 and FG-104 to FG-125" for the ids in ``sigs``."""
+    nums = sorted(int(s.id[3:]) for s in sigs)
+    runs: list[list[int]] = []
+    for n in nums:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return " and ".join(f"FG-{a:02d} to FG-{b:02d}" for a, b in runs)
+
+
 def signature_section(findings: list[Finding]) -> list[str]:
     """Layer 13: matched signatures with their fixes first, then the whole database split by surface."""
     hits = signatures.hits(findings)
@@ -1872,12 +2438,39 @@ def signature_section(findings: list[Finding]) -> list[str]:
                        f'<td class="n">{hits[sig.id]}</td><td class="loc">{where}</td>'
                        f'<td><pre class="fix">{_h(sig.fix)}</pre></td></tr>')
         out.append("</table></div>")
-    for title, sigs in ((f"Contract surface, FG-01 to FG-{signatures.WEB3_LAST:02d}", web3),
-                        (f"Web surface, FG-{signatures.WEB3_LAST + 1:02d} to FG-{len(signatures.SIGNATURES):02d}", web2)):
+    for title, sigs in ((f"Contract surface, {_id_ranges(web3)}", web3), (f"Web surface, {_id_ranges(web2)}", web2)):
         n_hit = sum(1 for s in sigs if hits[s.id])
         out.append(f'<details class="sigdb"><summary>{_h(title)} ({n_hit} of {len(sigs)} matched)</summary>{SIG_HEAD}')
         out += _sig_rows(sigs, hits, sev_now)
         out.append("</table></div></details>")
+    return out
+
+
+def finding_digest(result: ScoreResult, limit: int | None = None) -> list[str]:
+    """Plain-text report log: one block per deduction with severity, signature, file:line, points, the finding,
+    the source line and the fix example. The desktop window prints it when a run ends; ``simulate`` writes it
+    to foundryguard-findings.log next to the HTML report."""
+    counts = result.counts()
+    out = [f"FoundryGuard {result.score}/100 {result.verdict}: {result.target}",
+           f"{len(result.findings)} deduction(s): " + ", ".join(f"{counts[s]} {s.lower()}" for s in SEVERITIES)
+           + f"; {sum(1 for v in signatures.hits(result.findings).values() if v)} of {len(signatures.SIGNATURES)} "
+             "signatures matched"]
+    order = {s: i for i, s in enumerate(SEVERITIES)}
+    ranked = sorted(result.findings, key=lambda f: (order.get(f.severity, 9), f.signature or "FG-999", f.file, f.line))
+    shown = ranked if limit is None else ranked[:limit]
+    for f in shown:
+        tag = f.signature or "-"
+        out.append("")
+        out.append(f"[{f.severity}] {tag} {f.rule} {f.location} (-{f.points})")
+        out.append(f"  {f.title.replace('`', '')}")
+        if f.evidence:
+            out.append(f"  > {f.evidence.strip()}")
+        if f.fix:
+            out.append("  fix:")
+            out += [f"    {ln}" for ln in f.fix.splitlines()]
+    if limit is not None and len(ranked) > limit:
+        out.append("")
+        out.append(f"... and {len(ranked) - limit} more in the report")
     return out
 
 

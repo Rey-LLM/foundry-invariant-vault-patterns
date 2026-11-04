@@ -1,12 +1,17 @@
 """Layer 13: the FoundryGuard signature database.
 
-103 named signatures, each a separate failure mode with a CWE or SWC reference, a fixed severity, a one-line
+150 named signatures, each a separate failure mode with a CWE or SWC reference, a fixed severity, a one-line
 mitigation and a short fix example that the HTML report prints next to the hit.
 
-* FG-01..FG-50: the contract side (Solidity): reentrancy, price and balance manipulation, oracles, transient
-  storage, access control, proxies and diamonds, signatures, ordering, governance, arithmetic.
-* FG-51..FG-103: the web side: backend code, the HTTP surface of a page, dependency manifests, and the
-  backend-to-contract bridge (Layer 12).
+* FG-01..FG-50 and FG-104..FG-125: the contract side (Solidity): reentrancy, price and balance manipulation,
+  oracles, transient storage, access control, proxies and diamonds, signatures, ordering, governance,
+  arithmetic, and (since 0.16) staking and reward accounting, timelocks, emergency exits and ERC-721 /
+  ERC-1155 state.
+* FG-51..FG-103 and FG-126..FG-150: the web side: backend code, the HTTP surface of a page, dependency
+  manifests, the backend-to-contract bridge (Layer 12), and (since 0.16) API state endpoints, WebSockets,
+  header injection, caching and session/token handling.
+
+Ids never move: new signatures are appended, so FG-01..FG-103 mean what they meant in 0.15.
 
 The detectors live where the text is parsed: Solidity rules in ``scoring.check_solidity``, line rules in
 ``scoring.LINE_RULES``, response-header rules in ``scoring.check_headers``, the bridge rules in
@@ -29,7 +34,9 @@ from dataclasses import asdict, dataclass
 LAYER_ID = "L13"
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 OFF = "off"
-WEB3_LAST = 50  # FG-01..FG-50 contract side, FG-51..FG-103 web side
+WEB3_LAST = 50  # end of the first contract block, kept for older callers
+# contract-side id blocks; everything else is web side
+WEB3_RANGES: tuple[tuple[int, int], ...] = ((1, 50), (104, 125))
 
 
 @dataclass(frozen=True)
@@ -47,7 +54,8 @@ class Signature:
 
     @property
     def surface(self) -> str:
-        return "web3" if int(self.id[3:]) <= WEB3_LAST else "web2"
+        n = int(self.id[3:])
+        return "web3" if any(lo <= n <= hi for lo, hi in WEB3_RANGES) else "web2"
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -513,6 +521,219 @@ SIGNATURES: tuple[Signature, ...] = (
          "Backend signs an expiry the contract never checks",
          "Require `block.timestamp <= deadline` in the verifying function.",
          "if (block.timestamp > deadline) revert Expired();"),
+    # ------------------------------------------------------------------ contract side, 0.16: FG-104..FG-125
+    # staking and rewards, timelocks, emergency exits, ERC-721 / ERC-1155 state
+    _sig(104, "SOL-STAKE-NO-LOCK", SOL, "HIGH", "CWE-841",
+         "Stake withdrawable before its lock period ends",
+         "Store when each position unlocks and revert in unstake/withdraw while `block.timestamp` is below it.",
+         "if (block.timestamp < stakedAt[msg.sender] + LOCK_PERIOD) revert Locked();"),
+    _sig(105, "SOL-REWARD-NOT-UPDATED", SOL, "HIGH", "CWE-682",
+         "Staked balance changes without settling rewards first",
+         "Run the reward checkpoint (`updateReward(account)` modifier) before every change to a balance or "
+         "the total; otherwise new stake earns rewards for time it was not staked.",
+         "function stake(uint256 amount) external updateReward(msg.sender) {\n    totalStaked += amount;\n    balances[msg.sender] += amount;\n}"),
+    _sig(106, "SOL-REWARD-PRECISION", SOL, "MEDIUM", "CWE-1339",
+         "Reward-per-token accumulator divides without a scale factor",
+         "Scale the accumulator (1e18 or a PRECISION constant) before dividing by the total stake; small "
+         "rewards over a large stake round to zero and are lost.",
+         "rewardPerTokenStored += rewardRate * dt * 1e18 / totalStaked;\n// earned: balance * (rpt - paid) / 1e18"),
+    _sig(107, "SOL-REWARD-LOOP-DISTRIBUTION", SOL, "HIGH", "CWE-834",
+         "Rewards pushed pro-rata to every staker in one loop",
+         "Use a reward-per-token accumulator and let each staker pull; the loop runs out of gas as stakers "
+         "grow and its per-entry rounding leaks dust.",
+         "rewardPerTokenStored += amount * 1e18 / totalStaked; // O(1), stakers claim later"),
+    _sig(108, "SOL-EMERGENCY-WITHDRAW-FLAW", SOL, "HIGH", "CWE-841",
+         "Emergency withdraw pays rewards or leaves the stake on the books",
+         "An emergency exit returns principal only, zeroes the position and the reward debt first, and touches "
+         "no reward math.",
+         "uint256 amt = balances[msg.sender];\nbalances[msg.sender] = 0;\nrewards[msg.sender] = 0;\ntotalStaked -= amt;\nstakingToken.safeTransfer(msg.sender, amt);"),
+    _sig(109, "SOL-RESCUE-DRAINS-STAKE", SOL, "HIGH", "CWE-284",
+         "Admin token rescue can pull the users' staked token",
+         "Refuse the staking/deposit token (and the reward token while rewards are owed) in rescue and sweep "
+         "functions.",
+         "if (token == address(stakingToken)) revert CannotRescueStake();\nIERC20(token).safeTransfer(to, amount);"),
+    _sig(110, "SOL-NO-TIMELOCK", SOL, "MEDIUM", "CWE-284",
+         "Fee changed instantly by the admin with no cap and no timelock",
+         "Bound the new value with a hard-coded maximum and route the change through a timelock "
+         "(TimelockController, or queue + delay) so users can exit first.",
+         "if (newFee > MAX_FEE) revert FeeTooHigh();\npendingFee = newFee; pendingFeeEta = block.timestamp + 2 days;"),
+    _sig(111, "SOL-TIMELOCK-BYPASS", SOL, "CRITICAL", "CWE-863",
+         "Queued action executable before its ETA",
+         "Check `block.timestamp >= eta` (and a grace period) in execute, then delete the queued entry.",
+         "if (block.timestamp < op.eta) revert NotReady();\ndelete queued[id];"),
+    _sig(112, "SOL-TIMELOCK-SHORT-DELAY", SOL, "MEDIUM", "CWE-1188",
+         "Timelock delay shorter than one day",
+         "Use a delay users can react to (24-48 hours or more) and enforce a floor in the setter.",
+         "uint256 public constant MIN_DELAY = 2 days;"),
+    _sig(113, "SOL-NFT-UNSAFE-MINT", SOL, "LOW", "CWE-20",
+         "ERC-721 minted with _mint to a caller-chosen address",
+         "Use `_safeMint` (receiver check) when the recipient can be a contract, and guard it with nonReentrant.",
+         "_safeMint(to, tokenId);"),
+    _sig(114, "SOL-NFT-HOOK-REENTRANCY", SOL, "HIGH", "CWE-841 / SWC-107",
+         "State written after _safeMint / safeTransferFrom (receiver hook reentrancy)",
+         "The receiver's onERC721Received / onERC1155Received runs inside the call; update counters and "
+         "limits first or add `nonReentrant`.",
+         "minted[msg.sender] += 1;   // effect first\n_safeMint(msg.sender, id);"),
+    _sig(115, "SOL-NFT-STAKE-RECORD-DRIFT", SOL, "HIGH", "CWE-672",
+         "Staked NFT returned while its staker record stays set",
+         "Delete the staker mapping entry (and any per-token reward checkpoint) before transferring the token "
+         "back.",
+         "delete stakerOf[tokenId];\nnft.safeTransferFrom(address(this), msg.sender, tokenId);"),
+    _sig(116, "SOL-NFT-UNSTAKE-ANY", SOL, "CRITICAL", "CWE-639",
+         "Anyone can withdraw a staked NFT (no owner check)",
+         "Require that `msg.sender` is the recorded staker of `tokenId` before sending it out.",
+         "if (stakerOf[tokenId] != msg.sender) revert NotStaker();"),
+    _sig(117, "SOL-ARRAY-LENGTH-MISMATCH", SOL, "MEDIUM", "CWE-130",
+         "Parallel arrays (ids/amounts) used without a length check",
+         "Revert unless every parallel array has the same length before the loop.",
+         "if (ids.length != amounts.length) revert LengthMismatch();"),
+    _sig(118, "SOL-SUPPLY-DRIFT", SOL, "MEDIUM", "CWE-682",
+         "Per-id supply counter raised on mint and never lowered on burn",
+         "Decrement the counter in every burn path (or use ERC1155Supply, which does both).",
+         "totalSupply[id] -= amount;\n_burn(from, id, amount);"),
+    _sig(119, "SOL-NFT-APPROVAL-STALE", SOL, "HIGH", "CWE-284",
+         "Hand-written ERC-721 transfer keeps the previous owner's approval",
+         "Clear the token approval in every transfer; the old approved spender can otherwise take the token "
+         "back from the new owner.",
+         "delete getApproved[id];\nownerOf[id] = to;"),
+    _sig(120, "SOL-REWARD-CLAIM-NO-RESET", SOL, "CRITICAL", "CWE-841",
+         "Reward claim pays out without zeroing the owed amount",
+         "Read the amount, set the stored reward to zero, then transfer.",
+         "uint256 r = rewards[msg.sender];\nrewards[msg.sender] = 0;\nrewardToken.safeTransfer(msg.sender, r);"),
+    _sig(121, "SOL-REWARD-PERIOD-OVERWRITE", SOL, "HIGH", "CWE-682",
+         "New reward period overwrites the rate and drops the unpaid remainder",
+         "When the current period is still running, add `remaining * rewardRate` to the new reward before "
+         "computing the new rate.",
+         "if (block.timestamp < periodFinish) {\n    reward += (periodFinish - block.timestamp) * rewardRate;\n}\nrewardRate = reward / DURATION;"),
+    _sig(122, "SOL-LOCK-GRIEFING", SOL, "MEDIUM", "CWE-284",
+         "Anyone can extend another user's lock by depositing for them",
+         "Only let the account itself (or an approved operator) reset its unlock time, or keep the later of "
+         "the two times without extending it.",
+         "if (user != msg.sender) revert NotAllowed();\nunlockAt[user] = block.timestamp + LOCK;"),
+    _sig(123, "SOL-VESTING-OVERRUN", SOL, "HIGH", "CWE-682",
+         "Linear vesting keeps growing after the end date",
+         "Cap elapsed time at the duration (`if (block.timestamp >= end) return total;` or `Math.min`).",
+         "uint256 elapsed = Math.min(block.timestamp - start, duration);\nreturn total * elapsed / duration;"),
+    _sig(124, "SOL-RECEIVER-ANY-TOKEN", SOL, "HIGH", "CWE-345",
+         "onERC721Received / onERC1155Received credits a deposit from any token contract",
+         "Check `msg.sender` is the NFT contract you accept before recording the deposit; anyone can call the "
+         "hook with a fake collection.",
+         "if (msg.sender != address(nft)) revert WrongCollection();"),
+    _sig(125, "SOL-EMERGENCY-PAUSED", SOL, "MEDIUM", "CWE-400",
+         "Emergency exit disabled while the contract is paused",
+         "Drop `whenNotPaused` from the emergency withdraw; it is the path users need while everything else is "
+         "paused.",
+         "function emergencyWithdraw() external nonReentrant { ... } // no whenNotPaused"),
+
+    # ------------------------------------------------------------------ web side, 0.16: FG-126..FG-150
+    # API state endpoints, WebSockets, headers and caching, sessions and tokens
+    _sig(126, "WEB-IDOR-MUTATION", BACK, "HIGH", "CWE-639",
+         "Record updated or deleted by a URL id with no ownership check",
+         "Scope the write to the caller (`{ _id: id, owner: req.user.id }`) or check ownership before it; "
+         "reading is FG-69, writing is worse.",
+         "await Order.deleteOne({ _id: req.params.id, owner: req.user.id });"),
+    _sig(127, "WEB-WS-NO-ORIGIN", BACK, "HIGH", "CWE-1385",
+         "WebSocket server accepts any Origin (cross-site WebSocket hijacking)",
+         "Check the Origin header in the handshake (`verifyClient`, `allowRequest`, `origins=`) against an "
+         "allowlist; browsers send cookies with the upgrade from any site.",
+         "new WebSocketServer({ server, verifyClient: ({ origin }) => ALLOWED.has(origin) });"),
+    _sig(128, "WEB-WS-NO-AUTH", BACK, "HIGH", "CWE-306",
+         "WebSocket connection handled without authenticating the client",
+         "Authenticate in the handshake (session cookie or a short-lived token) and close the socket otherwise.",
+         "wss.on(\"connection\", (ws, req) => {\n  const user = verifyToken(new URL(req.url, BASE).searchParams.get(\"t\"));\n  if (!user) return ws.close(1008);\n});"),
+    _sig(129, "WEB-WS-UNBOUNDED-MESSAGE", BACK, "MEDIUM", "CWE-770",
+         "WebSocket server with no message size limit",
+         "Set `maxPayload` (ws), `maxHttpBufferSize` (socket.io) or `max_size` (websockets) to what the protocol "
+         "needs.",
+         "new WebSocketServer({ server, maxPayload: 64 * 1024 });"),
+    _sig(130, "WEB-HEADER-INJECTION", BACK, "HIGH", "CWE-113",
+         "Response header value taken from the request (header injection)",
+         "Never copy request values into headers; map them to known values or strip CR/LF and validate.",
+         "res.setHeader(\"Content-Language\", LANGS.has(lang) ? lang : \"en\");"),
+    _sig(131, "WEB-LOG-INJECTION", BACK, "LOW", "CWE-117",
+         "Raw request values written to the log",
+         "Log structured fields (JSON logger) or strip CR/LF so a caller cannot forge log lines.",
+         "logger.info(\"login attempt\", { user: String(req.body.user).replace(/[\\r\\n]/g, \"\") });"),
+    _sig(132, "WEB-CACHE-PUBLIC-AUTH", BACK, "HIGH", "CWE-524",
+         "Authenticated response marked cacheable by shared caches",
+         "Send `Cache-Control: private, no-store` on anything built for a logged-in user.",
+         "res.set(\"Cache-Control\", \"private, no-store\");"),
+    _sig(133, "WEB-CACHE-KEY-NO-USER", BACK, "HIGH", "CWE-524",
+         "Per-user response cached under a key without the user",
+         "Put the user id in the cache key (`key_prefix`, `make_cache_key`), or do not cache user data.",
+         "cache.set(`${req.user.id}:${req.originalUrl}`, body, 60);"),
+    _sig(134, "WEB-CACHE-POISON-HOST", BACK, "MEDIUM", "CWE-349",
+         "Response built from X-Forwarded-Host (web cache poisoning)",
+         "Build absolute URLs from a configured base URL, and only trust forwarded headers from your proxy.",
+         "const base = process.env.PUBLIC_BASE_URL;"),
+    _sig(135, "WEB-SESSION-COOKIE-CONFIG", BACK, "MEDIUM", "CWE-614",
+         "Session middleware leaves its cookie without Secure or HttpOnly",
+         "Set the nested cookie options explicitly: `cookie: { secure: true, httpOnly: true, sameSite: \"lax\" }` "
+         "(express-session), `SESSION_COOKIE_SECURE = True` (Flask).",
+         "app.use(session({ secret, cookie: { secure: true, httpOnly: true, sameSite: \"lax\" } }));"),
+    _sig(136, "WEB-SAMESITE-NONE", BACK, "MEDIUM", "CWE-1275",
+         "Session cookie sent cross-site (SameSite=None)",
+         "Use `SameSite=Lax` (or Strict) for session cookies; None sends them on every cross-site request.",
+         "cookie: { sameSite: \"lax\", secure: true, httpOnly: true }"),
+    _sig(137, "WEB-SESSION-FIXATION", BACK, "HIGH", "CWE-384",
+         "Login stores the user in the session without regenerating its id",
+         "Regenerate the session id at login (`req.session.regenerate`, `session_regenerate_id(true)`).",
+         "req.session.regenerate(() => { req.session.userId = user.id; res.redirect(\"/\"); });"),
+    _sig(138, "WEB-JWT-NO-EXPIRY", BACK, "MEDIUM", "CWE-613",
+         "JWT issued without an expiry",
+         "Set `expiresIn` / an `exp` claim, keep access tokens short-lived and refresh them.",
+         "jwt.sign({ sub: user.id }, key, { algorithm: \"HS256\", expiresIn: \"15m\" });"),
+    _sig(139, "WEB-JWT-WEAK-SECRET", BACK, "HIGH", "CWE-521",
+         "JWT signed or verified with a short literal secret",
+         "Load a 256-bit random key from the secret store; short literals are cracked offline from one token.",
+         "jwt.sign(payload, process.env.JWT_KEY, { expiresIn: \"15m\" });"),
+    _sig(140, "WEB-PASSWORD-PLAINTEXT", BACK, "CRITICAL", "CWE-256",
+         "Password from the request stored without hashing",
+         "Hash with argon2id or bcrypt before storing; never keep the plaintext.",
+         "const passwordHash = await argon2.hash(req.body.password);"),
+    _sig(141, "WEB-HOST-HEADER-LINK", BACK, "HIGH", "CWE-640",
+         "Reset or verification link built from the Host header",
+         "Build emailed links from a configured base URL; the Host header is set by the caller.",
+         "const link = `${process.env.PUBLIC_BASE_URL}/reset?token=${token}`;"),
+    _sig(142, "WEB-REGEX-INJECTION", BACK, "MEDIUM", "CWE-1333",
+         "Regular expression built from request data (ReDoS)",
+         "Escape the input (`re.escape`, `_.escapeRegExp`) or match literally; a crafted pattern can pin a CPU.",
+         "new RegExp(escapeRegExp(req.query.q), \"i\")"),
+    _sig(143, "WEB-PROTOTYPE-POLLUTION", BACK, "HIGH", "CWE-1321",
+         "Request data deep-merged into an object (prototype pollution)",
+         "Validate against a schema first, merge into `Object.create(null)`, or reject `__proto__` / "
+         "`constructor` keys.",
+         "const opts = schema.parse(req.body);\nObject.assign(Object.create(null), defaults, opts);"),
+    _sig(144, "WEB-UPLOAD-FILENAME", BACK, "HIGH", "CWE-434",
+         "Uploaded file saved under the client's filename",
+         "Generate the stored name yourself (uuid + allowed extension) or pass it through `secure_filename`, "
+         "and check the content type.",
+         "name = f\"{uuid4().hex}.png\"\nf.save(UPLOAD_DIR / name)"),
+    _sig(145, "WEB-GRAPHQL-INTROSPECTION", BACK, "LOW", "CWE-200",
+         "GraphQL introspection or GraphiQL switched on",
+         "Disable introspection and the IDE outside development.",
+         "new ApolloServer({ schema, introspection: process.env.NODE_ENV !== \"production\" });"),
+    _sig(146, "WEB-GRAPHQL-NO-LIMIT", BACK, "MEDIUM", "CWE-770",
+         "GraphQL server with no query depth or cost limit",
+         "Add depth and complexity limits (graphql-depth-limit, query cost analysis) as validation rules.",
+         "validationRules: [depthLimit(8)]"),
+    _sig(147, "WEB-API-STATE-NO-AUTH", BACK, "HIGH", "CWE-306",
+         "State-changing API route in a file with no authentication",
+         "Put POST/PUT/PATCH/DELETE routes behind the auth middleware or decorator.",
+         "router.post(\"/orders\", requireAuth, createOrder);"),
+    _sig(148, "WEB-ERROR-LEAK", BACK, "MEDIUM", "CWE-209",
+         "Exception message or stack trace returned to the client",
+         "Log the error server-side and return a generic message with a request id.",
+         "logger.error(err);\nres.status(500).json({ error: \"internal error\", id: req.id });"),
+    _sig(149, "WEB-CORS-REFLECT", BACK, "HIGH", "CWE-942",
+         "CORS reflects the caller's Origin",
+         "Compare the Origin to an allowlist; reflecting it (`origin: true`) with credentials lets any site "
+         "read authenticated responses.",
+         "cors({ origin: [\"https://app.example.com\"], credentials: true })"),
+    _sig(150, "WEB-WS-PLAINTEXT", BACK, "MEDIUM", "CWE-319",
+         "WebSocket endpoint over plain ws://",
+         "Use wss:// for every non-local socket.",
+         "new WebSocket(\"wss://api.example.com/stream\");"),
 )
 
 BY_ID = {s.id: s for s in SIGNATURES}
@@ -725,6 +946,58 @@ def check_backend(raw: str, lang: str) -> list[tuple[str, int, str]]:
         for m in LXML_PARSE.finditer(raw):
             out.append(("WEB-XXE", _line(raw, m.start()),
                         "lxml parse without `resolve_entities=False` (external entities resolve on lxml < 5)"))
+            break
+    out += check_backend16(raw, lang)
+    return out
+
+
+# FG-135 session middleware cookie options, FG-138 JWT issued with no expiry (0.16)
+SESSION_MW = re.compile(r"(?<![\w.$])(session|expressSession|cookieSession)\s*\(\s*\{")
+NESTED_COOKIE = re.compile(r"\bcookie\s*:\s*\{")
+FLASK_SESSION_USE = re.compile(r"\bsession\s*\[|from\s+flask\s+import[^\n]*\bsession\b")
+FLASK_CONFIG_SOURCE = re.compile(r"SESSION_COOKIE_SECURE|config\.from_(object|envvar|pyfile|mapping|prefixed_env)")
+DJANGO_SETTINGS = re.compile(r"^\s*(INSTALLED_APPS|MIDDLEWARE)\s*=", re.M)
+JWT_SIGN = re.compile(r"\bjwt\.(sign|encode)\s*\(")
+JWT_EXP = re.compile(r"expiresIn|['\"]exp['\"]|\bexp\s*[:=]|timedelta|expires_delta|maxAge")
+
+
+def _braced(text: str, open_brace: int) -> str:
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace + 1:i]
+    return text[open_brace + 1:]
+
+
+def check_backend16(raw: str, lang: str) -> list[tuple[str, int, str]]:
+    out: list[tuple[str, int, str]] = []
+    if lang == "js":
+        for m in SESSION_MW.finditer(raw):
+            args = _call_args(raw, raw.index("(", m.start()), 2000)
+            nested = NESTED_COOKIE.search(args)
+            inner = _braced(args, nested.end() - 1) if nested else ""
+            if not nested:
+                out.append(("WEB-SESSION-COOKIE-CONFIG", _line(raw, m.start()),
+                            f"`{m.group(1)}()` with no `cookie` options (Secure is off by default)"))
+            elif not re.search(r"\bsecure\s*:", inner):
+                out.append(("WEB-SESSION-COOKIE-CONFIG", _line(raw, m.start() + raw[m.start():].find("cookie")),
+                            f"`{m.group(1)}()` cookie options leave out `secure`"))
+    if lang == "py":
+        app = FLASK_APP.search(raw)
+        if app and FLASK_SESSION_USE.search(raw) and not FLASK_CONFIG_SOURCE.search(raw):
+            out.append(("WEB-SESSION-COOKIE-CONFIG", _line(raw, app.start()),
+                        "Flask app uses `session` and never sets `SESSION_COOKIE_SECURE`"))
+        d = DJANGO_SETTINGS.search(raw)
+        if d and "SESSION_COOKIE_SECURE" not in raw:
+            out.append(("WEB-SESSION-COOKIE-CONFIG", _line(raw, d.start()),
+                        "Django settings without `SESSION_COOKIE_SECURE = True`"))
+    if lang in ("py", "js") and not JWT_EXP.search(raw):
+        for m in JWT_SIGN.finditer(raw):
+            out.append(("WEB-JWT-NO-EXPIRY", _line(raw, m.start()), "JWT issued with no `exp` / `expiresIn`"))
             break
     return out
 

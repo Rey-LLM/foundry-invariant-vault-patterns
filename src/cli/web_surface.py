@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import json
 import re
 import sys
@@ -43,6 +44,46 @@ else:
 
 Finding = scoring.Finding
 LAYER = "L11"
+
+
+# --------------------------------------------------------------------------- #
+# Pre-compiled pool: every fixed pattern the validator uses below, compiled once at import, plus cached builders
+# for the per-identifier patterns (a function or constant name), so a repository with many signing sites does
+# not recompile the same word pattern for every pairing.
+# --------------------------------------------------------------------------- #
+
+_QUOTED = re.compile(r"['\"`]([^'\"`]*)['\"`]")
+_BARE_UINT = re.compile(r"^uint(?=\[|$)")
+_BARE_INT = re.compile(r"^int(?=\[|$)")
+_USE_CLIENT = re.compile(r"^\s*['\"]use client['\"]", re.M)
+_FIRST_STR_ARG = re.compile(r"[^(]*\(\s*['\"]([^'\"]*)")
+_PY_DEF = re.compile(r"\s*(async\s+)?def\s")
+_PAREN_STR = re.compile(r"\(\s*['\"`]([^'\"`]*)['\"`]")
+_LBRACE = re.compile(r"\{")
+_LEAD_WORD = re.compile(r"['\"]?(\w+)")
+_DOMAIN_KEYS = re.compile(r"(?<![\w.:'\"])(chainId|verifyingContract|name|version|salt)\s*(?=[,}\n])")
+_INTERPOLATED = re.compile(r"\$\{|\{\w+\}|%s|os\.environ|process\.env")
+_ARGS_ARRAY = re.compile(r"\bargs\s*:\s*\[")
+_ARGS_KEY = re.compile(r"\bargs\s*[:,}]")
+_CALL_NAME = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)\s*\(")
+_CHAINID = re.compile(r"block\s*\.\s*chainid")
+_ADDR_THIS = re.compile(r"address\s*\(\s*this\s*\)")
+_TIMESTAMP = re.compile(r"block\s*\.\s*timestamp")
+_ADDR_ZERO = re.compile(r"address\s*\(\s*0\s*\)")
+_ENCODE_PACKED = re.compile(r"abi\s*\.\s*encodePacked\s*\(")
+_DYNAMIC_TYPE = re.compile(r"^(string|bytes)(\s|$)|.*\[\s*\d*\s*\]")
+_PUBLIC = re.compile(r"\bpublic\b")
+
+
+@functools.lru_cache(maxsize=4096)
+def _word(name: str) -> re.Pattern[str]:
+    return re.compile(rf"\b{re.escape(name)}\b")
+
+
+@functools.lru_cache(maxsize=1024)
+def _incremented(name: str) -> re.Pattern[str]:
+    e = re.escape(name)
+    return re.compile(rf"\b{e}\s*(\+\+|\+=)|(\+\+)\s*{e}\b")
 
 # --------------------------------------------------------------------------- #
 # Vocabulary
@@ -194,7 +235,7 @@ class Domain:
 
     def literal(self, key: str) -> str | None:
         v = self.fields.get(key, "").strip()
-        m = re.fullmatch(r"['\"`]([^'\"`]*)['\"`]", v)
+        m = _QUOTED.fullmatch(v)
         return m.group(1) if m else None
 
 
@@ -288,8 +329,8 @@ class BridgeReport:
 
 def _norm_type(t: str) -> str:
     t = t.strip()
-    t = re.sub(r"^uint(?=\[|$)", "uint256", t)
-    t = re.sub(r"^int(?=\[|$)", "int256", t)
+    t = _BARE_UINT.sub("uint256", t)
+    t = _BARE_INT.sub("int256", t)
     return t
 
 
@@ -362,7 +403,7 @@ def is_client(rel: str, raw: str) -> bool:
     parts = {x.lower() for x in p.parts[:-1]}
     if p.suffix.lower() in CLIENT_EXT:
         return True
-    if re.search(r"^\s*['\"]use client['\"]", raw[:400], re.M):
+    if _USE_CLIENT.search(raw[:400]):
         return True
     if "api" in parts or "server" in parts or "backend" in parts:
         return False
@@ -383,14 +424,14 @@ def python_handlers(src: _Src) -> list[Handler]:
     for ln in lines:
         offsets.append(offsets[-1] + len(ln) + 1)
     for m in PY_ROUTE.finditer(src.struct):
-        rm = re.match(r"[^(]*\(\s*['\"]([^'\"]*)", src.keep[m.start():m.end() + 200])
+        rm = _FIRST_STR_ARG.match(src.keep[m.start():m.end() + 200])
         route = rm.group(1) if rm else "?"
         i = src.struct.count("\n", 0, m.start())
         deco_start = i
         while deco_start > 0 and lines[deco_start - 1].lstrip().startswith("@"):
             deco_start -= 1
         j = i
-        while j < len(lines) and not re.match(r"\s*(async\s+)?def\s", lines[j]):
+        while j < len(lines) and not _PY_DEF.match(lines[j]):
             j += 1
         if j >= len(lines):
             continue
@@ -417,14 +458,14 @@ def js_handlers(src: _Src) -> list[Handler]:
         open_i = m.end() - 1
         close_i = scoring.match_close(s, open_i, "(", ")")
         args = src.keep[open_i:close_i]
-        rm = re.match(r"\(\s*['\"`]([^'\"`]*)['\"`]", args)
+        rm = _PAREN_STR.match(args)
         route = f"{m.group(2).upper()} {rm.group(1) if rm else '?'}"
         # middleware is everything before the last function argument
         last_fn = max(args.rfind("=>"), args.rfind("function"))
         header = args[:last_fn] if last_fn > 0 else ""
         out.append(Handler(route, open_i, close_i, src.line(m.start()), header))
     for m in NEXT_ROUTE.finditer(s):
-        bm = re.compile(r"\{").search(s, m.end())
+        bm = _LBRACE.search(s, m.end())
         if not bm:
             continue
         # function form: the body starts after the parameter list
@@ -432,7 +473,7 @@ def js_handlers(src: _Src) -> list[Handler]:
         if m.group(1):
             p_open = s.find("(", m.end() - 1)
             p_close = scoring.match_close(s, p_open, "(", ")")
-            bm2 = re.compile(r"\{").search(s, p_close)
+            bm2 = _LBRACE.search(s, p_close)
             start = bm2.start() if bm2 else start
         end = scoring.match_close(s, start)
         name = m.group(1) or m.group(2)
@@ -467,7 +508,7 @@ def backend_structs(src: _Src) -> list[TypedStruct]:
         # every element of the list must be a {name, type} pair
         if len(items) != body.count("{"):
             continue
-        name = re.match(r"['\"]?(\w+)", src.keep[m.start():m.end()]).group(1)
+        name = _LEAD_WORD.match(src.keep[m.start():m.end()]).group(1)
         out.append(TypedStruct(name, items, src.rel, src.line(m.start())))
     return out
 
@@ -485,7 +526,7 @@ def backend_domains(src: _Src) -> list[Domain]:
             k = {"chain_id": "chainId", "verifying_contract": "verifyingContract"}.get(k, k)
             fields.setdefault(k, v.strip())
         # shorthand properties in JS: { name, version, chainId, verifyingContract }
-        for k in re.findall(r"(?<![\w.:'\"])(chainId|verifyingContract|name|version|salt)\s*(?=[,}\n])", body):
+        for k in _DOMAIN_KEYS.findall(body):
             fields.setdefault(k, k)
         if fields and ({"chainId", "verifyingContract"} & set(fields) or {"name", "version"} <= set(fields)):
             out.append(Domain(fields, src.rel, src.line(m.start())))
@@ -602,7 +643,7 @@ def scan_backend(src: _Src) -> tuple[list[SignSite], list[Finding]]:
         if MNEMONIC_LITERAL.search(ln):
             add("BRIDGE-MNEMONIC-LITERAL", "CRITICAL", "Seed phrase in source", i,
                 "Move it out of the repository, treat every derived account as compromised and drain them to new keys.")
-        if RPC_KEY.search(ln) and not re.search(r"\$\{|\{\w+\}|%s|os\.environ|process\.env", ln):
+        if RPC_KEY.search(ln) and not _INTERPOLATED.search(ln):
             sev = "MEDIUM" if src.client else "LOW"
             add("BRIDGE-RPC-KEY", sev, "RPC provider key embedded in a URL" + (" shipped to browsers" if src.client else ""),
                 i, "Read the RPC URL from the environment; for browser traffic proxy through your backend or "
@@ -614,7 +655,7 @@ def scan_backend(src: _Src) -> tuple[list[SignSite], list[Finding]]:
         cm = COUNTER_NONCE.match(ln)
         if cm:
             name = cm.group(1) or cm.group(2)
-            if re.search(rf"\b{re.escape(name)}\s*(\+\+|\+=)|(\+\+)\s*{re.escape(name)}\b", src.keep):
+            if _incremented(name).search(src.keep):
                 add("BRIDGE-WEAK-NONCE", "MEDIUM", f"Nonce counter `{name}` lives in process memory", i,
                     "It restarts at the initial value after a deploy or crash and differs per worker; read the "
                     "nonce from the contract or a database row.")
@@ -697,13 +738,13 @@ def backend_calls(src: _Src) -> list[tuple[str, int | None, bool, int]]:
         start = src.struct.rfind("{", 0, m.start())
         end = scoring.match_close(src.struct, start) if start >= 0 else m.end()
         obj = src.keep[start:end]
-        am = re.search(r"\bargs\s*:\s*\[", obj)
+        am = _ARGS_ARRAY.search(obj)
         n = None
         if am:
             a_open = start + am.end() - 1
             a_close = scoring.match_close(src.struct, a_open, "[", "]")
             n = len(_split_args(src.keep[a_open + 1:a_close]))
-        elif re.search(r"\bargs\s*[:,}]", obj):
+        elif _ARGS_KEY.search(obj):
             n = None
         else:
             n = 0
@@ -747,7 +788,7 @@ def _reach(ss: _SolSrc, c, fn) -> tuple[str, str, list]:
         reached.append(f)
         parts_c.append(ss.clean[f.body_start:f.body_end + 1])
         parts_k.append(ss.keep[f.body_start:f.body_end + 1])
-        names = set(re.findall(r"(?<![\w.$])([A-Za-z_]\w*)\s*\(", parts_c[-1])) | set(f.modifiers)
+        names = set(_CALL_NAME.findall(parts_c[-1])) | set(f.modifiers)
         for n in names:
             for g in by_name.get(n, []):
                 if g.name not in seen and g.kind in ("function", "modifier"):
@@ -795,16 +836,16 @@ def scan_solidity(ss: _SolSrc) -> tuple[list[VerifySite], list[Finding], dict[st
                     chain_bound = "chainId" in dom_fields
                     contract_bound = "verifyingContract" in dom_fields or "salt" in dom_fields
                 else:
-                    chain_bound = bool(re.search(r"block\s*\.\s*chainid", ctext_k))
-                    contract_bound = bool(re.search(r"address\s*\(\s*this\s*\)", ctext_k))
+                    chain_bound = bool(_CHAINID.search(ctext_k))
+                    contract_bound = bool(_ADDR_THIS.search(ctext_k))
             else:
-                chain_bound = bool(re.search(r"block\s*\.\s*chainid", body_c))
-                contract_bound = bool(re.search(r"address\s*\(\s*this\s*\)", body_c))
+                chain_bound = bool(_CHAINID.search(body_c))
+                contract_bound = bool(_ADDR_THIS.search(body_c))
             replay = bool(SOL_REPLAY.search(body_c))
-            deadline = bool(re.search(r"block\s*\.\s*timestamp", body_c)) and bool(SOL_DEADLINE.search(body_c))
+            deadline = bool(_TIMESTAMP.search(body_c)) and bool(SOL_DEADLINE.search(body_c))
             typehash = None
             for const, sname in consts.items():
-                if sname != "EIP712Domain" and re.search(rf"\b{re.escape(const)}\b", body_c):
+                if sname != "EIP712Domain" and _word(const).search(body_c):
                     typehash = structs.get(sname)
                     break
             if typehash is None and eip712:
@@ -841,15 +882,15 @@ def scan_solidity(ss: _SolSrc) -> tuple[list[VerifySite], list[Finding], dict[st
                     "Hash with EIP-712 (OpenZeppelin `EIP712` + `_hashTypedDataV4`): the domain carries "
                     "`block.chainid` and `address(this)`, so a signature for one chain or deployment cannot "
                     "be replayed on another.")
-            if "ecrecover" in body_c and not re.search(r"address\s*\(\s*0\s*\)", body_c):
+            if "ecrecover" in body_c and not _ADDR_ZERO.search(body_c):
                 add("BRIDGE-RAW-ECRECOVER", "MEDIUM", f"Bare `ecrecover` in `{c.name}.{fn.name}`",
                     "`ecrecover` returns address(0) on a bad signature and accepts malleable `s` values. Use "
                     "OpenZeppelin `ECDSA.recover` (or check `signer != address(0)` and `s` in the lower half order).")
-            for pm in re.finditer(r"abi\s*\.\s*encodePacked\s*\(", body_c):
+            for pm in _ENCODE_PACKED.finditer(body_c):
                 close = scoring.match_close(body_c, pm.end() - 1, "(", ")")
                 args = [a.strip() for a in _split_args(body_c[pm.end():close])]
                 dyn_names = {n for f in reached for t, n in f.params
-                             if re.match(r"^(string|bytes)(\s|$)|.*\[\s*\d*\s*\]", t)}
+                             if _DYNAMIC_TYPE.match(t)}
                 if sum(a in dyn_names for a in args) >= 2:
                     add("BRIDGE-PACKED-COLLISION", "MEDIUM",
                         f"`abi.encodePacked` with two dynamic values in the signed hash of `{c.name}.{fn.name}`",
@@ -872,7 +913,7 @@ def abi_index(sol: list[_SolSrc]) -> dict[str, set[int | None]]:
                     out.setdefault(fn.name, set()).add(len([p for p in fn.params if p[0]]))
             for name, meta in c.state_vars.items():
                 line_text = clean_lines[meta["line"] - 1] if meta["line"] else ""
-                if re.search(r"\bpublic\b", line_text):
+                if _PUBLIC.search(line_text):
                     out.setdefault(name, set()).add(None)
     return out
 
@@ -894,11 +935,11 @@ def _link(sign: SignSite, verifies: list[VerifySite], backend_text: str) -> Veri
         cands = [v for v in verifies if v.typehash and v.typehash.name == sign.struct.name]
         if not cands:
             return None
-        named = [v for v in cands if re.search(rf"\b{re.escape(v.function)}\b", backend_text)]
+        named = [v for v in cands if _word(v.function).search(backend_text)]
         return (named or cands)[0]
     if sign.kind == "raw":
         raw = [v for v in verifies if v.method == "raw"]
-        named = [v for v in raw if re.search(rf"\b{re.escape(v.function)}\b", backend_text)]
+        named = [v for v in raw if _word(v.function).search(backend_text)]
         if named:
             return named[0]
         return raw[0] if len(raw) == 1 else None

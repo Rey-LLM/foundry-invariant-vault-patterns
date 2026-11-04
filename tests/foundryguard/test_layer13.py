@@ -197,7 +197,7 @@ class ReportTests(unittest.TestCase):
             html = page.read_text()
         self.assertIn("<h2>Signature database</h2>", html)
         rows = dict((sid, hit) for hit, sid in re.findall(r'<tr class="sigrow( hit)?"><td>(FG-\d+)</td>', html))
-        self.assertEqual(len(rows), 103)
+        self.assertEqual(len(rows), len(signatures.SIGNATURES))
         self.assertTrue(all(rows[sid] for sid, _, _ in EXPECTED_WEAK))
         self.assertIn('<pre class="fix">', html)
         self.assertIn('<span class="sig">FG-07</span>', html)
