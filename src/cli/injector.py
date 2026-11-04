@@ -823,7 +823,7 @@ def render_handler(t: Target, plan: SetupPlan, import_rel: str, support_rel: str
             on_success.append("_transientCheck();")
         seq_wrappers.append((hname, decls))
 
-        on_revert = [f"ghost_reverts[{_q(hname)}]++;"]
+        on_revert = [f"ghost_reverts[{_q(hname)}]++;", "ghost_revertedFlows++;"]
         if hooks:
             if fn["signature"] in hooks.guarded_flows:
                 reentry = f'abi.encodeWithSignature("{abi_signature(fn)}"' + "".join(f", {a.expr}" for a in args) + ")"
@@ -948,6 +948,8 @@ contract {c['name']}GuardHandler is CommonBase, StdUtils {{
     /// Reward tokens received by actors, per token.
     mapping(address => uint256) public ghost_rewardsPaid;
     uint256 public ghost_successfulFlows;
+    /// Value-flow calls that reverted; afterInvariant() only judges a run that attempted a flow.
+    uint256 public ghost_revertedFlows;
     /// Actions skipped because the actor had nothing to take out.
     uint256 public ghost_skipped;
 {erc_ghosts}{probes_decl}{transient_state}{governance_state}
@@ -1185,9 +1187,14 @@ def render_invariant(t: Target, plan: SetupPlan, import_rel: str, support_rel: s
             "        );")
 
     invariant_names.append("afterInvariant")
-    invariants.append("""    /// @notice Runs once per fuzz run: if no value-flow call ever succeeded, the invariants above
-    ///         were checked against an untouched contract. Fund and approve the actors in setUp.
+    invariants.append("""    /// @notice Runs once per fuzz run: if value-flow calls were made and every one reverted, the
+    ///         invariants above were checked against an untouched contract. Fund and approve the
+    ///         actors in setUp.
+    /// @dev A run with no reverted flow passes. forge also calls this hook while it shrinks a broken
+    ///      invariant's call sequence; failing on a short or empty candidate would let the shrinker
+    ///      throw the real counter-example away.
     function afterInvariant() public view {
+        if (handler.ghost_revertedFlows() == 0) return;
         assertGt(handler.ghost_successfulFlows(), 0, "no value-flow call succeeded: fix setUp funding/approvals");
     }""")
 
@@ -1565,6 +1572,8 @@ def render_ecosystem_handler(eco: EcosystemPlan, dest: Path, root: Path, support
             body.extend("    " + x for x in on_success)
             body.append("} catch {")
             body.append(f"    ghost_reverts[{_q(hfn)}]++;")
+            if kind == "flow":
+                body.append("    ghost_revertedFlows++;")
             body.append("}")
             what = {"flow": f"{fn['category']} ({fn['direction']})", "action": "action",
                     "keeper": f"keeper call as admin ({', '.join(fn.get('modifiers', []))})"}[kind]
@@ -1636,6 +1645,8 @@ contract {hname} is CommonBase, StdUtils {{
     mapping(string => uint256) public ghost_calls;
     mapping(string => uint256) public ghost_reverts;
     uint256 public ghost_successfulFlows;
+    /// Value-flow calls that reverted; afterInvariant() only judges a run that attempted a flow.
+    uint256 public ghost_revertedFlows;
     uint256 public ghost_successfulActions;
     uint256 public ghost_sequences;
     /// Actions skipped because the actor had nothing to take out.
@@ -1805,9 +1816,12 @@ def render_ecosystem_invariant(eco: EcosystemPlan, dest: Path, root: Path, suppo
             f'        assertEq(held, t.totalSupply(), "{tk.var} left the ecosystem");')
 
     names.append("afterInvariant")
-    invariants.append("""    /// @notice Runs once per fuzz run: if no value-flow call ever succeeded, the invariants above were
-    ///         checked against an untouched ecosystem. Fix the wiring or funding in setUp.
+    invariants.append("""    /// @notice Runs once per fuzz run: if value-flow calls were made and every one reverted, the
+    ///         invariants above were checked against an untouched ecosystem. Fix the wiring or funding in setUp.
+    /// @dev A run with no reverted flow passes, so forge's shrinker cannot reduce a broken invariant's
+    ///      call sequence to an empty one that only fails here.
     function afterInvariant() public view {
+        if (handler.ghost_revertedFlows() == 0) return;
         assertGt(handler.ghost_successfulFlows(), 0, "no value-flow call succeeded in the ecosystem: check the wiring");
     }""")
 
