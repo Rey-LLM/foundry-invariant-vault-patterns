@@ -365,6 +365,24 @@ class GuiLogicTests(TmpCase):
             self.assertEqual(gui.main([]), 2)
         self.assertIn("python3-tk", err.getvalue())
 
+    def test_main_without_customtkinter(self):
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            self.skipTest("Tk not available")
+        with unittest.mock.patch.dict(sys.modules, {"customtkinter": None}), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(gui.main([]), 2)
+        self.assertIn("pip install customtkinter", err.getvalue())
+
+    def test_customtkinter_dependency(self):
+        self.assertIn('"customtkinter>=5.2"', (REPO / "pyproject.toml").read_text())
+
+    def test_score_color(self):
+        self.assertEqual(gui.score_color(100), gui.ACCENT)
+        self.assertEqual(gui.score_color(60), gui.AMBER)
+        self.assertEqual(gui.score_color(10), gui.RED)
+
     def test_entry_point(self):
         text = (REPO / "pyproject.toml").read_text()
         self.assertIn('foundryguard-gui = "foundryguard.gui:main"', text)
@@ -372,8 +390,7 @@ class GuiLogicTests(TmpCase):
 
 def _tk_root():
     try:
-        import tkinter as tk
-        return tk.Tk()
+        return gui.make_root()
     except Exception:
         return None
 
@@ -387,6 +404,10 @@ class GuiWindowTests(TmpCase):
         try:
             app = gui.App(root, str(self.root))
             self.assertEqual(str(app.launch_btn.cget("text")), gui.LAUNCH_LABEL)
+            self.assertEqual(app.entry.get(), str(self.root))
+            app.target_var.set("https://example.com")
+            self.assertEqual(app.entry.get(), "https://example.com")
+            app.target_var.set(str(self.root))
             self.assertEqual(len(app.preset_vars), 8)
             app.preset_vars[3].set(False)
             self.assertEqual(app.selected_presets(), scoring.ALL_PRESETS - {3})
@@ -400,6 +421,8 @@ class GuiWindowTests(TmpCase):
                 time.sleep(0.02)
             self.assertEqual(app.score_var.get(), "63/100")
             self.assertIn("EXPOSED", app.status_var.get())
+            self.assertEqual(app.verdict_var.get(), "EXPOSED")
+            self.assertEqual(app.progress.get(), 1)
             app.target_var.set("")
             app.update_hint()
             self.assertEqual(str(app.launch_btn.cget("state")), "disabled")

@@ -305,7 +305,7 @@ foundryguard score https://app.example.com  # one passive GET; report goes to ~/
 foundryguard-gui                            # the window
 ```
 
-The window is plain Tk (`python3-tk` on Debian and Ubuntu; the python.org installers ship it). It has one bar for a folder, a file or a URL, eight preset toggles, and LAUNCH SECURITY SIMULATION. The run happens in a background thread, so the window stays responsive and Stop works. When it finishes, the report opens in the browser with the score at the top. `foundryguard-score.json` next to it has the same data for scripts.
+The window is built on customtkinter (installed with the package; Tk itself comes from `python3-tk` on Debian and Ubuntu, the python.org installers ship it). Dark theme: one bar for a folder, a file or a URL, the eight presets as a 4 x 2 grid, and LAUNCH SECURITY SIMULATION. The run happens in a background thread with a progress bar and elapsed time, so the window stays responsive and Stop works. When it finishes, the score card turns green, amber or red and the report opens in the browser with the score at the top. `foundryguard-score.json` next to it has the same data for scripts.
 
 ### Config
 

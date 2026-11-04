@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foundryguard"
-version = "0.11.0"
+version = "0.12.0"
 description = "Generate Foundry invariant test suites from Solidity sources, score a codebase 1-100, and run it all from a desktop window."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-dependencies = ["tomli>=1.1; python_version < '3.11'"]
+dependencies = ["tomli>=1.1; python_version < '3.11'", "customtkinter>=5.2"]
 keywords = ["solidity", "foundry", "fuzzing", "invariant-testing", "defi", "security"]
 classifiers = [
     "Programming Language :: Python :: 3",

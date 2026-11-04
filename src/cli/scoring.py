@@ -99,7 +99,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.11 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.12 (passive single-page check)"
 SCORE_JSON = "foundryguard-score.json"
 
 
