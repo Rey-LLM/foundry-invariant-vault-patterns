@@ -78,7 +78,7 @@ else:  # executed as a plain script directory (python3 src/cli/parser.py)
     from compiler import Diagnostic, SolidityError  # type: ignore
 
 SCHEMA = "foundryguard.blueprint/v2"
-TOOL_VERSION = "0.18.0"
+TOOL_VERSION = "0.19.0"
 
 log = logging.getLogger("foundryguard.parser")
 

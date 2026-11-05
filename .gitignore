@@ -13,3 +13,7 @@ tests/foundryguard/fixtures/libs/package-lock.json
 # Layer 10 score pages written next to scanned fixtures
 foundryguard-score.json
 tests/foundryguard/fixtures/**/foundryguard-report.html
+
+# build_installer.py output
+dist/
+*.spec

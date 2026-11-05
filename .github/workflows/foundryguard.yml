@@ -464,3 +464,23 @@ jobs:
           PY
       - name: Generated suites compile
         run: forge build
+
+  executable:
+    name: Standalone executable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller customtkinter
+      # builds dist/FoundryGuard(.exe) and smoke-tests it headless on the safe fixture
+      - run: python build_installer.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FoundryGuard-${{ runner.os }}
+          path: dist/FoundryGuard*

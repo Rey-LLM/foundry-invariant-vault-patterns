@@ -112,7 +112,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.18 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.19 (passive single-page check)"
 CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
 FINDINGS_LOG = "foundryguard-findings.log"
@@ -2635,10 +2635,18 @@ def _blueprint_matrix(target: Path, presets: frozenset[int], ast_path: str | Non
         return None, f"AST unavailable ({msg.splitlines()[0][:200]}); the preset matrix comes from the source-level detectors"
 
 
+def forge_command(root: Path, report_md: Path) -> list[str]:
+    """``foundryguard run --test`` in a child process. A frozen build (``build_installer.py``) has no interpreter
+    or ``foundryguard.py`` on disk, so it starts its own executable with ``--cli`` instead."""
+    args = ["run", "--root", str(root), "--test", "--no-html", "--report", str(report_md)]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--cli", *args]
+    return [sys.executable, str(Path(__file__).with_name("foundryguard.py")), *args]
+
+
 def _run_forge(root: Path, progress: Progress, cancel, timeout: float) -> tuple[dict, list[Finding], object]:
-    cli = Path(__file__).with_name("foundryguard.py")
     report_md = root / reporter.REPORT_FILE
-    cmd = [sys.executable, str(cli), "run", "--root", str(root), "--test", "--no-html", "--report", str(report_md)]
+    cmd = forge_command(root, report_md)
     progress("forge: " + " ".join(cmd[2:]))
     proc = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     captured: list[str] = []

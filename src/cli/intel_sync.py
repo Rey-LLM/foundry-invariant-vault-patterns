@@ -371,7 +371,7 @@ def _adv(eco, name, lo, fixed, adv_id, summary) -> dict:
 class SyncResult:
     rules: list[RuleSpec] = field(default_factory=list)
     advisories: list[Advisory] = field(default_factory=list)
-    source: str = "none"  # network | cache | off | none | idle (nothing tried yet)
+    source: str = "none"  # network | cache | bundled | off | none | idle (nothing tried yet)
     fetched_at: float | None = None
     errors: list[str] = field(default_factory=list)
     feeds: list[dict] = field(default_factory=list)  # per feed: url, ok, count
@@ -389,7 +389,7 @@ class SyncResult:
         if self.source == "none":
             return base + " (sync failed, no cache)"
         tail = f" + {self.dynamic} dynamic verified"
-        return base + tail + (" (cached)" if self.source == "cache" else "")
+        return base + tail + {"cache": " (cached)", "bundled": " (offline, bundled pack)"}.get(self.source, "")
 
 
 def _fetch_osv(cfg: IntelConfig, fetch: Fetcher, res: SyncResult) -> list[Advisory]:
@@ -460,7 +460,7 @@ def sync(cfg: IntelConfig, fetch: Fetcher | None = None, cache: Path | None = No
         advisories = _fetch_osv(cfg, fetch, res)
         any_ok = any_ok or res.feeds[-1]["ok"]
     if not any_ok:
-        fallback = cached or SyncResult(source="none")
+        fallback = cached or load_bundled() or SyncResult(source="none")
         fallback.errors = res.errors + fallback.errors
         if cached:
             fallback.source = "cache"
@@ -475,6 +475,31 @@ def sync(cfg: IntelConfig, fetch: Fetcher | None = None, cache: Path | None = No
 # --------------------------------------------------------------------------- #
 # Cache
 # --------------------------------------------------------------------------- #
+
+def bundled_pack_path() -> Path | None:
+    """The default rule pack shipped inside a standalone build (``build_installer.py`` adds it). A checkout or a
+    pip install has none, so the order stays network, cache, built-in signatures there."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not (getattr(sys, "frozen", False) and meipass):
+        return None
+    path = Path(meipass) / "intel" / "foundryguard-rules.json"
+    return path if path.is_file() else None
+
+
+def load_bundled(path: Path | None = None) -> SyncResult | None:
+    """First start of a standalone build with no network and no cache yet: use the pack it was built with."""
+    path = path or bundled_pack_path()
+    if path is None:
+        return None
+    res = SyncResult(source="bundled")
+    try:
+        res.rules = parse_pack(path.read_bytes(), "bundled:" + DEFAULT_PACK, res.errors)
+    except (OSError, IntelError, ValueError) as exc:
+        res.errors.append(f"bundled pack: {exc}")
+        return None
+    res.feeds.append({"url": "bundled:" + DEFAULT_PACK, "ok": True, "count": len(res.rules)})
+    return res
+
 
 def save_cache(path: Path, res: SyncResult) -> None:
     doc = {"version": CACHE_VERSION, "fetched_at": res.fetched_at, "feeds": res.feeds,
@@ -612,4 +637,4 @@ def cmd_intel(args) -> int:
             print(f"  {r.sig.id:<18} {r.sig.severity:<8} {r.sig.ref:<16} {r.sig.title}")
         for e in res.errors[:20]:
             print(f"  skipped: {e}")
-    return 0 if res.source in ("network", "cache") else 1
+    return 0 if res.source in ("network", "cache", "bundled") else 1
