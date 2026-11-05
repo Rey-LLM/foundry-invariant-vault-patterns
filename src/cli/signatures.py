@@ -1,6 +1,6 @@
 """Layer 13: the FoundryGuard signature database.
 
-150 named signatures, each a separate failure mode with a CWE or SWC reference, a fixed severity, a one-line
+170 named signatures, each a separate failure mode with a CWE or SWC reference, a fixed severity, a one-line
 mitigation and a short fix example that the HTML report prints next to the hit.
 
 * FG-01..FG-50 and FG-104..FG-125: the contract side (Solidity): reentrancy, price and balance manipulation,
@@ -10,8 +10,13 @@ mitigation and a short fix example that the HTML report prints next to the hit.
 * FG-51..FG-103 and FG-126..FG-150: the web side: backend code, the HTTP surface of a page, dependency
   manifests, the backend-to-contract bridge (Layer 12), and (since 0.16) API state endpoints, WebSockets,
   header injection, caching and session/token handling.
+* FG-151..FG-157 (contract) and FG-158..FG-170 (web), since 0.18: cryptography misuse, Layer 18. EIP-712 domain,
+  typehash and field encoding, unprefixed or caller-chosen signed digests, commit-reveal binding and 64-byte
+  Merkle leaves; ECB, constant IVs, literal keys, legacy ciphers, weak KDF cost, fast password hashes, CBC without
+  a MAC, short RSA keys, PKCS#1 v1.5 encryption, JWT algorithm confusion and decode-only, legacy TLS.
 
-Ids never move: new signatures are appended, so FG-01..FG-103 mean what they meant in 0.15.
+Ids never move: new signatures are appended, so FG-01..FG-103 mean what they meant in 0.15 and FG-104..FG-150
+what they meant in 0.16.
 
 The detectors live where the text is parsed: Solidity rules in ``scoring.check_solidity``, line rules in
 ``scoring.LINE_RULES``, response-header rules in ``scoring.check_headers``, the bridge rules in
@@ -36,7 +41,7 @@ SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 OFF = "off"
 WEB3_LAST = 50  # end of the first contract block, kept for older callers
 # contract-side id blocks; everything else is web side
-WEB3_RANGES: tuple[tuple[int, int], ...] = ((1, 50), (104, 125))
+WEB3_RANGES: tuple[tuple[int, int], ...] = ((1, 50), (104, 125), (151, 157))
 
 
 @dataclass(frozen=True)
@@ -736,6 +741,118 @@ SIGNATURES: tuple[Signature, ...] = (
          "WebSocket endpoint over plain ws://",
          "Use wss:// for every non-local socket.",
          "new WebSocket(\"wss://api.example.com/stream\");"),
+
+    # ------------------------------------------------------------------ 0.18 cryptography, contract side: FG-151..157
+    _sig(151, "SOL-EIP712-CACHED-DOMAIN", SOL, "MEDIUM", "SWC-121 / CWE-294",
+         "EIP-712 domain separator fixed at deploy (replayable on a chain fork)",
+         "Rebuild the domain separator when `block.chainid` differs from the deploy chain id, or inherit "
+         "OpenZeppelin `EIP712`, which does this. A separator cached in the constructor (or a hard-coded chain id) "
+         "keeps signatures valid on both sides of a fork.",
+         "function _domainSeparator() internal view returns (bytes32) {\n"
+         "    return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : _computeDomainSeparator();\n}"),
+    _sig(152, "SOL-EIP712-TYPEHASH-MISMATCH", SOL, "HIGH", "CWE-347",
+         "EIP-712 struct hash encodes a different number of fields than its typehash declares",
+         "Encode exactly the fields the type string lists, in the same order. Wallets sign the declared type, so a "
+         "missing or extra field makes every honest signature fail, or makes the contract check something the "
+         "user never saw.",
+         "bytes32 constant PERMIT_TYPEHASH = keccak256(\"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\");\n"
+         "keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline));"),
+    _sig(153, "SOL-EIP712-DYNAMIC-UNHASHED", SOL, "MEDIUM", "CWE-347",
+         "EIP-712 string, bytes or array field encoded raw instead of hashed",
+         "EIP-712 encodes `string` and `bytes` as `keccak256(value)` and arrays as the hash of the concatenated "
+         "element encodings. Encoding the raw value produces a digest no standard wallet signs.",
+         "keccak256(abi.encode(ORDER_TYPEHASH, maker, keccak256(bytes(memo)), keccak256(abi.encodePacked(ids))));"),
+    _sig(154, "SOL-SIG-UNPREFIXED-HASH", SOL, "MEDIUM", "CWE-347",
+         "Signature recovered over a bare hash (no EIP-191 or EIP-712 prefix)",
+         "Recover over `MessageHashUtils.toEthSignedMessageHash(hash)` or an EIP-712 digest. Without a prefix the "
+         "signed bytes are not domain separated, so a signature made for another purpose (or another app) over the "
+         "same 32 bytes is accepted.",
+         "bytes32 digest = MessageHashUtils.toEthSignedMessageHash(keccak256(abi.encode(to, amount, nonce)));\n"
+         "address signer = ECDSA.recover(digest, signature);"),
+    _sig(155, "SOL-SIG-CALLER-DIGEST", SOL, "HIGH", "CWE-347",
+         "Signature checked over a digest the caller supplies",
+         "Build the digest inside the contract from the values the call acts on. When the caller passes the hash, any "
+         "signature the signer ever made over any 32 bytes authorizes the call, and the hash is not tied to the "
+         "amount or recipient.",
+         "bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(CLAIM_TYPEHASH, msg.sender, amount, nonce)));\n"
+         "require(ECDSA.recover(digest, sig) == signer, \"bad sig\");"),
+    _sig(156, "SOL-COMMIT-NO-SENDER", SOL, "MEDIUM", "SWC-114 / CWE-362",
+         "Commit-reveal hash does not bind the committer's address",
+         "Include `msg.sender` in the committed hash. Otherwise anyone can copy a pending commitment and replay the "
+         "revealed value from their own address, taking the win or the bid.",
+         "require(commitments[msg.sender] == keccak256(abi.encode(msg.sender, value, salt)), \"bad reveal\");"),
+    _sig(157, "SOL-MERKLE-LEAF-64", SOL, "MEDIUM", "CWE-328",
+         "Merkle leaf is a single hash of 64 bytes (second-preimage with an inner node)",
+         "Hash the leaf twice (`keccak256(bytes.concat(keccak256(abi.encode(a, b))))`), as OpenZeppelin's "
+         "StandardMerkleTree does. A 64-byte leaf has the same shape as an inner node, so an inner node can be "
+         "proven as a leaf.",
+         "bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));\n"
+         "require(MerkleProof.verify(proof, root, leaf), \"bad proof\");"),
+
+    # ------------------------------------------------------------------ 0.18 cryptography, web side: FG-158..170
+    _sig(158, "WEB-CIPHER-ECB", BACK, "HIGH", "CWE-327",
+         "Block cipher in ECB mode",
+         "Use an AEAD mode (AES-GCM or ChaCha20-Poly1305) with a fresh nonce. ECB encrypts equal blocks to equal "
+         "ciphertext, so patterns in the data survive encryption and blocks can be cut and pasted.",
+         "const iv = crypto.randomBytes(12);\nconst c = crypto.createCipheriv(\"aes-256-gcm\", key, iv);"),
+    _sig(159, "WEB-STATIC-IV", BACK, "HIGH", "CWE-329 / CWE-323",
+         "Constant IV or nonce passed to a cipher",
+         "Generate a new random IV for every message (12 bytes for GCM, 16 for CBC) and store it next to the "
+         "ciphertext. A reused GCM nonce leaks the authentication key; a fixed CBC IV leaks equal prefixes.",
+         "iv = os.urandom(12)\nct = AESGCM(key).encrypt(iv, data, None)\nstore(iv + ct)"),
+    _sig(160, "WEB-HARDCODED-CRYPTO-KEY", BACK, "CRITICAL", "CWE-321",
+         "Encryption or HMAC key written as a literal in the call",
+         "Load the key from a secret manager or the environment, and rotate the one in the source: anyone with the "
+         "code (or the bundle) can decrypt and forge.",
+         "const key = Buffer.from(process.env.DATA_KEY, \"base64\");\ncrypto.createHmac(\"sha256\", key)"),
+    _sig(161, "WEB-WEAK-CIPHER", BACK, "HIGH", "CWE-327",
+         "Broken or legacy cipher (DES, 3DES, RC4, RC2, Blowfish)",
+         "Switch to AES-GCM or ChaCha20-Poly1305. DES keys are brute-forced in hours, 64-bit block ciphers fall to "
+         "Sweet32, and RC4 output is biased.",
+         "from cryptography.hazmat.primitives.ciphers.aead import AESGCM\nct = AESGCM(key).encrypt(nonce, data, aad)"),
+    _sig(162, "WEB-CREATECIPHER-NO-IV", BACK, "HIGH", "CWE-329 / CWE-916",
+         "Node crypto.createCipher (password-derived key, no IV)",
+         "Use `crypto.createCipheriv` with a real key from `scrypt` and a random IV. `createCipher` derives the key "
+         "with one round of MD5 and reuses the same IV for every message; it was removed in Node 22.",
+         "const key = crypto.scryptSync(password, salt, 32);\nconst c = crypto.createCipheriv(\"aes-256-gcm\", key, crypto.randomBytes(12));"),
+    _sig(163, "WEB-WEAK-KDF", BACK, "MEDIUM", "CWE-916",
+         "Password KDF with too few iterations or too little cost",
+         "PBKDF2-SHA256 needs 600,000 iterations or more (OWASP), bcrypt a cost of 10 or more, scrypt N of 2^15 or "
+         "more. Low settings make an offline guess cheap after a database leak.",
+         "hashlib.pbkdf2_hmac(\"sha256\", pw, salt, 600_000)\nbcrypt.hash(pw, 12)"),
+    _sig(164, "WEB-PASSWORD-FAST-HASH", BACK, "HIGH", "CWE-916",
+         "Password hashed with a fast digest (MD5, SHA-1, SHA-2, SHA-3)",
+         "Store passwords with argon2id, scrypt or bcrypt. A GPU tries billions of SHA-256 guesses per second, so a "
+         "plain digest, even salted, does not protect a leaked table.",
+         "from argon2 import PasswordHasher\nstored = PasswordHasher().hash(password)"),
+    _sig(165, "WEB-UNAUTHENTICATED-ENCRYPTION", BACK, "MEDIUM", "CWE-649",
+         "CBC/CTR encryption with no MAC (ciphertext can be altered; padding oracle)",
+         "Use AES-GCM or ChaCha20-Poly1305, or encrypt-then-MAC with HMAC over IV and ciphertext and check it in "
+         "constant time before decrypting.",
+         "const c = crypto.createCipheriv(\"aes-256-gcm\", key, iv);\nconst tag = c.getAuthTag();"),
+    _sig(166, "WEB-RSA-WEAK-KEY", BACK, "HIGH", "CWE-326",
+         "RSA or DSA key shorter than 2048 bits",
+         "Generate RSA keys of 3072 bits (2048 at the very least), or move to Ed25519 / P-256.",
+         "rsa.generate_private_key(public_exponent=65537, key_size=3072)"),
+    _sig(167, "WEB-RSA-PKCS1V15-ENCRYPT", BACK, "MEDIUM", "CWE-780",
+         "RSA encryption with PKCS#1 v1.5 padding (Bleichenbacher oracle)",
+         "Encrypt with OAEP (SHA-256). PKCS#1 v1.5 decryption that reports padding errors, even through timing, lets "
+         "an attacker decrypt messages.",
+         "public_key.encrypt(data, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))"),
+    _sig(168, "WEB-JWT-ALG-CONFUSION", BACK, "HIGH", "CWE-347 / CWE-327",
+         "JWT verification accepts both HMAC and public-key algorithms",
+         "Pin one algorithm family per key. With HS256 and RS256 both allowed, a token signed with HMAC using the "
+         "public key as the secret passes verification.",
+         "jwt.verify(token, publicKey, { algorithms: [\"RS256\"] });"),
+    _sig(169, "WEB-JWT-DECODE-ONLY", BACK, "HIGH", "CWE-347",
+         "Server reads JWT claims with decode() and never verifies the signature",
+         "Use `jwt.verify` (or `jwtVerify` in jose) with the key and a fixed algorithm list; `decode` only "
+         "base64-decodes, so anyone can mint a token with any claims.",
+         "const claims = jwt.verify(token, key, { algorithms: [\"HS256\"] });"),
+    _sig(170, "WEB-LEGACY-TLS", BACK, "MEDIUM", "CWE-327",
+         "SSLv3, TLS 1.0 / 1.1 or a NULL, EXPORT or RC4 cipher suite allowed",
+         "Require TLS 1.2 or newer and leave the cipher list at the library default (or a modern AEAD-only list).",
+         "ctx = ssl.create_default_context()\nctx.minimum_version = ssl.TLSVersion.TLSv1_2"),
 )
 
 BY_ID = {s.id: s for s in SIGNATURES}
@@ -859,12 +976,26 @@ HEADERS_PRESENT = re.compile(r"helmet|Talisman|flask_talisman|Content-Security-P
 LXML_PARSE = re.compile(r"\betree\.(parse|fromstring|XML|iterparse)\s*\(")
 
 
-def limiter_present(raw: str) -> bool:
-    return bool(RATE_LIMITER.search(raw))
+# Literal hints for the case-insensitive whole-file patterns: every alternative of the pattern contains one of
+# them (lowercase), so a file without any hint cannot match and the regex is skipped. Python's `re` has no
+# literal prefilter for an ignore-case alternation, and these run on every scanned file.
+RATE_LIMITER_HINTS = ("limit", "throttl", "bottlene")
+HEADERS_HINTS = ("helmet", "talisman", "content-security-policy", "strict-transport-security", "x-frame-options",
+                 "securitymiddleware", "secure_headers", "lusca")
 
 
-def headers_present(raw: str) -> bool:
-    return bool(HEADERS_PRESENT.search(raw))
+def hinted(pattern: re.Pattern[str], hints: tuple[str, ...], raw: str, low: str | None = None) -> bool:
+    """``pattern.search(raw)``, skipped when none of ``hints`` occurs in the lowercased text."""
+    low = raw.lower() if low is None else low
+    return any(h in low for h in hints) and pattern.search(raw) is not None
+
+
+def limiter_present(raw: str, low: str | None = None) -> bool:
+    return hinted(RATE_LIMITER, RATE_LIMITER_HINTS, raw, low)
+
+
+def headers_present(raw: str, low: str | None = None) -> bool:
+    return hinted(HEADERS_PRESENT, HEADERS_HINTS, raw, low)
 
 
 def _line(raw: str, offset: int) -> int:
@@ -903,27 +1034,34 @@ def check_backend(raw: str, lang: str) -> list[tuple[str, int, str]]:
             if size >= 50:
                 out.append(("WEB-BODY-LIMIT", _line(raw, m.start()),
                             f"Body parser accepts {m.group(2)}{m.group(3)} per request"))
-    if lang in ("py", "js", "php") and not limiter_present(raw):
-        for m in AUTH_ROUTE.finditer(raw):
-            out.append(("WEB-RATE-LIMIT", _line(raw, m.start()),
-                        "Credential or token route with no rate limiter"))
+    # Cheap-first ordering: the narrow pattern runs before the whole-file one it depends on (same result).
+    if lang in ("py", "js", "php"):
+        routes = list(AUTH_ROUTE.finditer(raw))
+        if routes and not limiter_present(raw):
+            for m in routes:
+                out.append(("WEB-RATE-LIMIT", _line(raw, m.start()),
+                            "Credential or token route with no rate limiter"))
     if lang not in ("py", "js", "php"):
         return out
 
     # FG-62 SSRF: a request value flows into an HTTP client through a variable
-    tainted = {m.group(1) for m in TAINT_ASSIGN.finditer(raw)}
-    for m in TAINT_DESTRUCTURE.finditer(raw):
-        tainted |= {p.split(":")[-1].strip() for p in m.group(1).split(",") if p.strip()}
-    tainted.discard("")
-    for m in HTTP_CLIENT.finditer(raw):
+    clients = list(HTTP_CLIENT.finditer(raw))
+    tainted: set[str] = set()
+    if clients:
+        tainted = {m.group(1) for m in TAINT_ASSIGN.finditer(raw)}
+        for m in TAINT_DESTRUCTURE.finditer(raw):
+            tainted |= {p.split(":")[-1].strip() for p in m.group(1).split(",") if p.strip()}
+        tainted.discard("")
+    for m in clients:
         var = m.group(m.lastindex)
         if var in tainted:
             out.append(("WEB-SSRF", _line(raw, m.start()),
                         f"Outbound request to `{var}`, which comes from the request"))
 
     # FG-69 IDOR / BOLA
-    if not OWNERSHIP.search(raw):
-        for m in ID_LOOKUP.finditer(raw):
+    lookups = list(ID_LOOKUP.finditer(raw))
+    if lookups and not OWNERSHIP.search(raw):
+        for m in lookups:
             out.append(("WEB-IDOR", _line(raw, m.start()),
                         "Record fetched by a URL id and returned with no ownership check"))
 
@@ -962,6 +1100,7 @@ def check_backend(raw: str, lang: str) -> list[tuple[str, int, str]]:
                         "lxml parse without `resolve_entities=False` (external entities resolve on lxml < 5)"))
             break
     out += check_backend16(raw, lang)
+    out += check_crypto(raw, lang)
     return out
 
 
@@ -1009,10 +1148,49 @@ def check_backend16(raw: str, lang: str) -> list[tuple[str, int, str]]:
         if d and "SESSION_COOKIE_SECURE" not in raw:
             out.append(("WEB-SESSION-COOKIE-CONFIG", _line(raw, d.start()),
                         "Django settings without `SESSION_COOKIE_SECURE = True`"))
-    if lang in ("py", "js") and not JWT_EXP.search(raw):
-        for m in JWT_SIGN.finditer(raw):
+    if lang in ("py", "js"):
+        m = JWT_SIGN.search(raw)
+        if m and not JWT_EXP.search(raw):
             out.append(("WEB-JWT-NO-EXPIRY", _line(raw, m.start()), "JWT issued with no `exp` / `expiresIn`"))
-            break
+    return out
+
+
+# FG-163 password KDF cost (0.18): literal iteration counts and cost factors below the floor
+KDF_HINTS = ("pbkdf2", "bcrypt", "scrypt", "password_hash")
+_NUM = r"(\d[\d_]*)(?![\d_]|\s*(?:\*|<<|\.\d|[eE]\d))"  # a plain literal, not 2**14 / 1 << 15 / 1e5
+KDF_RULES: tuple[tuple[re.Pattern[str], str, int, frozenset[str]], ...] = (
+    (re.compile(r"\bpbkdf2_hmac\s*\(\s*[^,()]+,[^,()]+(?:\([^()]*\))?[^,()]*,[^,()]+(?:\([^()]*\))?[^,()]*,\s*(?:iterations\s*=\s*)?"
+                + _NUM), "PBKDF2", 100_000, frozenset({"py"})),
+    (re.compile(r"\bPBKDF2HMAC\s*\((?:[^()]|\([^()]*\))*?\biterations\s*=\s*" + _NUM), "PBKDF2", 100_000, frozenset({"py"})),
+    (re.compile(r"\bPBKDF2\s*\((?:[^()]|\([^()]*\))*?\bcount\s*=\s*" + _NUM), "PBKDF2", 100_000, frozenset({"py"})),
+    (re.compile(r"\bpbkdf2(?:Sync)?\s*\(\s*[^,()]+(?:\([^()]*\))?[^,()]*,\s*[^,()]+(?:\([^()]*\))?[^,()]*,\s*" + _NUM),
+     "PBKDF2", 100_000, frozenset({"js"})),
+    (re.compile(r"['\"]PBKDF2['\"](?:[^()]|\([^()]*\)){0,300}?\biterations\s*:\s*" + _NUM), "PBKDF2", 100_000, frozenset({"js"})),
+    (re.compile(r"\bhash_pbkdf2\s*\(\s*[^,()]+,[^,()]+,[^,()]+,\s*" + _NUM), "PBKDF2", 100_000, frozenset({"php"})),
+    (re.compile(r"\bbcrypt\.gensalt\s*\(\s*(?:rounds\s*=\s*)?" + _NUM), "bcrypt", 10, frozenset({"py"})),
+    (re.compile(r"\bbcrypt\w*\s*\.\s*(?:genSalt|genSaltSync)\s*\(\s*" + _NUM), "bcrypt", 10, frozenset({"js"})),
+    (re.compile(r"\bbcrypt\w*\s*\.\s*(?:hash|hashSync)\s*\(\s*[^,()]+(?:\([^()]*\))?[^,()]*,\s*" + _NUM + r"\s*[,)]"),
+     "bcrypt", 10, frozenset({"js"})),
+    (re.compile(r"\bpassword_hash\s*\([^;]*?['\"]cost['\"]\s*=>\s*" + _NUM), "bcrypt", 10, frozenset({"php"})),
+    (re.compile(r"\b(?:hashlib\.scrypt|Scrypt)\s*\((?:[^()]|\([^()]*\))*?\bn\s*=\s*" + _NUM), "scrypt", 16384, frozenset({"py"})),
+    (re.compile(r"\bscrypt(?:Sync)?\s*\((?:[^()]|\([^()]*\))*?\b(?:N|cost)\s*:\s*" + _NUM), "scrypt", 16384, frozenset({"js"})),
+)
+KDF_WHAT = {"PBKDF2": "iterations", "bcrypt": "cost", "scrypt": "N"}
+
+
+def check_crypto(raw: str, lang: str, low: str | None = None) -> list[tuple[str, int, str]]:
+    low = raw.lower() if low is None else low
+    if not any(h in low for h in KDF_HINTS):
+        return []
+    out: list[tuple[str, int, str]] = []
+    for pat, kdf, floor, langs in KDF_RULES:
+        if lang not in langs:
+            continue
+        for m in pat.finditer(raw):
+            value = int(m.group(1).replace("_", ""))
+            if value < floor:
+                out.append(("WEB-WEAK-KDF", _line(raw, m.start()),
+                            f"{kdf} with {KDF_WHAT[kdf]} {value:,} (floor {floor:,})"))
     return out
 
 

@@ -22,9 +22,9 @@ What gets read:
   transactions, allocates nonces or trusts RPC answers, paired with the contract function that verifies
   the signature. Typehash and domain drift, replayable or never-expiring signatures, public signing routes
   and leaked keys land under layer L11.
-* The signature database (Layer 13, ``signatures.py``): 150 named signatures, FG-01..FG-50 and FG-104..FG-125
-  for contracts, FG-51..FG-103 and FG-126..FG-150 for backend code, response headers, dependency manifests,
-  WebSockets, sessions and the bridge, each with a fixed severity, a CWE/SWC reference and a fix example. Matching findings carry the signature id;
+* The signature database (Layer 13, ``signatures.py``): 170 named signatures, FG-01..FG-50, FG-104..FG-125 and
+  FG-151..FG-157 for contracts, FG-51..FG-103, FG-126..FG-150 and FG-158..FG-170 for backend code, response
+  headers, dependency manifests, WebSockets, sessions, cryptography (Layer 18) and the bridge, each with a fixed severity, a CWE/SWC reference and a fix example. Matching findings carry the signature id;
   ``foundryguard.toml`` ``[score]`` can retune severities, ignore paths and limit how deep the walk goes.
 * A URL: one passive GET of the page. The response headers and the HTML/inline scripts it returns are
   checked. Nothing else is requested and nothing is fuzzed against a remote host.
@@ -38,6 +38,7 @@ score at the top, plus ``foundryguard-score.json``.
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as _dt
 import html as _html
 import json
@@ -81,6 +82,8 @@ LAYERS = {
     "L9": "configuration",
     "L10": "fuzzed invariant",
     "L11": "web2-web3 bridge",
+    "L17": "threat intel (dynamic rules)",
+    "L18": "cryptography",
 }
 
 PRESETS = {
@@ -109,7 +112,7 @@ SKIP_DIRS = {".git", "node_modules", "lib", "out", "cache", "broadcast", "venv",
 MAX_FILES = 5000
 MAX_FILE_BYTES = 1_000_000
 MAX_PAGE_BYTES = 2_000_000
-USER_AGENT = "FoundryGuard/0.17 (passive single-page check)"
+USER_AGENT = "FoundryGuard/0.18 (passive single-page check)"
 CONFIG_FILE = "foundryguard.toml"
 SCORE_JSON = "foundryguard-score.json"
 FINDINGS_LOG = "foundryguard-findings.log"
@@ -209,12 +212,34 @@ _STRIP_TOKENS_TPL = re.compile(_STRIP_BASE + r"|(?P<t>`)(?P<tb>(?:\\[\s\S]|[^`\\
 _NOT_NL = re.compile(r"[^\n]")
 
 
+# Scan-scoped memo for strip_comments and parse_solidity. A .sol file is stripped and parsed by the contract
+# rules, the diamond-slot pass and the bridge validator; inside score_path the second and third callers get the
+# first result. Outside a scan (None) nothing is kept, so the memo never outlives the files it was built from.
+_MEMO: dict | None = None
+
+
+def _memo(kind: str, key: tuple, build):
+    memo = _MEMO
+    if memo is None:
+        return build()
+    k = (kind, *key)
+    if k not in memo:
+        memo[k] = build()
+    return memo[k]
+
+
 def strip_comments(text: str, blank_strings: bool = True, templates: bool = False) -> str:
     """Comments (and string contents) replaced by spaces; offsets and newlines are kept.
 
     ``templates`` also treats JavaScript backtick literals as strings, so a ``//`` inside a template (a URL) is not
     taken for a comment.
     """
+    if templates:  # JS line rules only; nothing else asks for this variant, so it is not kept
+        return _strip_comments(text, blank_strings, templates)
+    return _memo("strip", (text, blank_strings), lambda: _strip_comments(text, blank_strings, templates))
+
+
+def _strip_comments(text: str, blank_strings: bool, templates: bool) -> str:
     def sub(m: re.Match) -> str:
         if m.group("c") is not None:
             return _NOT_NL.sub(" ", m.group("c"))
@@ -374,6 +399,10 @@ def _header_tokens(rest: str) -> tuple[str, str, list[str]]:
 
 
 def parse_solidity(clean: str) -> list[SolContract]:
+    return _memo("parse", (clean,), lambda: _parse_solidity(clean))
+
+
+def _parse_solidity(clean: str) -> list[SolContract]:
     contracts: list[SolContract] = []
     pos = 0
     while True:
@@ -1140,6 +1169,182 @@ def solidity_pack16_contract(sf: _SolFile, c: SolContract, add) -> None:
                 return
 
 
+# --------------------------------------------------------------------------- #
+# 0.18 cryptography, contract side (FG-151..FG-157)
+# --------------------------------------------------------------------------- #
+
+TYPEHASH_DEF = re.compile(r"\b([A-Za-z_]\w*)\s*=\s*keccak256\s*\(\s*(?:bytes\s*\(\s*)?(?:abi\.encodePacked\s*\(\s*)?"
+                          r"\"([A-Za-z_]\w*)\(([^\"()]*)\)")
+DOMAIN_VAR = re.compile(r"^_?\w*(DOMAIN_SEPARATOR|[Dd]omainSeparator|DomainSeparator)\w*$")
+CHAINID_CHECK = re.compile(r"block\s*\.\s*chainid\s*(==|!=)|(==|!=)\s*block\s*\.\s*chainid|chainid\s*\(\s*\)\s*(==|!=)|"
+                           r"eq\s*\(\s*chainid\s*\(\s*\)|_cachedChainId|_CACHED_CHAIN_ID|INITIAL_CHAIN_ID|_domainSeparatorV4")
+RECOVER_CALL = re.compile(r"(?<![\w.$])ecrecover\s*\(|\bECDSA\s*\.\s*(?:try)?[Rr]ecover\w*\s*\(|"
+                          r"\bSignatureChecker\s*\.\s*isValidSignatureNow\w*\s*\(|(?<=[\w)\]])\s*\.\s*(?:try)?recover\s*\(")
+SIG_PREFIX = re.compile(r"\\x19|toEthSignedMessageHash|toTypedDataHash|_hashTypedDataV4|hashTypedData|_hashTypedData|"
+                        r"\bEIP712\b|DOMAIN_SEPARATOR|[Dd]omainSeparator|Ethereum Signed Message|isValidSignature\s*\(\s*bytes32")
+REVEAL_FN = re.compile(r"^_?reveal\w*$", re.I)
+MERKLE_VERIFY = re.compile(r"\bMerkleProof\w*\s*\.\s*(verify|verifyCalldata|processProof|processProofCalldata|multiProofVerify\w*)\s*\(")
+KECCAK_ENC = re.compile(r"keccak256\s*\(\s*abi\.encode(Packed)?\s*\(")
+STATIC_32 = re.compile(r"^(address|bool|u?int\d*|bytes([1-9]|[12]\d|3[0-2]))$")
+WORD_32 = re.compile(r"^(u?int(256)?|bytes32)$")
+
+
+def _args_at(text: str, open_paren: int) -> list[str]:
+    close = match_close(text, open_paren, "(", ")")
+    return [a.strip() for a in _split_args_sol(text[open_paren + 1:close])] if close > open_paren else []
+
+
+def _fn_at(c: SolContract, off: int) -> SolFunction | None:
+    for fn in c.functions:
+        if fn.body_start <= off <= fn.body_end:
+            return fn
+    return None
+
+
+def _var_type(sf: _SolFile, c: SolContract, fn: SolFunction | None, name: str) -> str | None:
+    """Declared type of a parameter, local or state variable named ``name`` (None when it cannot be told)."""
+    if name in ("msg.sender", "tx.origin", "address(this)"):
+        return "address"
+    if re.fullmatch(r"\d+", name):
+        return "uint256"
+    if fn is not None:
+        for t, n in fn.params:
+            if n == name:
+                return t
+        m = re.search(rf"(?<![\w.$])([A-Za-z_]\w*(?:\[\d*\])*)\s+(?:memory\s+|calldata\s+|storage\s+)?{re.escape(name)}\s*[=;]",
+                      sf.body(fn))
+        if m and m.group(1) not in ("return", "returns", "delete", "emit"):
+            return m.group(1)
+    meta = c.state_vars.get(name)
+    return meta["type"] if meta else None
+
+
+def solidity_crypto_contract(sf: _SolFile, c: SolContract, add, typehashes: dict[str, tuple[int, list[str]]],
+                             prefixed: bool) -> None:
+    if c.kind in ("interface", "library"):
+        return
+    cname = c.name
+    text = sf.clean[c.start:c.end]
+
+    def hit(rule, title, off, is_line=False):
+        add(rule, signatures.severity(rule), _SIG_LAYER.get(rule, "L18"), title, off,
+            signatures.lookup(rule).mitigation, contract=cname, is_line=is_line)
+
+    # FG-151 domain separator cached at deploy (or a literal chain id inside it)
+    for var in [v for v in c.state_vars if DOMAIN_VAR.match(v)]:
+        for m in re.finditer(rf"(?<![\w.$]){re.escape(var)}\s*=(?!=)\s*", sf.clean[c.start:c.end]):
+            off = c.start + m.end()
+            end = sf.clean.find(";", off)
+            rhs = sf.clean[off:end if end >= 0 else c.end]
+            if "keccak256" not in rhs and not re.search(r"domain", rhs, re.I):
+                continue
+            enc = re.search(r"abi\.encode\s*\(", rhs)
+            literal = [a for a in (_args_at(rhs, enc.end() - 1) if enc else []) if re.fullmatch(r"\d+", a)]
+            if literal:
+                hit("SOL-EIP712-CACHED-DOMAIN", f"`{var}` hard-codes chain id {literal[0]}", c.start + m.start())
+            elif not CHAINID_CHECK.search(sf.clean):
+                hit("SOL-EIP712-CACHED-DOMAIN",
+                    f"`{var}` is computed once and never rebuilt when `block.chainid` changes", c.start + m.start())
+            break
+
+    # FG-152 / FG-153 struct hash against its typehash
+    for name, (nfields, fields) in typehashes.items():
+        for m in re.finditer(rf"\babi\.encode\s*\(\s*{re.escape(name)}\s*[,)]", text):
+            off = c.start + m.start()
+            args = _args_at(sf.clean, c.start + text.index("(", m.start()))
+            if len(args) - 1 != nfields:
+                hit("SOL-EIP712-TYPEHASH-MISMATCH",
+                    f"`{name}` declares {nfields} field(s) but the struct hash encodes {len(args) - 1}", off)
+                continue
+            fn = _fn_at(c, off)
+            for field, arg in zip(fields, args[1:]):
+                ftype = field.split()[0] if field.split() else ""
+                if not (ftype in ("string", "bytes") or ftype.endswith("]")):
+                    continue
+                if "keccak256" in arg or not re.fullmatch(r"[A-Za-z_]\w*", arg):
+                    continue
+                vt = _var_type(sf, c, fn, arg)
+                if vt and (vt in ("string", "bytes") or vt.endswith("]")):
+                    hit("SOL-EIP712-DYNAMIC-UNHASHED",
+                        f"`{field.strip()}` of `{name}` is encoded as the raw `{arg}` instead of its keccak256", off)
+                    break
+
+    for fn in c.functions:
+        if fn.kind == "modifier":
+            continue
+        body = sf.body(fn)
+        b0 = fn.body_start
+        recovers = list(RECOVER_CALL.finditer(body))
+
+        # FG-154 recover over a hash with no EIP-191 / EIP-712 prefix anywhere in the file
+        if recovers and not prefixed:
+            hit("SOL-SIG-UNPREFIXED-HASH", f"`{fn.name}` recovers a signer from a hash with no EIP-191/712 prefix",
+                b0 + recovers[0].start())
+            prefixed = True  # once per file is enough
+
+        # FG-155 digest chosen by the caller
+        if recovers and fn.exposed and fn.state_changing and fn.name != "isValidSignature" \
+                and not _authorized(sf, c, fn):
+            digests = {n for t, n in fn.params if t == "bytes32" and n}
+            for m in recovers:
+                if "isValidSignatureNow" in m.group(0):
+                    args = _args_at(body, m.end() - 1)
+                    first = args[1] if len(args) > 1 else ""
+                elif m.group(0).lstrip().startswith("."):
+                    recv = re.search(r"([A-Za-z_]\w*)\s*$", body[:m.start()])
+                    first = recv.group(1) if recv else ""
+                else:
+                    args = _args_at(body, m.end() - 1)
+                    first = args[0] if args else ""
+                inner = re.fullmatch(r"(?:[\w.]*toEthSignedMessageHash\s*\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*)"
+                                     r"(?:\s*\.\s*toEthSignedMessageHash\s*\(\s*\))?)", first)
+                p = inner and (inner.group(1) or inner.group(2))
+                if p in digests and not re.search(rf"(?<![\w.$]){re.escape(p)}\s*(==|!=|=(?!=))|(==|!=)\s*{re.escape(p)}\b",
+                                                  body):
+                    hit("SOL-SIG-CALLER-DIGEST", f"`{fn.name}` verifies a signature over `{p}`, which the caller passes in",
+                        b0 + m.start())
+                    break
+
+        # FG-156 commit-reveal without the sender in the hash
+        if REVEAL_FN.match(fn.name) and fn.state_changing and re.search(r"commit", text, re.I):
+            addr_params = {n for t, n in fn.params if t == "address" and n}
+            hashes = list(KECCAK_ENC.finditer(body)) + list(re.finditer(r"keccak256\s*\(", body))
+            if hashes:
+                spans = [body[h.start():match_close(body, body.index("(", h.start()), "(", ")") + 1] for h in hashes]
+                bound = any(re.search(r"msg\.sender|_msgSender\s*\(", sp) or
+                            any(re.search(rf"(?<![\w.$]){re.escape(a)}\b", sp) for a in addr_params) for sp in spans)
+                if not bound and re.search(r"==|!=|\[", body):
+                    hit("SOL-COMMIT-NO-SENDER", f"`{fn.name}` checks a commitment hash that does not include the sender",
+                        b0 + hashes[0].start())
+
+        # FG-157 single-hashed 64-byte Merkle leaf
+        if MERKLE_VERIFY.search(body):
+            for m in KECCAK_ENC.finditer(body):
+                if re.search(r"(concat|keccak256|encodePacked|encode)\s*\(\s*$", body[:m.start()]):
+                    continue  # inner hash of a double-hashed leaf
+                args = _args_at(body, m.end() - 1)
+                if len(args) != 2:
+                    continue
+                types = [_var_type(sf, c, fn, a) for a in args]
+                ok = WORD_32 if m.group(1) else STATIC_32
+                if all(t and ok.match(t) for t in types):
+                    hit("SOL-MERKLE-LEAF-64", f"`{fn.name}` hashes the Merkle leaf once over 64 bytes "
+                        f"({', '.join(types)})", b0 + m.start())
+                    break
+
+
+def crypto_file_context(sf: _SolFile) -> tuple[dict[str, tuple[int, list[str]]], bool]:
+    """Typehash constants of the file ({name: (field count, fields)}) and whether any signature prefix is used."""
+    keep = strip_comments(sf.raw, blank_strings=False)
+    typehashes: dict[str, tuple[int, list[str]]] = {}
+    for m in TYPEHASH_DEF.finditer(keep):
+        if m.group(2) == "EIP712Domain":
+            continue
+        fields = [f.strip() for f in m.group(3).split(",") if f.strip()]
+        typehashes[m.group(1)] = (len(fields), fields)
+    return typehashes, bool(SIG_PREFIX.search(keep))
+
+
 _SIG_LAYER = {
     "SOL-READONLY-REENTRANCY": "L4", "SOL-TWAP-SHORT-WINDOW": "L4", "SOL-ORACLE-BAD-PRICE": "L1",
     "SOL-IMPL-NOT-DISABLED": "L2", "SOL-UUPS-NO-AUTH": "L2", "SOL-PROXY-STORAGE-COLLISION": "L4",
@@ -1155,6 +1360,10 @@ _SIG_LAYER = {
     "SOL-ARRAY-LENGTH-MISMATCH": "L1", "SOL-SUPPLY-DRIFT": "L4", "SOL-NFT-APPROVAL-STALE": "L2",
     "SOL-REWARD-CLAIM-NO-RESET": "L4", "SOL-REWARD-PERIOD-OVERWRITE": "L4", "SOL-LOCK-GRIEFING": "L2",
     "SOL-VESTING-OVERRUN": "L4", "SOL-RECEIVER-ANY-TOKEN": "L2", "SOL-EMERGENCY-PAUSED": "L9",
+    # 0.18 cryptography
+    "SOL-EIP712-CACHED-DOMAIN": "L18", "SOL-EIP712-TYPEHASH-MISMATCH": "L18", "SOL-EIP712-DYNAMIC-UNHASHED": "L18",
+    "SOL-SIG-UNPREFIXED-HASH": "L18", "SOL-SIG-CALLER-DIGEST": "L18", "SOL-COMMIT-NO-SENDER": "L18",
+    "SOL-MERKLE-LEAF-64": "L18",
 }
 
 
@@ -1175,6 +1384,7 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
             "Pin the compiler version you tested with (e.g. `pragma solidity 0.8.24;`).", is_line=True)
 
     inherited = _inherited_names(sf)
+    typehashes, prefixed = crypto_file_context(sf)
     nft_only = bool(re.search(r"\bI?ERC(721|1155)\w*", sf.clean)) and not re.search(r"\bI?ERC20\w*|SafeERC20", sf.clean)
     for c in sf.contracts:
         if c.kind == "interface":
@@ -1395,6 +1605,8 @@ def check_solidity(rel: str, raw: str, presets: frozenset[int]) -> tuple[list[Fi
 
         solidity_pack_contract(sf, c, add, inherited)
         solidity_pack16_contract(sf, c, add)
+        solidity_crypto_contract(sf, c, add, typehashes, prefixed)
+        prefixed = prefixed or any(f.rule == "SOL-SIG-UNPREFIXED-HASH" for f in out)
 
         # Preset 05: tstore slots never written back to zero
         stores: dict[str, list[tuple[int, str]]] = {}
@@ -1544,9 +1756,11 @@ LINE_RULES: tuple[LineRule, ...] = (
              "Compare with `hmac.compare_digest` / `crypto.timingSafeEqual` / `hash_equals`.", frozenset({PY, JS, PHP}),
              unless=_r(r"compare_digest|timingSafeEqual|hash_equals|secure_compare|constantTimeEq|safeCompare")),
     LineRule("WEB-TOKEN-ENTROPY", "MEDIUM", "L7", "Token with too little entropy",
-             _r(r"secrets\.token_(hex|bytes|urlsafe)\s*\(\s*([1-9]|1[0-5])\s*\)|randomBytes\s*\(\s*([1-9]|1[0-5])\s*\)|"
+             # a 12-byte GCM / ChaCha nonce or an 8-byte CTR nonce is the right size, not a short token
+             _r(r"^(?!.*\b(?:iv|IV|nonce|NONCE|Nonce)\w*\s*[:=](?!=)).*?(?:"
+                r"secrets\.token_(hex|bytes|urlsafe)\s*\(\s*([1-9]|1[0-5])\s*\)|randomBytes\s*\(\s*([1-9]|1[0-5])\s*\)|"
                 r"random_bytes\s*\(\s*([1-9]|1[0-5])\s*\)|\buuid\.?uuid1\s*\(|"
-                r"\buuidv1\s*\(|\buuid\.v1\s*\(|\buniqid\s*\(|Date\.now\(\)\.toString\(\s*36\s*\)|str\(\s*time\.time\(\)\s*\)"),
+                r"\buuidv1\s*\(|\buuid\.v1\s*\(|\buniqid\s*\(|Date\.now\(\)\.toString\(\s*36\s*\)|str\(\s*time\.time\(\)\s*\))"),
              "Use 16+ random bytes from a CSPRNG (`secrets.token_urlsafe(32)`).", WEB, needs=SECRET_TERMS),
     LineRule("WEB-COOKIE-INSECURE", "MEDIUM", "L7", "Session cookie flags switched off",
              _r(r"SESSION_COOKIE_(SECURE|HTTPONLY)\s*=\s*False|httpOnly\s*:\s*false|\bsecure\s*:\s*false|"
@@ -1694,6 +1908,84 @@ LINE_RULES: tuple[LineRule, ...] = (
     LineRule("WEB-WS-PLAINTEXT", "MEDIUM", "L8", "WebSocket over plain ws://",
              _r(r"['\"`]ws://(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])"),
              "Use wss:// for every non-local socket.", WEB),
+    # 0.18 cryptography (FG-158..FG-170, FG-163 WEB-WEAK-KDF is in signatures.check_crypto)
+    LineRule("WEB-CIPHER-ECB", "HIGH", "L18", "Block cipher in ECB mode",
+             _r(r"\bMODE_ECB\b|\bmodes\.ECB\s*\(|\bmode\s*:\s*CryptoJS\.mode\.ECB\b|['\"`](?:aes|des|des-ede3?|bf|camellia|sm4|aria)"
+                r"(?:-\d+)?-ecb['\"`]|['\"`]AES/ECB/", re.I),
+             "Use AES-GCM or ChaCha20-Poly1305 with a random nonce per message.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-STATIC-IV", "HIGH", "L18", "Constant IV or nonce",
+             _r(r"create(?:Cipher|Decipher)iv\s*\([^,]+,[^,]+,\s*(?:['\"`]|Buffer\.(?:alloc|from)\s*\(\s*(?:\d|['\"`\[])|"
+                r"new\s+Uint8Array\s*\(\s*\d)|"
+                r"\bAES\.new\s*\([^,]+,\s*AES\.MODE_\w+\s*,\s*(?:iv\s*=\s*|nonce\s*=\s*)?(?:b['\"]|bytes\s*\(\s*\d|bytearray\s*\(\s*\d)|"
+                r"\bmodes\.(?:CBC|GCM|CTR|CFB8?|OFB)\s*\(\s*(?:b['\"]|bytes\s*\(\s*\d|bytearray\s*\(\s*\d)|"
+                r"\b(?:AESGCM|ChaCha20Poly1305|AESCCM|AESOCB3)\s*\([^)]*\)\s*\.\s*(?:en|de)crypt\s*\(\s*b['\"]|"
+                r"(?<![\w.$])(?:iv|IV|nonce|NONCE|_iv|init_vector|initVector|INIT_VECTOR)\s*[:=]\s*(?:b['\"][^'\"]{8,}['\"]|"
+                r"bytes\s*\(\s*\d+\s*\)|b['\"]\\x00['\"]\s*\*\s*\d+|Buffer\.alloc\s*\(\s*\d+\s*\)|new\s+Uint8Array\s*\(\s*\d+\s*\)|"
+                r"Buffer\.from\s*\(\s*['\"`][^'\"`]{8,}['\"`]|CryptoJS\.enc\.\w+\.parse\s*\(\s*['\"`])|"
+                r"\b(?:const|let|var)\s+(?:iv|IV|nonce|initVector)\s*=\s*['\"`][^'\"`]{8,}['\"`]"),
+             "Generate a fresh random IV/nonce for every message and store it with the ciphertext.", frozenset({PY, JS})),
+    LineRule("WEB-HARDCODED-CRYPTO-KEY", "CRITICAL", "L18", "Cipher or HMAC key is a literal",
+             _r(r"create(?:Cipher|Decipher)iv\s*\(\s*[^,]+,\s*(?:['\"`][^'\"`]+['\"`]|Buffer\.from\s*\(\s*['\"`])|"
+                r"\bcreateHmac\s*\(\s*['\"`][\w-]+['\"`]\s*,\s*['\"`][^'\"`]+['\"`]|"
+                r"\bAES\.new\s*\(\s*b?['\"]|\b(?:Fernet|AESGCM|ChaCha20Poly1305|AESCCM|AESOCB3)\s*\(\s*b?['\"]|"
+                r"\bhmac\.new\s*\(\s*b?['\"]|\balgorithms\.(?:AES|ChaCha20|TripleDES|Camellia)\s*\(\s*b['\"]|"
+                r"CryptoJS\.(?:AES|DES|TripleDES|Rabbit|RC4)\.(?:en|de)crypt\s*\([^,]+,\s*['\"`]|CryptoJS\.Hmac\w+\s*\([^,]+,\s*['\"`]|"
+                r"\bopenssl_(?:en|de)crypt\s*\([^,]+,[^,]+,\s*['\"]|\bhash_hmac\s*\(\s*['\"]\w+['\"]\s*,[^,]+,\s*['\"]"),
+             "Load the key from a secret store or the environment and rotate the one in the code.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-WEAK-CIPHER", "HIGH", "L18", "Broken or legacy cipher",
+             _r(r"\b(?:DES3?|ARC4|ARC2|Blowfish|CAST)\.new\s*\(|\balgorithms\.(?:TripleDES|ARC4|Blowfish|CAST5|IDEA|SEED)\s*\(|"
+                r"create(?:Cipher|Decipher)(?:iv)?\s*\(\s*['\"`](?:des|des3|des-ede|des-ede3|des-ede-cbc|des-ede3-cbc|des-cbc|"
+                r"des-ecb|rc4|rc4-40|rc2|rc2-cbc|rc2-40-cbc|bf|bf-cbc|bf-ecb|blowfish|cast5?-cbc|idea|idea-cbc|seed|seed-cbc)['\"`]|"
+                r"CryptoJS\.(?:DES|TripleDES|RC4|RC4Drop)\.|"
+                r"\bopenssl_(?:en|de)crypt\s*\([^,]+,\s*['\"](?:des|rc4|rc2|bf|blowfish|cast5|idea|seed)[-'\"]|\bmcrypt_\w+\s*\(", re.I),
+             "Switch to AES-GCM or ChaCha20-Poly1305.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-CREATECIPHER-NO-IV", "HIGH", "L18", "crypto.createCipher derives the key with MD5 and uses no IV",
+             _r(r"\bcreate(?:Cipher|Decipher)\s*\("),
+             "Use createCipheriv with a scrypt-derived key and a random IV.", frozenset({JS})),
+    LineRule("WEB-PASSWORD-FAST-HASH", "HIGH", "L18", "Password hashed with a fast digest",
+             _r(r"(?:\bhashlib\.(?:md5|sha1|sha224|sha256|sha384|sha512|sha3_\d+|blake2[bs])\s*\(|\bhashlib\.new\s*\(\s*['\"]\w+['\"]\s*,|"
+                r"\bcreateHash\s*\(\s*['\"`][\w-]+['\"`]\s*\)\s*\.\s*update\s*\(|\bCryptoJS\.(?:MD5|SHA1|SHA224|SHA256|SHA384|SHA512|SHA3)\s*\(|"
+                r"(?<![\w>$:])(?:md5|sha1)\s*\(|\bhash\s*\(\s*['\"][\w/-]+['\"]\s*,)"
+                r"(?:[^()\n]|\([^()\n]*\))*?(?:\([^()\n]*?)?(?i:pass(?:word|wd|phrase)|\bpwd\b)(?![\w]*(?:[Rr]eset|[Tt]oken|_?[Hh]ash|[Ll]ink|RESET|TOKEN|HASH))"),
+             "Hash passwords with argon2id, scrypt or bcrypt.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-UNAUTHENTICATED-ENCRYPTION", "MEDIUM", "L18", "CBC/CTR encryption with no MAC in the file",
+             _r(r"\bMODE_(?:CBC|CTR|CFB|OFB)\b|\bmodes\.(?:CBC|CTR|CFB8?|OFB)\s*\(|['\"`]aes-(?:128|192|256)-(?:cbc|ctr|cfb8?|ofb)['\"`]|"
+                r"\bmode\s*:\s*CryptoJS\.mode\.(?:CBC|CTR|CFB|OFB)\b", re.I),
+             "Use an AEAD mode, or HMAC the IV and ciphertext and verify before decrypting.", frozenset({PY, JS, PHP}),
+             unless=_r(r"hmac|compare_digest|timingSafeEqual|AuthTag|gcm|Poly1305|Fernet|hash_equals|\bmac\b|\.sign\s*\(", re.I)),
+    LineRule("WEB-RSA-WEAK-KEY", "HIGH", "L18", "RSA/DSA key under 2048 bits",
+             _r(r"\([^)]*\bkey_size\s*=\s*(?:512|768|1024|1536)\b|\bmodulusLength\s*:\s*(?:512|768|1024|1536)\b|"
+                r"\b(?:RSA|DSA)\.generate\s*\(\s*(?:512|768|1024|1536)\b|\brsa\.newkeys\s*\(\s*(?:512|768|1024|1536)\b|"
+                r"private_key_bits['\"]?\s*=>\s*(?:512|768|1024|1536)\b|"
+                r"\bgenerate_private_key\s*\(\s*(?:65537|3)\s*,\s*(?:512|768|1024|1536)\b|"
+                r"\bpki\.rsa\.generateKeyPair\s*\(\s*(?:\{\s*bits\s*:\s*)?(?:512|768|1024|1536)\b"),
+             "Use 3072-bit RSA (2048 minimum) or Ed25519 / P-256.", frozenset({PY, JS, PHP})),
+    LineRule("WEB-RSA-PKCS1V15-ENCRYPT", "MEDIUM", "L18", "RSA encryption with PKCS#1 v1.5 padding",
+             _r(r"\.(?:en|de)crypt\s*\([^)]*padding\.PKCS1v15\s*\(|\b(?:public|private)(?:En|De)crypt\s*\([^)]*RSA_PKCS1_PADDING\b|"
+                r"\bpadding\s*:\s*(?:crypto\.)?constants\.RSA_PKCS1_PADDING\b|"
+                r"\bopenssl_(?:public|private)_(?:en|de)crypt\s*\((?![^)]*OAEP)[^)]*\)|"
+                r"\.(?:en|de)crypt\s*\([^)]*['\"`]RSAES-PKCS1-V1_5['\"`]|\bfrom\s+Crypto(?:dome)?\.Cipher\s+import\s+[^\n]*\bPKCS1_v1_5\b"),
+             "Encrypt with RSA-OAEP (SHA-256).", frozenset({PY, JS, PHP})),
+    LineRule("WEB-JWT-ALG-CONFUSION", "HIGH", "L18", "JWT verify accepts HMAC and public-key algorithms together",
+             _r(r"\balgorithms\s*[:=]\s*\[[^\]]*['\"]HS\d{3}['\"][^\]]*['\"](?:RS|ES|PS)\d{3}['\"]|"
+                r"\balgorithms\s*[:=]\s*\[[^\]]*['\"](?:RS|ES|PS)\d{3}['\"][^\]]*['\"]HS\d{3}['\"]|"
+                r"\balgorithms\s*=\s*(?:jwt\.)?(?:algorithms\.)?get_default_algorithms\s*\(|\balgorithms\s*=\s*ALGORITHMS\.(?:SUPPORTED|ALL)\b"),
+             "Pin one algorithm per key: `algorithms: [\"RS256\"]`.", frozenset({PY, JS})),
+    LineRule("WEB-JWT-DECODE-ONLY", "HIGH", "L18", "JWT claims read with decode() and never verified",
+             _r(r"\bjwt\.decode\s*\(|\bjwtDecode\s*\(|\bdecodeJwt\s*\(|\bjwt_decode\s*\("), "Verify with jwt.verify / jwtVerify.",
+             frozenset({JS}), needs=_r(r"\breq\.|\brequest\.|\bexpress\b|\brouter\.|\bfastify\b|\bkoa\b|NextRequest|NextResponse|\bctx\.request"),
+             unless=_r(r"\bjwt\.verify\s*\(|\bjwtVerify\s*\(|\bverifyJwt\w*\s*\(|\bverifyToken\w*\s*\(|\bexpressjwt\b|express-jwt|\bpassport\b", re.I)),
+    LineRule("WEB-JWT-DECODE-ONLY", "HIGH", "L18", "JWT claims read without verifying the signature",
+             _r(r"\bget_unverified_claims\s*\("), "Verify with jwt.decode(token, key, algorithms=[...]).",
+             frozenset({PY}), unless=_r(r"\bjwt\.decode\s*\([^)\n]*\balgorithms\s*=")),
+    LineRule("WEB-LEGACY-TLS", "MEDIUM", "L18", "Legacy TLS version or weak cipher suite allowed",
+             _r(r"\bPROTOCOL_(?:SSLv2|SSLv3|TLSv1|TLSv1_1)\b|\bTLSVersion\.(?:SSLv3|TLSv1|TLSv1_1)\b|"
+                r"\bminVersion\s*:\s*['\"`]TLSv1(?:\.1)?['\"`]|\bsecureProtocol\s*:\s*['\"`](?:SSLv2|SSLv3|TLSv1|TLSv1_1)_method['\"`]|"
+                r"\bciphers\s*[:=]\s*['\"`][^'\"`]*(?<![!\w-])(?:NULL|EXPORT|RC4|aNULL|eNULL)\b|"
+                r"\bset_ciphers\s*\(\s*['\"][^'\"]*(?<![!\w-])(?:NULL|EXPORT|RC4|aNULL|eNULL)\b|"
+                r"CURLOPT_SSLVERSION\s*,\s*(?:CURL_SSLVERSION_(?:SSLv2|SSLv3|TLSv1_0|TLSv1_1|TLSv1)\b|[123]\s*\))|"
+                r"STREAM_CRYPTO_METHOD_(?:SSLv3|TLSv1_0|TLSv1_1)_CLIENT"),
+             "Require TLS 1.2+ and keep the default cipher list.", frozenset({PY, JS, PHP})),
 )
 
 
@@ -1704,7 +1996,7 @@ def _lang(path: str) -> str | None:
 
 FILE_RULE_LAYER = {"WEB-BODY-LIMIT": "L9", "WEB-RATE-LIMIT": "L2", "WEB-SSRF": "L6", "WEB-IDOR": "L2",
                    "WEB-COOKIE-INSECURE": "L7", "WEB-XXE": "L6", "WEB-NO-HEADERS-MW": "L9", "WEB-VULN-DEPENDENCY": "L9",
-                   "WEB-SESSION-COOKIE-CONFIG": "L7", "WEB-JWT-NO-EXPIRY": "L7"}
+                   "WEB-SESSION-COOKIE-CONFIG": "L7", "WEB-JWT-NO-EXPIRY": "L7", "WEB-WEAK-KDF": "L18"}
 
 
 def check_manifest(rel: str, raw: str) -> list[Finding]:
@@ -1776,12 +2068,29 @@ LINE_HINTS: dict[str, tuple[str, ...]] = {
     "WEB-ERROR-LEAK": ("res.", "traceback", "str", "repr", "getmessage"),
     "WEB-CORS-REFLECT": ("origin",),
     "WEB-WS-PLAINTEXT": ("ws://",),
+    # 0.18
+    "WEB-CIPHER-ECB": ("ecb",),
+    "WEB-STATIC-IV": ("createcipheriv", "createdecipheriv", "aes.new", "modes.", "encrypt", "decrypt", "iv", "nonce", "init"),
+    "WEB-HARDCODED-CRYPTO-KEY": ("createcipheriv", "createdecipheriv", "createhmac", "aes.new", "fernet", "aesgcm",
+                                 "chacha20poly1305", "aesccm", "aesocb3", "hmac.new", "algorithms.", "cryptojs",
+                                 "openssl_", "hash_hmac"),
+    "WEB-WEAK-CIPHER": ("des", "rc4", "arc4", "arc2", "rc2", "blowfish", "cast", "idea", "seed", "bf", "mcrypt_"),
+    "WEB-CREATECIPHER-NO-IV": ("createcipher", "createdecipher"),
+    "WEB-PASSWORD-FAST-HASH": ("pass", "pwd"),
+    "WEB-UNAUTHENTICATED-ENCRYPTION": ("cbc", "ctr", "cfb", "ofb"),
+    "WEB-RSA-WEAK-KEY": ("key_size", "moduluslength", "rsa.generate", "dsa.generate", "newkeys", "private_key_bits",
+                         "generate_private_key", "generatekeypair"),
+    "WEB-RSA-PKCS1V15-ENCRYPT": ("pkcs1", "openssl_public", "openssl_private"),
+    "WEB-JWT-ALG-CONFUSION": ("algorithms",),
+    "WEB-JWT-DECODE-ONLY": ("decode", "get_unverified_claims"),
+    "WEB-LEGACY-TLS": ("protocol_", "tlsversion", "minversion", "secureprotocol", "ciphers", "curlopt_sslversion",
+                       "stream_crypto_method"),
 }
 _PY_COMMENT = re.compile(r"(^|\s)#.*$")
 LINE_MAX = 4000  # longer lines (minified bundles) are not matched line by line
 
 
-def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
+def check_text(rel: str, raw: str, lang: str, low: str | None = None) -> list[Finding]:
     lines = raw.splitlines()
     # Strip comments for C-like and Python sources so commented-out code does not count.
     if lang == PY:
@@ -1790,25 +2099,67 @@ def check_text(rel: str, raw: str, lang: str) -> list[Finding]:
         clean_lines = strip_comments(raw, blank_strings=False, templates=True).splitlines()
     else:
         clean_lines = lines
-    low = raw.lower()
+    low = raw.lower() if low is None else low
     out: list[Finding] = []
+    # File-level `needs` / `unless` patterns scan the whole file, which costs more than the line pass for most
+    # rules, so they run only once a line has matched, and each pattern runs at most once per file.
+    file_hit: dict[int, bool] = {}
+
+    def in_file(pat: re.Pattern[str]) -> bool:
+        k = id(pat)
+        if k not in file_hit:
+            file_hit[k] = pat.search(raw) is not None
+        return file_hit[k]
+
+    # Every match of a hinted rule contains one of its hints on the same line, so only the lines that hold a hint
+    # are handed to the regex. They are found with str.find over the lowercased text, which skips most lines of
+    # a file in C instead of calling the regex once per line.
+    joined = ""
+    starts: list[int] = []
+    n_clean = len(clean_lines)
+
+    def candidate_lines(hints: tuple[str, ...]) -> list[int]:
+        nonlocal joined
+        if not starts:
+            low_lines = low.splitlines()
+            joined = "\n".join(low_lines)
+            pos = 0
+            for ln in low_lines:
+                starts.append(pos)
+                pos += len(ln) + 1
+            if not starts:
+                starts.append(0)
+        found: set[int] = set()
+        last = len(starts)
+        for h in hints:
+            i = joined.find(h)
+            while i != -1:
+                n = bisect.bisect_right(starts, i)  # 1-based line number
+                found.add(n)
+                if n >= last:
+                    break
+                i = joined.find(h, starts[n])
+        return sorted(n for n in found if n <= n_clean)
+
+    every_line = range(1, n_clean + 1)
     for rule in LINE_RULES:
         if lang not in rule.langs:
-            continue
-        if rule.needs and not rule.needs.search(raw):
-            continue
-        if rule.unless and rule.unless.search(raw):
             continue
         hints = LINE_HINTS.get(rule.rule)
         if hints and not any(h in low for h in hints):
             continue
         search = rule.pattern.search
-        for i, ln in enumerate(clean_lines, 1):
-            if len(ln) > LINE_MAX:
-                continue
-            if search(ln):
-                out.append(Finding(rule.rule, rule.severity, rule.layer, rule.title, rel, i, snippet(lines, i),
-                                   rule.mitigation))
+        hit_lines = [i for i in (candidate_lines(hints) if hints else every_line)
+                     if len(clean_lines[i - 1]) <= LINE_MAX and search(clean_lines[i - 1])]
+        if not hit_lines:
+            continue
+        if rule.needs and not in_file(rule.needs):
+            continue
+        if rule.unless and in_file(rule.unless):
+            continue
+        for i in hit_lines:
+            out.append(Finding(rule.rule, rule.severity, rule.layer, rule.title, rel, i, snippet(lines, i),
+                               rule.mitigation))
     for rule, ln, title in signatures.check_backend(raw, lang) + signatures.missing_security_headers(raw, lang):
         sig = signatures.lookup(rule)
         out.append(Finding(rule, sig.severity, FILE_RULE_LAYER.get(rule, "L2"), title, rel, ln,
@@ -2093,6 +2444,18 @@ def iter_sources(files: Iterable[Path], notes: list[str], limit: int = MAX_FILE_
 
 def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanConfig | None = None
                ) -> tuple[ScoreResult, dict[str, list[SolContract]]]:
+    global _MEMO
+    outer = _MEMO
+    if outer is None:
+        _MEMO = {}
+    try:
+        return _score_path(target, presets, config)
+    finally:
+        _MEMO = outer
+
+
+def _score_path(target: Path, presets: Iterable[int], config: ScanConfig | None
+                ) -> tuple[ScoreResult, dict[str, list[SolContract]]]:
     if __package__:
         from . import web_surface
     else:
@@ -2115,15 +2478,17 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
     for p, raw in iter_sources(files, notes):
         rel = p.relative_to(base).as_posix() if p != base else p.name
         lines += raw.count("\n") + 1
-        limiter_seen = limiter_seen or (p.suffix.lower() not in SOL_EXT and signatures.limiter_present(raw))
-        headers_seen = headers_seen or (p.suffix.lower() not in SOL_EXT and signatures.headers_present(raw))
+        low = raw.lower()
+        is_sol = p.suffix.lower() in SOL_EXT
+        limiter_seen = limiter_seen or (not is_sol and signatures.limiter_present(raw, low))
+        headers_seen = headers_seen or (not is_sol and signatures.headers_present(raw, low))
         if is_manifest(p.name):
             kinds.add("web")
             findings += check_manifest(rel, raw)
             continue
-        if web_surface.relevant(rel, raw):
+        if web_surface.relevant(rel, raw, low):
             bridge_sources.append((rel, raw))
-        if p.suffix.lower() in SOL_EXT:
+        if is_sol:
             sol_sources.append((rel, raw))
             kinds.add("solidity")
             f, contracts = check_solidity(rel, raw, presets)
@@ -2133,7 +2498,7 @@ def score_path(target: Path, presets: Iterable[int] = ALL_PRESETS, config: ScanC
             lang = _lang(p.name)
             if lang:
                 kinds.add("web")
-                findings += check_text(rel, raw, lang) + check_dynamic(rel, raw, lang)
+                findings += check_text(rel, raw, lang, low) + check_dynamic(rel, raw, lang)
     if not files:
         notes.append("no .sol/.py/.js/.ts/.html/.php files found (test, lib and node_modules dirs are skipped)")
     bridge = None
@@ -2436,7 +2801,8 @@ def _id_ranges(sigs) -> str:
             runs[-1][1] = n
         else:
             runs.append([n, n])
-    return " and ".join(f"FG-{a:02d} to FG-{b:02d}" for a, b in runs)
+    parts = [f"FG-{a:02d} to FG-{b:02d}" for a, b in runs]
+    return ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else "".join(parts)
 
 
 def signature_section(findings: list[Finding]) -> list[str]:

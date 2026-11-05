@@ -1,6 +1,6 @@
 """Layer 17: threat intelligence sync.
 
-Pulls extra detection data from public feeds and adds it to the running scanner, next to the 150 built-in
+Pulls extra detection data from public feeds and adds it to the running scanner, next to the 170 built-in
 signatures in ``signatures.py``. Nothing is written into the source tree: the merged data lives in memory and
 in a local cache file, so the hardcoded database stays exactly as shipped.
 
@@ -23,7 +23,7 @@ Every fetched entry is checked before it is used, and anything that fails is dro
 * an advisory needs an id, a package, an ecosystem FoundryGuard reads (npm, PyPI) and a numeric range.
 
 When the network is down the last good sync is read back from the cache (and re-checked the same way). With
-neither, the scanner runs on the 150 built-in signatures alone. Remote data is only ever parsed as JSON and
+neither, the scanner runs on the 170 built-in signatures alone. Remote data is only ever parsed as JSON and
 compiled as a regex; it is never executed.
 
 foundryguard.toml::

@@ -1,4 +1,4 @@
-"""Signature database (103 in 0.15, 150 since 0.16): catalog shape, one sample per signature that must match, a fixed form that must not,
+"""Signature database (103 in 0.15, 150 in 0.16, 170 since 0.18): catalog shape, one sample per signature that must match, a fixed form that must not,
 and the report.
 
 Samples live in fixtures/ultrapack/weak (one file or folder per signature, named fgNN_*), their fixed forms in
@@ -57,14 +57,14 @@ def _http_findings() -> list:
 
 
 class CatalogTests(unittest.TestCase):
-    def test_150_signatures_split_72_78(self):
+    def test_170_signatures_split_79_91(self):
         sigs = signatures.SIGNATURES
-        self.assertEqual(len(sigs), 150)
-        self.assertEqual([s.id for s in sigs], [f"FG-{i:02d}" for i in range(1, 151)])
-        self.assertEqual(sum(s.surface == "web3" for s in sigs), 72)
-        self.assertEqual(sum(s.surface == "web2" for s in sigs), 78)
+        self.assertEqual(len(sigs), 170)
+        self.assertEqual([s.id for s in sigs], [f"FG-{i:02d}" for i in range(1, 171)])
+        self.assertEqual(sum(s.surface == "web3" for s in sigs), 79)
+        self.assertEqual(sum(s.surface == "web2" for s in sigs), 91)
         self.assertEqual({s.id for s in sigs if s.surface == "web3"},
-                         {f"FG-{i:02d}" for i in (*range(1, 51), *range(104, 126))})
+                         {f"FG-{i:02d}" for i in (*range(1, 51), *range(104, 126), *range(151, 158))})
         self.assertTrue(all(s.stack == "solidity" for s in sigs if s.surface == "web3"))
         self.assertFalse([s.id for s in sigs if s.surface == "web2" and s.stack == "solidity"])
 
@@ -202,18 +202,18 @@ library B { bytes32 constant IMPLEMENTATION = keccak256("eip1967.proxy.implement
 
 
 class ReportTests(unittest.TestCase):
-    def test_report_lists_all_150_and_the_matched_ones_with_fixes(self):
+    def test_report_lists_all_170_and_the_matched_ones_with_fixes(self):
         with tempfile.TemporaryDirectory() as d:
             result, page = scoring.simulate(str(PACK / "weak"), run_forge=False, out_dir=d)
             html = page.read_text()
             log = (Path(d) / scoring.FINDINGS_LOG).read_text()
         rows = re.findall(r'<tr class="sigrow( hit)?"><td>(FG-\d\d+)</td>', html)
-        self.assertEqual(len(rows), 150)
+        self.assertEqual(len(rows), 170)
         by_surface = [s.id for s in signatures.SIGNATURES if s.surface == "web3"] + \
                      [s.id for s in signatures.SIGNATURES if s.surface == "web2"]
         self.assertEqual([r[1] for r in rows], by_surface)
-        self.assertIn("Contract surface, FG-01 to FG-50 and FG-104 to FG-125", html)
-        self.assertIn("Web surface, FG-51 to FG-103 and FG-126 to FG-150", html)
+        self.assertIn("Contract surface, FG-01 to FG-50, FG-104 to FG-125 and FG-151 to FG-157", html)
+        self.assertIn("Web surface, FG-51 to FG-103, FG-126 to FG-150 and FG-158 to FG-170", html)
         self.assertIn("[CRITICAL] FG-116 SOL-NFT-UNSTAKE-ANY fg116_nft_unstake_any.sol:", log)
         self.assertIn("<h3>Matched</h3>", html)
         for fg in ("FG-10", "FG-24", "FG-62", "FG-90"):

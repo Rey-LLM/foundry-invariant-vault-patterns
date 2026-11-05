@@ -159,12 +159,12 @@ class SyncTests(IntelCase):
         self.assertEqual(res.source, "network")
         self.assertGreaterEqual(len(res.rules), 5)
         self.assertEqual(len(res.advisories), 2)
-        self.assertEqual(res.label(), f"Signatures: 150 hardcoded + {res.dynamic} dynamic verified")
+        self.assertEqual(res.label(), f"Signatures: {len(signatures.SIGNATURES)} hardcoded + {res.dynamic} dynamic verified")
         self.assertIs(intel_sync.status(), res)
         self.assertTrue(self.cache.is_file())
         self.assertEqual(len(signatures.DYNAMIC_RULES), len(res.rules))
         # the built-in catalog is untouched
-        self.assertEqual(len(signatures.SIGNATURES), 150)
+        self.assertEqual(len(signatures.SIGNATURES), 170)
         self.assertNotIn("FGX-SWC-129", signatures.BY_ID)
 
     def test_offline_falls_back_to_cache_then_to_builtin(self):
@@ -392,13 +392,13 @@ class GuiIntelTests(IntelCase):
             self.skipTest("Tk not available")
         try:
             app = gui.App(root, "")
-            self.assertEqual(app.intel_var.get(), "Signatures: 150 hardcoded")
+            self.assertEqual(app.intel_var.get(), f"Signatures: {len(signatures.SIGNATURES)} hardcoded")
             app.start_intel_sync(self.cfg(osv=False), Fetcher(), self.cache)
             deadline = time.time() + 10
             while "dynamic verified" not in app.intel_var.get() and time.time() < deadline:
                 root.update()
                 time.sleep(0.02)
-            self.assertRegex(app.intel_var.get(), r"^Signatures: 150 hardcoded \+ \d+ dynamic verified$")
+            self.assertRegex(app.intel_var.get(), rf"^Signatures: {len(signatures.SIGNATURES)} hardcoded \+ \d+ dynamic verified$")
         finally:
             root.destroy()
 

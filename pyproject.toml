@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foundryguard"
-version = "0.17.0"
+version = "0.18.0"
 description = "Generate Foundry invariant test suites from Solidity sources, score a codebase 1-100, check the seam between backend and contracts, and run it all from a desktop window."
 readme = "README.md"
 license = { text = "MIT" }

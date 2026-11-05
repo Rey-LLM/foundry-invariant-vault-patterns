@@ -94,6 +94,10 @@ WEB3_HINT = re.compile(
     r"sign_message|private_?key|privateKey|PRIVATE_KEY|mnemonic|JsonRpcProvider|HTTPProvider|createWalletClient|"
     r"createPublicClient|getTransactionCount|get_transaction_count|ecsign|infura\.io|alchemy\.com|"
     r"(NEXT_PUBLIC|VITE|REACT_APP|EXPO_PUBLIC|NUXT_PUBLIC)_\w*(KEY|MNEMONIC|SEED)", re.I)
+WEB3_HINT_WORDS = ("ethers", "web3", "viem", "eth_account", "eth-account", "@wagmi", "signtypeddata", "sign_typed_data",
+                   "signmessage", "sign_message", "private", "mnemonic", "jsonrpcprovider", "httpprovider",
+                   "createwalletclient", "createpublicclient", "gettransactioncount", "get_transaction_count", "ecsign",
+                   "infura.io", "alchemy.com", "next_public", "vite_", "react_app", "expo_public", "nuxt_public")
 
 SIGN_TYPED = re.compile(r"\b_?signTypedData(?:V4)?\s*\(|\bsign_typed_data\s*\(|\bencode_typed_data\s*\(|"
                         r"\bencode_structured_data\s*\(|eth_signTypedData")
@@ -1116,11 +1120,11 @@ def _sol_line(sol: list[_SolSrc], v: VerifySite) -> str:
     return ""
 
 
-def relevant(rel: str, raw: str) -> bool:
+def relevant(rel: str, raw: str, low: str | None = None) -> bool:
     """Whether a file is worth keeping in memory for the bridge pass."""
     if rel.lower().endswith(".sol"):
         return True
-    return bool(WEB3_HINT.search(raw))
+    return scoring.signatures.hinted(WEB3_HINT, WEB3_HINT_WORDS, raw, low)
 
 
 # --------------------------------------------------------------------------- #
